@@ -10,16 +10,9 @@ import cupy as cp
 import numpy as np
 from scipy.optimize import fmin_l_bfgs_b
 
-
-def allocate_pinned(shape, dtype=np.float64):
-    """Allocate a pinned (page-locked) numpy array for fast GPU transfers."""
-    nbytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
-    mem = cp.cuda.alloc_pinned_memory(nbytes)
-    return np.frombuffer(mem, dtype=dtype, count=int(np.prod(shape))).reshape(shape)
-
 from glide import IcePhysics
 from glide.io import VTIWriter, write_vti
-from glide.physics import abs_loss,abs_grad,huber_loss, huber_grad, tikhonov_regularization
+from glide.physics import huber_loss, tikhonov_regularization
 from glide.data import (
     load_bedmachine,
     load_velocity_mosaic,
@@ -29,35 +22,36 @@ from glide.data import (
     load_antarctic_velocity,
     load_antarctica_preprocessed
 )
-from glide.kernels import restrict_vfacet, restrict_hfacet, get_kernels
-from glide.solver import fascd_vcycle, adjoint_vcycle, restrict_parameters_to_hierarchy
-from glide.kernels import prolongate_cell_centered
+from glide.kernels import restrict_vfacet, restrict_hfacet, prolongate_cell_centered, get_kernels
+from glide.solver import restrict_parameters_to_hierarchy,restrict_solution_to_hierarchy
+#from glide.kernels import prolongate_cell_centered
 
 # =============================================================================
 # Configuration - modify these paths and parameters
 # =============================================================================
-GEOMETRY_PATH = "./data/BedMachineAntarctica-v3.nc"
-SMB_PATH = "./data/smbgl_monthlyS_ANT11_RACMO2.4p1_ERA5_197901_202312.nc"
-U_OBS_PATH = "./data/antarctica_ice_velocity_450m_v2.nc"
+
 OUTPUT_DIR = "./inverse_output"
 
 SKIP = 4              # Geometry downsampling factor
 DT = 1.0             # Time step (years)
 N_LEVELS = 5          # Multigrid levels
-REG_WEIGHT = 1e-4     # Tikhonov regularization weight
 
 # Physical constants
 RHO_ICE = 917.0
 G = 9.81
 N_GLEN = 3.0
 
-kernels = get_kernels()
 
+REG_WEIGHT = 1e-4     # Tikhonov regularization weight
 # =============================================================================
 # Load data
 # =============================================================================
 
 """
+GEOMETRY_PATH = "./data/BedMachineAntarctica-v3.nc"
+SMB_PATH = "./data/smbgl_monthlyS_ANT11_RACMO2.4p1_ERA5_197901_202312.nc"
+U_OBS_PATH = "./data/antarctica_ice_velocity_450m_v2.nc"
+
 print("Loading geometry...")
 geometry = load_bedmachine(GEOMETRY_PATH, skip=SKIP, thklim=0.1,bbox_pad=[1100,1000,1600,1600])
 geometry = prepare_grid(geometry, n_levels=N_LEVELS)
@@ -91,17 +85,23 @@ dataset = load_antarctica_preprocessed()
 ny,nx = dataset.ny,dataset.nx
 dx = dataset.dx
 bed = dataset.bed.values
+beta = dataset.beta.values
+beta.fill(0.5)
 surface = dataset.surface.values
 thickness = dataset.thickness.values
 smb = dataset.smb.values
+smb[surface == 0] = -10.0
+
 u_obs_cell = dataset.vx.values
 v_obs_cell = dataset.vy.values
 
 # Interpolate to faces
 u_obs = cp.zeros((ny, nx + 1), dtype=cp.float32)
 u_obs[:, 1:-1] = cp.array((u_obs_cell[:, 1:] + u_obs_cell[:, :-1]) / 2.0)
+u_obs[cp.isnan(u_obs)] = 0.0
 v_obs = cp.zeros((ny + 1, nx), dtype=cp.float32)
 v_obs[1:-1] = cp.array((v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0)
+v_obs[cp.isnan(v_obs)] = 0.0
 
 # =============================================================================
 # Initialize physics
@@ -109,14 +109,21 @@ v_obs[1:-1] = cp.array((v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0)
 
 # Compute B (rate factor)
 B_scalar = cp.float32(1e-17 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
-
 B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
+
 print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, thklim=0.1,calving_rate=0.0,water_drag=1e-5,gl_derivatives=False)
+physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
+        thklim=0.1,
+        n=3.0,eps_reg=1e-6,
+        m=1.0/3.0,u_reg=1000.0,
+        water_drag=1e-5,
+        calving_rate=0.0,sigmoid_c=0.1)
+
 physics.set_geometry(bed, thickness)
-physics.set_parameters(B=B, beta=0.01, smb=smb)
+physics.set_parameters(B=B, beta=beta, smb=smb)
 
 grid = physics.grid
+kernels = get_kernels()
 
 # =============================================================================
 # Build observation hierarchy for multi-resolution optimization
@@ -131,25 +138,11 @@ while g.child is not None:
     obs_hierarchy.append((current_u, current_v))
     g = g.child
 
-# Build list of grids from finest to coarsest
-level_grids = [grid]
-g = grid
-while g.child is not None:
-    level_grids.append(g.child)
-    g = g.child
-
-for g in level_grids:
-    g.dt = cp.float32(DT)
-
-# =============================================================================
-# Multi-resolution optimization
-# =============================================================================
-verbose = False
-for level_idx in range(len(level_grids) - 1, -1, -1):
-    current_grid = level_grids[level_idx]
+#for level_idx in range(N_LEVELS - 1, -1, -1):
+for level_idx in [4,3,2,1,0]:
+    physics.set_grid_level(level_idx)
+    current_grid = physics.grid
     u_obs_level, v_obs_level = obs_hierarchy[level_idx]
-
-    print(f"\n=== Optimizing at level {level_idx}: {current_grid.ny} x {current_grid.nx} ===")
 
     writer = VTIWriter(
         f"{OUTPUT_DIR}/level_{level_idx}",
@@ -168,83 +161,35 @@ for level_idx in range(len(level_grids) - 1, -1, -1):
 
     counter = [0]
 
-    # Allocate pinned memory for fast CPU-GPU transfers
-    n_params = current_grid.nh
-    x_pinned = allocate_pinned(n_params, dtype=np.float64)
-    grad_pinned = allocate_pinned(n_params, dtype=np.float64)
-
     def objective(log_beta_flat):
-        """Objective function for L-BFGS-B."""
-        # Transfer from (pinned) CPU to GPU
-        log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32)
+
+        log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32) 
         current_grid.beta[:] = cp.exp(log_beta)
-
-        # Reset state
-        current_grid.u.fill(0.0)
-        current_grid.v.fill(0.0)
-        current_grid.H[:] = current_grid.H_prev
-
-        # Forward solve
         restrict_parameters_to_hierarchy(current_grid)
-        current_grid.f_H[:,:] = current_grid.H_prev/current_grid.dt + current_grid.smb
 
-        if verbose:
-            rss_H_init = current_grid.compute_residual(return_fischer_burmeister=True)
-            r0 = float(cp.sqrt(
-                cp.linalg.norm(current_grid.r_u)**2 +
-                cp.linalg.norm(current_grid.r_v)**2 +
-                cp.linalg.norm(rss_H_init)**2
-            ))
-            print(f"  Initial: |r| = {r0:.2e}, "
-                  f"|r_u| = {float(cp.linalg.norm(current_grid.r_u)):.2e}, "
-                  f"|r_v| = {float(cp.linalg.norm(current_grid.r_v)):.2e}, "
-                  f"|rss_H| = {float(cp.linalg.norm(rss_H_init)):.2e}")
-        for _ in range(5):
-            fascd_vcycle(current_grid, physics.thklim, finest=True)
-            if verbose:
-                rss_H = current_grid.compute_residual(return_fischer_burmeister=True)
-                r_combined = float(cp.sqrt(
-                    cp.linalg.norm(current_grid.r_u)**2 +
-                    cp.linalg.norm(current_grid.r_v)**2 +
-                    cp.linalg.norm(rss_H)**2
-                ))
-                rel = r_combined / r0 if r0 > 0 else 0.0
-                print(f"  V-cycle {counter}: |r|/|r0| = {rel:.2e}, "
-                      f"|r_u| = {float(cp.linalg.norm(current_grid.r_u)):.2e}, "
-                      f"|r_v| = {float(cp.linalg.norm(current_grid.r_v)):.2e}, "
-                      f"|rss_H| = {float(cp.linalg.norm(rss_H)):.2e}")
 
+        current_grid.u.fill(0)
+        current_grid.v.fill(0)
+        current_grid.H[:] = current_grid.H_prev
+        u, v, H = physics.forward(dt=10.0, n_vcycles=10, verbose=False,update_geometry=False)
 
         # Compute loss
-        J = abs_loss(current_grid.u, current_grid.v, u_obs_level, v_obs_level)
-        dJdu, dJdv = abs_grad(current_grid.u, current_grid.v, u_obs_level, v_obs_level)
+        J_data, dJdu, dJdv = huber_loss(current_grid.u, current_grid.v, u_obs_level, v_obs_level,epsilon=1.0,mask_threshold=0.001)
+        dJdH = cp.zeros_like(H)
+    
+        physics.adjoint(dJdu,dJdv,dJdH,n_vcycles=3,verbose=False)
+        grad_log_beta = current_grid.beta*current_grid.grad_beta
 
-        # Adjoint solve
-        current_grid.f_adj_u[:] = -dJdu
-        current_grid.f_adj_v[:] = -dJdv
-        current_grid.f_adj_H.fill(0.0)
-        current_grid.Lambda.fill(0.0)
+        J_tikh,tikh_grad = tikhonov_regularization(log_beta,weight=cp.float32(REG_WEIGHT))
+        J = J_data + J_tikh
+        grad_log_beta += tikh_grad
 
-        adjoint_vcycle(current_grid)
-        adjoint_vcycle(current_grid)
+        J_norm = 0.5*(log_beta**2).sum()/log_beta.size
+        J_norm_grad = log_beta/log_beta.size
 
-        # Gradient
-        grad_beta = current_grid.grad_beta = current_grid.compute_grad_beta()
-        grad_log_beta = current_grid.beta * grad_beta
+        print(f"Level: {level_idx} {counter},  Loss: {J:.4f}, Loss Data: {J_data:.4f}, Loss Tikh: {J_tikh:.4f}, {J_norm}")
 
-        # Regularization
-        tik_loss, tik_grad = tikhonov_regularization(current_grid.beta)
-        tik_loss *= REG_WEIGHT
-        tik_grad *= REG_WEIGHT
-
-        total_loss = J + tik_loss
-        total_grad = grad_log_beta + tik_grad
-
-        print(f"  Loss: {J:.4f}, Reg: {tik_loss:.4f}, Total: {total_loss:.4f}")
-
-        # Transfer gradient to pinned memory (fast GPU->CPU)
-        grad_pinned[:] = total_grad.ravel().get().astype(np.float64)
-        return float(total_loss), grad_pinned
+        return float(J),grad_log_beta.ravel().get().astype(np.float64)
 
     def callback(log_beta_flat):
         """Callback for visualization."""
@@ -260,32 +205,24 @@ for level_idx in range(len(level_grids) - 1, -1, -1):
         })
         writer.write_pvd()
 
-    # Initialize x0 in pinned memory
-    x_pinned[:] = cp.log(current_grid.beta).ravel().get().astype(np.float64)
-    bounds = [(-6, 5)] * current_grid.nh
-
+    x_init = cp.log(current_grid.beta).ravel().get().astype(np.float64)
+    bounds = [(-8,4)]*current_grid.nh
     result = fmin_l_bfgs_b(
-        objective, x_pinned,
+        objective, x_init,
         bounds=bounds,
         callback=callback,
-        factr=1e10,
-        m=15
+        factr=1e11,
+        maxiter=200
     )
 
-    # Update beta with optimized values
-    current_grid.beta[:] = cp.exp(cp.array(result[0].reshape((current_grid.ny, current_grid.nx))).astype(cp.float32))
-    current_grid.mask.fill(0.0)
-
+    current_grid.beta[:] = cp.exp(cp.array(result[0].reshape((current_grid.ny, current_grid.nx))).astype(cp.float32))     # Prolongate to finer grid for next level
     # Save result
     pickle.dump(
         current_grid.beta.get(),
         open(f"{OUTPUT_DIR}/beta_level_{level_idx}.p", 'wb')
     )
 
-    # Prolongate to finer grid for next level
     if level_idx > 0:
-        parent = level_grids[level_idx - 1]
-        prolongate_cell_centered(current_grid.beta, kernels, H_fine=parent.beta)
+        parent = physics.grids[level_idx - 1]
+        prolongate_cell_centered(current_grid.beta, kernels, H_fine=parent.beta,smooth=False)   
 
-print("\nOptimization complete!")
-print(f"Results saved to {OUTPUT_DIR}/")

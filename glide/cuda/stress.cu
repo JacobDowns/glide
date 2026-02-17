@@ -271,7 +271,6 @@ TauBxJacobian get_tau_bx_jac(
     float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
 
     jac.res = -beta_eff * unorm_sq_pow * s.u;
-    //jac.d_u = -beta_eff * unorm_sq_pow;
     jac.d_u = -beta_eff * (2.0f * unorm_sq_deriv * s.u * s.u + unorm_sq_pow);
     jac.d_v_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tl);
     jac.d_v_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tr);
@@ -314,12 +313,105 @@ struct TauByStencilDual {
 
     __device__ __forceinline__
     TauByStencil get_primals() const {
-        return {v.v,u_tl.v,u_tr.v,u_bl.v,u_br.v,H_t.v,H_b.v,bed_t,bed_b,beta_t,beta_b,water_drag,sigmoid_c};
+        return {v.v,u_tl.v,u_tr.v,u_bl.v,u_br.v,H_t.v,H_b.v,bed_t,bed_b,beta_t,beta_b,m,u_reg,water_drag,sigmoid_c};
     }
 
     __device__ __forceinline__
     TauByStencil get_diffs() const {
-        return {v.d,u_tl.d,u_tr.d,u_bl.d,u_br.d,H_t.d,H_b.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        return {v.d,u_tl.d,u_tr.d,u_bl.d,u_br.d,H_t.d,H_t.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+    }
+
+};
+
+struct TauByJacobian {
+    float res;
+    float d_v;
+    float d_u_tl,d_u_tr,d_u_bl,d_u_br;
+    float d_H_t, d_H_b;
+    float d_beta_t, d_beta_b;
+
+    __device__ __forceinline__
+    float apply_jvp(const TauByStencil& dot) const {
+        return d_v * dot.v +
+	       d_u_tl * dot.u_tl +
+	       d_u_tr * dot.u_tr +
+	       d_u_bl * dot.u_bl +
+	       d_u_br * dot.u_br +
+	       d_H_t * dot.H_t +
+	       d_H_b * dot.H_b;
+    }
+};
+
+__device__ __forceinline__
+TauByJacobian get_tau_by_jac(
+   TauByStencil s )
+{
+    TauByJacobian jac = {0};
+
+    float z_t = s.bed_t + 0.917f*s.H_t;
+    float z_b = s.bed_b + 0.917f*s.H_b;
+
+    float grounded_t = sigmoid(z_t, s.sigmoid_c);
+    float grounded_b = sigmoid(z_b, s.sigmoid_c);
+
+    float beta_eff_t = grounded_t*s.beta_t + (1.0f - grounded_t)*s.water_drag;
+    float beta_eff_b = grounded_b*s.beta_b + (1.0f - grounded_b)*s.water_drag;
+    float beta_eff = 0.5f*(beta_eff_t + beta_eff_b);
+
+    float unorm_sq = s.v * s.v + 0.25f*(s.u_tl * s.u_tl + s.u_tr * s.u_tr + s.u_bl * s.u_bl + s.u_br * s.u_br);
+    float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
+    float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
+
+    jac.res = -beta_eff * unorm_sq_pow * s.v;
+    jac.d_v = -beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow);
+    jac.d_u_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tl);
+    jac.d_u_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tr);
+    jac.d_u_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_bl);
+    jac.d_u_br = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_br);
+    jac.d_beta_t = -0.5f*grounded_t * unorm_sq_pow * s.v;
+    jac.d_beta_b = -0.5f*grounded_b * unorm_sq_pow * s.v;
+
+    return jac;
+}
+
+__device__ __forceinline__
+DualFloat get_tau_by_dual(TauByStencilDual s) {
+    TauByJacobian jac = get_tau_by_jac(s.get_primals());
+    return {jac.res,jac.apply_jvp(s.get_diffs())};
+}
+
+/*
+struct TauByStencil {
+    float v;
+    float u_tl, u_tr, u_bl, u_br;
+    float H_t, H_b;
+    float bed_t, bed_b;
+    float beta_t, beta_b;
+    float m;
+    float u_reg;
+    float water_drag;
+    float sigmoid_c;
+};
+
+struct TauByStencilDual {
+    DualFloat v;
+    DualFloat u_tl, u_tr, u_bl, u_br;
+    DualFloat H_t, H_b;
+    float bed_t, bed_b;
+    float beta_t, beta_b;
+    float m;
+    float u_reg;
+    float water_drag;
+    float sigmoid_c;
+
+    __device__ __forceinline__
+    TauByStencil get_primals() const {
+        return {v.v,u_tl.v,u_tr.v,u_bl.v,u_br.v,H_t.v,H_b.v,bed_t,bed_b,beta_t,beta_b,u_reg,m,water_drag,sigmoid_c};
+    }
+
+    __device__ __forceinline__
+    TauByStencil get_diffs() const {
+        return {v.d,u_tl.d,u_tr.d,u_bl.d,u_br.d,H_t.d,H_b.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
     }
 
 };
@@ -361,10 +453,9 @@ TauByJacobian get_tau_by_jac(
 
     float unorm_sq = 0.25f*(s.u_tl * s.u_tl + s.u_tr * s.u_tr + s.u_bl * s.u_bl + s.u_br * s.u_br) + s.v * s.v;
     float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
-    float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
+    float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);                 
 
     jac.res = -beta_eff * unorm_sq_pow * s.v;
-    //jac.d_v = -beta_eff * unorm_sq_pow;
     jac.d_v = -beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow);
     jac.d_u_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tl);
     jac.d_u_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tr);
@@ -381,7 +472,7 @@ DualFloat get_tau_by_dual(TauByStencilDual s) {
     TauByJacobian jac = get_tau_by_jac(s.get_primals());
     return {jac.res,jac.apply_jvp(s.get_diffs())};
 }
-
+*/
 /*=========================================================
   ==================== Driving Stress =====================
   =========================================================*/

@@ -13,7 +13,6 @@ from glide import IcePhysics
 from glide.io import VTIWriter, write_vti
 from glide.physics import abs_loss
 
-from glide.solver import restrict_frozen_fields_to_hierarchy
 from glide.kernels import restrict_vfacet, restrict_hfacet, prolongate_cell_centered, get_kernels
 
 # =============================================================================
@@ -63,7 +62,7 @@ else:
     raise NotImplementedError('Only support ISMIP-HOM C and D for now')
 
 smb = cp.zeros_like(thk)
-beta*=5
+#beta*=5
 
 # Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
 B_scalar = cp.float32(1e-16 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
@@ -74,11 +73,10 @@ B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
 # =============================================================================
 
 print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS,m=1./3.)
+physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS,m=1.)
 physics.set_geometry(bed, thk)
 physics.set_parameters(B=B, beta=beta, smb=smb)
 
-#physics.set_grid_level(2)
 # Access the grid hierarchy
 grid = physics.grid
 

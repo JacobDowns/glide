@@ -17,9 +17,9 @@ from glide.io import VTIWriter, write_vti
 # =============================================================================
 
 N_LEVELS = 6       # Multigrid levels
-N_VCYCLES = 5
+N_VCYCLES = 10
 L = 5000
-EXP = 'D'
+EXP = 'C'
 
 # Physical constants
 RHO_ICE = 917.0
@@ -79,7 +79,7 @@ grid = physics.grid
 writer = VTIWriter('./results/', base=f"ismip-hom-{EXP}-{L}", dx=dx)
 
 # Forward solve
-u, v, H = physics.forward(dt=0.01, n_vcycles=N_VCYCLES, verbose=True)
+u, v, H = physics.forward(dt=0.1, n_vcycles=N_VCYCLES, verbose=True)
 
 # Output
 u_c, v_c = physics.get_velocities_cell_centered()

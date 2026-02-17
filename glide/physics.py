@@ -8,7 +8,7 @@ computations into a clean interface.
 import cupy as cp
 from .grid import Grid
 from .kernels import get_kernels, restrict_cell_centered
-from .solver import fascd_vcycle, adjoint_vcycle, restrict_parameters_to_hierarchy
+from .solver import fascd_vcycle, adjoint_vcycle_fas, restrict_parameters_to_hierarchy, restrict_solution_to_hierarchy
 
 
 # Physical constants
@@ -83,6 +83,9 @@ class IcePhysics:
 
         for _ in range(self.n_levels - 1):
             self.grids.append(self.grids[-1].spawn_child())
+
+    def set_grid_level(self,level=0):
+        self.grid = self.grids[level]
 
     def set_geometry(self, bed, thickness):
         """
@@ -214,7 +217,7 @@ class IcePhysics:
 
         return self.grid.u, self.grid.v, self.grid.H
 
-    def adjoint(self, dL_du, dL_dv, dL_dH,n_vcycles=2):
+    def adjoint(self, dL_du, dL_dv, dL_dH,n_vcycles=2,verbose=False):
         """
         Compute adjoint (reverse-mode AD) for gradient computation.
 
@@ -233,16 +236,17 @@ class IcePhysics:
         grad_beta : cupy.ndarray
             Gradient of loss w.r.t. beta (ny, nx)
         """
+        restrict_solution_to_hierarchy(self.grid)
+
         # Set adjoint forcing
         self.grid.f_adj_u[:] = cp.asarray(-dL_du, dtype=cp.float32)
         self.grid.f_adj_v[:] = cp.asarray(-dL_dv, dtype=cp.float32)
         self.grid.f_adj_H[:] = cp.asarray(-dL_dH, dtype=cp.float32)
-        self.grid.Lambda.fill(0.0)
-        self.grid.Lambda_out.fill(0.0)
 
+        self.grid.Lambda.fill(0.0)
         # Solve adjoint system
         for _ in range(n_vcycles):
-            adjoint_vcycle(self.grid)
+            adjoint_vcycle_fas(self.grid,omega=cp.float32(0.5),verbose=verbose,finest=True)
 
         # Compute parameter gradient
         return self.grid.compute_grad_beta()
@@ -264,66 +268,7 @@ class IcePhysics:
         v_c = 0.5 * (self.grid.v[1:] + self.grid.v[:-1])
         return u_c, v_c
 
-
-def huber_loss(u, v, u_obs, v_obs, eps=10.0):
-    """
-    Compute Huber-like loss for velocity misfit.
-
-    Parameters
-    ----------
-    u, v : cupy.ndarray
-        Model velocities
-    u_obs, v_obs : cupy.ndarray
-        Observed velocities
-    eps : float
-        Smoothing parameter
-
-    Returns
-    -------
-    loss : float
-        Loss value
-    """
-    eps = cp.float32(eps)
-    delta_u = u - u_obs
-    mask_u = cp.isnan(delta_u)
-    delta_u[mask_u] = 0.0
-    delta_v = v - v_obs
-    mask_v = cp.isnan(delta_v)
-    delta_v[mask_v] = 0.0
-    return cp.sqrt(delta_u**2 + eps).mean() + cp.sqrt(delta_v**2 + eps).mean()
-
-
-def huber_grad(u, v, u_obs, v_obs, eps=10.0):
-    """
-    Compute gradient of Huber-like loss.
-
-    Parameters
-    ----------
-    u, v : cupy.ndarray
-        Model velocities
-    u_obs, v_obs : cupy.ndarray
-        Observed velocities
-    eps : float
-        Smoothing parameter
-
-    Returns
-    -------
-    dL_du, dL_dv : cupy.ndarray
-        Gradients w.r.t. velocities
-    """
-    eps = cp.float32(eps)
-    delta_u = u - u_obs
-    mask_u = cp.isnan(delta_u)
-    delta_u[mask_u] = 0.0
-    delta_v = v - v_obs
-    mask_v = cp.isnan(delta_v)
-    delta_v[mask_v] = 0.0
-    n = u.size
-    dL_du = delta_u / cp.sqrt(delta_u**2 + eps) / n
-    dL_dv = delta_v / cp.sqrt(delta_v**2 + eps) / n
-    return dL_du, dL_dv
-
-def abs_loss(u, v, u_obs, v_obs):
+def abs_loss(u, v, u_obs, v_obs,mask_threshold=1.0):
     """
     Compute Huber-like loss for velocity misfit.
 
@@ -343,21 +288,33 @@ def abs_loss(u, v, u_obs, v_obs):
     """
     u = u.astype(cp.float64)
     v = v.astype(cp.float64)
+    
     u_obs = u_obs.astype(cp.float64)
     v_obs = v_obs.astype(cp.float64)
+    
+    n_u = u.size
+    n_v = v.size
+    
+    mask_u = abs(u_obs) < mask_threshold
+    mask_v = abs(v_obs) < mask_threshold
+    
     delta_u = u - u_obs
-    mask_u = cp.isnan(delta_u)
-    delta_u[mask_u] = 0.0
     delta_v = v - v_obs
-    mask_v = cp.isnan(delta_v)
-    delta_v[mask_v] = 0.0
-    return abs(delta_u).mean() + abs(delta_v).mean()
-    #return abs(delta_u).sum() + abs(delta_v).sum()
+    
+    L = abs(delta_u[~mask_u]).sum()/n_u + abs(delta_v[~mask_v]).sum()/n_v
+
+    dLdu = cp.sign(delta_u)/n_u
+    dLdu[mask_u] = 0.0
+    
+    dLdv = cp.sign(delta_v)/n_v
+    dLdv[mask_v] = 0.0
 
 
-def abs_grad(u, v, u_obs, v_obs, eps=10.0):
+    return L, dLdu, dLdv
+
+def huber_loss(u, v, u_obs, v_obs, epsilon=10.0, mask_threshold=1.0):
     """
-    Compute gradient of Huber-like loss.
+    Compute Huber-like loss for velocity misfit.
 
     Parameters
     ----------
@@ -370,22 +327,39 @@ def abs_grad(u, v, u_obs, v_obs, eps=10.0):
 
     Returns
     -------
-    dL_du, dL_dv : cupy.ndarray
-        Gradients w.r.t. velocities
+    loss : float
+        Loss value
     """
-    eps = cp.float32(eps)
+    u = u.astype(cp.float64)
+    v = v.astype(cp.float64)
+    
+    u_obs = u_obs.astype(cp.float64)
+    v_obs = v_obs.astype(cp.float64)
+    
+    n_u = u.size
+    n_v = v.size
+    
+    mask_u = abs(u_obs) < mask_threshold
+    mask_v = abs(v_obs) < mask_threshold
+    
     delta_u = u - u_obs
-    mask_u = cp.isnan(delta_u)
-    delta_u[mask_u] = 0.0
     delta_v = v - v_obs
-    mask_v = cp.isnan(delta_v)
-    delta_v[mask_v] = 0.0
-    n = u.size
-    return cp.sign(delta_u)/n, cp.sign(delta_v)/n
-    #return cp.sign(delta_u), cp.sign(delta_v)
+    
+    delta_u_mag = (delta_u ** 2 + epsilon**2)**0.5
+    delta_v_mag = (delta_v ** 2 + epsilon**2)**0.5
+
+    L = delta_u_mag.sum()/n_u + delta_v_mag.sum()/n_v
+
+    dLdu = (delta_u/delta_u_mag)/n_u
+    dLdu[mask_u] = 0.0
+    
+    dLdv = (delta_v/delta_v_mag)/n_v
+    dLdv[mask_v] = 0.0
+    
+    return L, dLdu, dLdv
 
 
-def tikhonov_regularization(field):
+def tikhonov_regularization(field,weight=cp.float32(1.0)):
     """
     Compute Tikhonov (gradient smoothness) regularization.
 
@@ -414,4 +388,4 @@ def tikhonov_regularization(field):
     grad[0, :] -= (field[1, :] - field[0, :])
     grad[-1, :] -= (field[-2, :] - field[-1, :])
 
-    return float(loss), grad
+    return float(weight*loss), weight*grad

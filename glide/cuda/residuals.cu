@@ -60,11 +60,6 @@ void compute_residual(
 
 	    float rH = H_c/dt - f_H_c;
 
-	    //float bed_c = get_cell(bed,i,j,ny,nx);
-	    //CellCalvingJacobian j_calve = get_cell_calving_jac({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
-	    //rH -= j_calve.res;
-
-
 	    float H_l = get_cell(H,i,j-1,ny,nx);
 	    float u_l = get_vfacet(u,i,j,ny,nx);
 	    HorizontalFluxJacobian j_l = get_horizontal_flux_jac({u_l,H_l,H_c}, i, j, ny, nx);
@@ -337,7 +332,7 @@ void compute_residual(
 /*=========================================================
   ==================== JVP Computation ====================
   =========================================================*/
-/*
+
 extern "C" __global__
 void compute_jvp(
     float* __restrict__ jvp_u,
@@ -354,8 +349,9 @@ void compute_jvp(
     const float* __restrict__ beta,
     const float* __restrict__ mask,
     const float* __restrict__ gamma,
-    float n, float eps_reg, float water_drag,
-    float calving_rate, float sigmoid_c,
+    float n, float eps_reg,
+    float m, float u_reg,
+    float water_drag, float calving_rate, float sigmoid_c,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
 {
@@ -390,31 +386,48 @@ void compute_jvp(
 	    float d_rH = H_c.d/dt;
 
 	    float bed_c = get_cell(bed,i,j,ny,nx);
-	    DualFloat calve = get_cell_calving_dual({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
-	    d_rH -= calve.d;
+	    //DualFloat calve = get_cell_calving_dual({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
+	    //d_rH -= calve.d;
 
 	    DualFloat H_l = get_cell(H,d_H,i,j-1,ny,nx);
 	    DualFloat u_l = get_vfacet(u,d_u,i,j,ny,nx);
 	    DualFloat q_l = get_horizontal_flux_dual({u_l,H_l,H_c}, i, j, ny, nx);
 	    d_rH -= q_l.d*dx_inv;
 
+	    float bed_l = get_cell(bed,i,j-1,ny,nx);
+	    DualFloat q_calve_l = get_facet_calving_dual({H_c,H_l,bed_c,bed_l,calving_rate,sigmoid_c},i,j,ny,nx);
+	    d_rH += q_calve_l.d*dx_inv;
+
 	    DualFloat H_r = get_cell(H,d_H,i,j+1,ny,nx);
 	    DualFloat u_r = get_vfacet(u,d_u,i,j+1,ny,nx);
 	    DualFloat q_r = get_horizontal_flux_dual({u_r,H_c,H_r}, i, j + 1, ny, nx);
             d_rH += q_r.d*dx_inv;
+
+	    float bed_r = get_cell(bed,i,j+1,ny,nx);
+	    DualFloat q_calve_r = get_facet_calving_dual({H_c,H_r,bed_c,bed_r,calving_rate,sigmoid_c},i,j+1,ny,nx);
+	    d_rH += q_calve_r.d*dx_inv;
 
 	    DualFloat H_t = get_cell(H,d_H,i-1,j,ny,nx);
 	    DualFloat v_t = get_hfacet(v,d_v,i,j,ny,nx);
 	    DualFloat q_t = get_vertical_flux_dual({v_t,H_t,H_c}, i, j, ny, nx);
 	    d_rH += q_t.d*dx_inv;
 
+	    float bed_t = get_cell(bed,i-1,j,ny,nx);
+	    DualFloat q_calve_t = get_facet_calving_dual({H_c,H_t,bed_c,bed_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	    d_rH += q_calve_t.d*dx_inv;
+
 	    DualFloat H_b = get_cell(H,d_H,i+1,j,ny,nx);
 	    DualFloat v_b = get_hfacet(v,d_v,i+1,j,ny,nx);
 	    DualFloat q_b = get_vertical_flux_dual({v_b,H_c,H_b}, i + 1, j, ny, nx);
             d_rH -= q_b.d*dx_inv;
 
+	    float bed_b = get_cell(bed,i+1,j,ny,nx);
+	    DualFloat q_calve_b = get_facet_calving_dual({H_c,H_b,bed_c,bed_b,calving_rate,sigmoid_c},i+1,j,ny,nx);
+	    d_rH += q_calve_b.d*dx_inv;
+
 	    float masked = get_cell(mask,i,j,ny,nx);
-            jvp_H[i * nx + j] = (1.0f - masked) * d_rH + masked * H_c.d;
+	    if (masked > 0.5) {d_rH = 0.0f;}
+            jvp_H[i * nx + j] = d_rH;
 
 	}
 
@@ -498,13 +511,18 @@ void compute_jvp(
 	
             {    
             DualFloat u_l    = get_vfacet(u,d_u,i,j,ny,nx);
+            DualFloat v_tl   = get_hfacet(v,d_v,i,j-1,ny,nx);
+	    DualFloat v_tr   = get_hfacet(v,d_v,i,j,ny,nx);
+	    DualFloat v_bl   = get_hfacet(v,d_v,i+1,j-1,ny,nx);
+	    DualFloat v_br   = get_hfacet(v,d_v,i+1,j,ny,nx);
+
 	    DualFloat H_l    = get_cell(H,d_H,i,j-1,ny,nx);
 	    DualFloat H_c    = get_cell(H,d_H,i,j,ny,nx);
 	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    DualFloat tau_bx = get_tau_bx_dual({u_l,H_l,H_c,bed_l,bed_c,beta_l,beta_c,water_drag,sigmoid_c});
+	    DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,bed_l,bed_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
 	    d_ru_l += tau_bx.d;
 	    }
 
@@ -516,6 +534,8 @@ void compute_jvp(
 	    DualFloat tau_dx = get_tau_dx_dual({H_l,H_c,bed_l,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
 	    d_ru_l -= tau_dx.d;
 	    }
+
+	    if (j <= 0 || j >= nx) {d_ru_l = 0.0f;}
 	    jvp_u[i * (nx + 1) + j] = d_ru_l;
 	
  	}
@@ -595,6 +615,12 @@ void compute_jvp(
 
 	    {
 	    DualFloat v_t    = get_hfacet(v,d_v,i,j,ny,nx);
+
+            DualFloat u_tl = get_vfacet(u,d_u,i-1,j,ny,nx);
+            DualFloat u_tr = get_vfacet(u,d_u,i-1,j+1,ny,nx);
+            DualFloat u_bl = get_vfacet(u,d_u,i,j,ny,nx);
+            DualFloat u_br = get_vfacet(u,d_u,i,j+1,ny,nx);
+
 	    DualFloat H_t    = get_cell(H,d_H,i-1,j,ny,nx);
 	    DualFloat H_c    = get_cell(H,d_H,i,j,ny,nx);
 	    float bed_t      = get_cell(bed,i-1,j,ny,nx);
@@ -602,7 +628,7 @@ void compute_jvp(
 	    float beta_t     = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c     = get_cell(beta,i,j,ny,nx);
 
-	    DualFloat tau_by = get_tau_by_dual({v_t,H_t,H_c,bed_t,bed_c,beta_t,beta_c,water_drag,sigmoid_c});
+	    DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,bed_t,bed_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
 	    d_rv_t += tau_by.d;
 	    }
 
@@ -616,17 +642,18 @@ void compute_jvp(
 	    d_rv_t -= tau_dy.d;
 	    }
 
+	    if (i <= 0 || i >= ny) { d_rv_t = 0.0f;}
 	    jvp_v[i * nx + j] = d_rv_t;
 
 	}
     }
 }
-*/
+
 
 /*=========================================================
   ==================== VJP Computation ====================
   =========================================================*/
-/*
+
 extern "C" __global__
 void compute_vjp(
     float* __restrict__ vjp_u,
@@ -643,7 +670,9 @@ void compute_vjp(
     const float* __restrict__ beta,
     const float* __restrict__ mask,
     const float* __restrict__ gamma,
-    float n, float eps_reg, float water_drag,
+    float n, float eps_reg, 
+    float m, float u_reg,
+    float water_drag,
     float calving_rate, float sigmoid_c,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
@@ -695,8 +724,8 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c/dt);
 
 	    float bed_c = get_cell(bed,i,j,ny,nx);
-	    CellCalvingJacobian j_calve = get_cell_calving_jac({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
-	    atomicAdd(&s_adj_H[bi][bj] , -lambda_H_c*j_calve.d_H);
+	    //CellCalvingJacobian j_calve = get_cell_calving_jac({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
+	    //atomicAdd(&s_adj_H[bi][bj] , -lambda_H_c*j_calve.d_H);
 
 	    float H_l = get_cell(H,i,j-1,ny,nx);
 	    float u_l = get_vfacet(u,i,j,ny,nx);
@@ -704,6 +733,10 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi][bj]  , -lambda_H_c*j_q_l.d_H_r*dx_inv);
             atomicAdd(&s_adj_H[bi][bj-1], -lambda_H_c*j_q_l.d_H_l*dx_inv);
             atomicAdd(&s_adj_u[bi][bj]  , -lambda_H_c*j_q_l.d_u*dx_inv);
+
+	    float bed_l = get_cell(bed,i,j-1,ny,nx);
+	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,bed_c,bed_l,calving_rate,sigmoid_c},i,j,ny,nx);
+	    atomicAdd(&s_adj_H[bi][bj],   lambda_H_c*j_calve_l.d_H_this*dx_inv);
            
 	    float H_r = get_cell(H,i,j+1,ny,nx);
 	    float u_r = get_vfacet(u,i,j+1,ny,nx);
@@ -712,6 +745,10 @@ void compute_vjp(
             atomicAdd(&s_adj_H[bi][bj+1], lambda_H_c*j_q_r.d_H_r*dx_inv);
             atomicAdd(&s_adj_u[bi][bj+1], lambda_H_c*j_q_r.d_u*dx_inv);
 
+	    float bed_r = get_cell(bed,i,j+1,ny,nx);
+	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,bed_c,bed_r,calving_rate,sigmoid_c},i,j+1,ny,nx);
+	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_r.d_H_this*dx_inv);
+
 	    float H_t = get_cell(H,i-1,j,ny,nx);
 	    float v_t = get_hfacet(v,i,j,ny,nx);
 	    VerticalFluxJacobian j_q_t = get_vertical_flux_jac({v_t,H_t,H_c}, i, j, ny, nx);
@@ -719,12 +756,21 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi-1][bj], lambda_H_c*j_q_t.d_H_t*dx_inv);
 	    atomicAdd(&s_adj_v[bi][bj],   lambda_H_c*j_q_t.d_v*dx_inv);
 
+	    float bed_t = get_cell(bed,i-1,j,ny,nx);
+	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,bed_c,bed_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_t.d_H_this*dx_inv);
+
+
 	    float H_b = get_cell(H,i+1,j,ny,nx);
 	    float v_b = get_hfacet(v,i+1,j,ny,nx);
 	    VerticalFluxJacobian j_q_b = get_vertical_flux_jac({v_b,H_c,H_b}, i + 1, j, ny, nx);
             atomicAdd(&s_adj_H[bi][bj],   -lambda_H_c*j_q_b.d_H_t*dx_inv);
             atomicAdd(&s_adj_H[bi+1][bj], -lambda_H_c*j_q_b.d_H_b*dx_inv);
 	    atomicAdd(&s_adj_v[bi+1][bj], -lambda_H_c*j_q_b.d_v*dx_inv);
+
+	    float bed_b = get_cell(bed,i+1,j,ny,nx);
+	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,bed_c,bed_b,calving_rate,sigmoid_c},i+1,j,ny,nx);
+	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_b.d_H_this*dx_inv);
 
 	    float masked = get_cell(mask,i,j,ny,nx);
 	    float lambda_H_c_ = get_cell(lambda_H,i,j,ny,nx);
@@ -847,22 +893,34 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi+1][bj-1],-lambda_u_l * j_sigma_xy_bl.d_eta_H*eta_H_bl.d_H_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi+1][bj],  -lambda_u_l * j_sigma_xy_bl.d_eta_H*eta_H_bl.d_H_br*dx_inv);
 	    }
-
-            {
+            
+            {    
             float u_l    = get_vfacet(u,i,j,ny,nx);
-            float lambda_u_l    = get_vfacet(lambda_u,i,j,ny,nx);
+            float v_tl   = get_hfacet(v,i,j-1,ny,nx);
+	    float v_tr   = get_hfacet(v,i,j,ny,nx);
+	    float v_bl   = get_hfacet(v,i+1,j-1,ny,nx);
+	    float v_br   = get_hfacet(v,i+1,j,ny,nx);
+
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
 	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,H_l,H_c,bed_l,bed_c,beta_l,beta_c,water_drag,sigmoid_c});
+	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,bed_l,bed_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
 
-	    atomicAdd(&s_adj_u[bi][bj],lambda_u_l * j_tau_bx.d_u);
-	    atomicAdd(&s_adj_H[bi][bj-1], lambda_u_l * j_tau_bx.d_H_l);
-	    atomicAdd(&s_adj_H[bi][bj],   lambda_u_l * j_tau_bx.d_H_r);
+
+	    float lambda_u_l = get_vfacet(lambda_u,i,j,ny,nx);
+	    atomicAdd(&s_adj_u[bi][bj],     lambda_u_l * j_tau_bx.d_u);
+	    atomicAdd(&s_adj_v[bi][bj-1],   lambda_u_l * j_tau_bx.d_v_tl);
+	    atomicAdd(&s_adj_v[bi][bj],     lambda_u_l * j_tau_bx.d_v_tr);
+	    atomicAdd(&s_adj_v[bi+1][bj-1], lambda_u_l * j_tau_bx.d_v_bl);
+	    atomicAdd(&s_adj_v[bi+1][bj],   lambda_u_l * j_tau_bx.d_v_br);
+	    atomicAdd(&s_adj_H[bi][bj-1],   lambda_u_l * j_tau_bx.d_H_l);
+	    atomicAdd(&s_adj_H[bi][bj],     lambda_u_l * j_tau_bx.d_H_r);
+
 	    }
+	    
 
 	    {
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
@@ -989,22 +1047,36 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi][bj],    lambda_v_t * j_sigma_xy_tr.d_eta_H*eta_H_tr.d_H_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj+1],  lambda_v_t * j_sigma_xy_tr.d_eta_H*eta_H_tr.d_H_br*dx_inv);            
 	    }
-
+             
+	    
 	    {
-	    float v_t = get_hfacet(v,i,j,ny,nx);
-	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
+	    float v_t  = get_hfacet(v,i,j,ny,nx);
+            float u_tl = get_vfacet(u,i-1,j,ny,nx);
+            float u_tr = get_vfacet(u,i-1,j+1,ny,nx);
+            float u_bl = get_vfacet(u,i,j,ny,nx);
+            float u_br = get_vfacet(u,i,j+1,ny,nx);
+
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
-	    float bed_t = get_cell(bed,i-1,j,ny,nx);
-	    float bed_c = get_cell(bed,i,j,ny,nx);
+	    float bed_t  = get_cell(bed,i-1,j,ny,nx);
+	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 
-	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,H_t,H_c,bed_t,bed_c,beta_t,beta_c,water_drag,sigmoid_c});
-	    atomicAdd(&s_adj_v[bi][bj],lambda_v_t * j_tau_by.d_v);
-	    atomicAdd(&s_adj_H[bi-1][bj], lambda_v_t * j_tau_by.d_H_t);
-	    atomicAdd(&s_adj_H[bi][bj],   lambda_v_t * j_tau_by.d_H_b);
+	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,bed_t,bed_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    
+	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
+	    
+	    atomicAdd(&s_adj_v[bi][bj],    lambda_v_t * j_tau_by.d_v);
+            atomicAdd(&s_adj_u[bi-1][bj],   lambda_v_t * j_tau_by.d_u_tl);
+            atomicAdd(&s_adj_u[bi-1][bj+1], lambda_v_t * j_tau_by.d_u_tr);
+            atomicAdd(&s_adj_u[bi][bj],     lambda_v_t * j_tau_by.d_u_bl);
+            atomicAdd(&s_adj_u[bi][bj+1],   lambda_v_t * j_tau_by.d_u_br);
+	    atomicAdd(&s_adj_H[bi-1][bj],  lambda_v_t * j_tau_by.d_H_t);
+	    atomicAdd(&s_adj_H[bi][bj],    lambda_v_t * j_tau_by.d_H_b);
+
 	    }
+	    
 
 	    {
             float lambda_v_t    = get_hfacet(lambda_v,i,j,ny,nx);
@@ -1027,7 +1099,7 @@ void compute_vjp(
     int g_base_y = blockIdx.y * stride - halo;
     int g_base_x = blockIdx.x * stride - halo;
     
-
+    
     // Flush U (16x17)
     for (int k = tid; k < 272; k += 256) {
 
@@ -1037,7 +1109,7 @@ void compute_vjp(
         if (fabsf(val) > 0.0f) {
             int gy = g_base_y + r;
             int gx = g_base_x + c;
-            if (gy >= 0 && gy < ny && gx >= 0 && gx <= nx) // Global Bounds Check
+            if (gy >= 0 && gy < ny && gx > 0 && gx < nx) // Global Bounds Check incl. Dirichlet masking
                 atomicAdd(&vjp_u[gy * (nx+1) + gx], val);
         }
     }
@@ -1050,7 +1122,7 @@ void compute_vjp(
         if (fabsf(val) > 0.0f) {
             int gy = g_base_y + r;
             int gx = g_base_x + c;
-            if (gy >= 0 && gy <= ny && gx >= 0 && gx < nx) 
+            if (gy > 0 && gy < ny && gx >= 0 && gx < nx) 
                 atomicAdd(&vjp_v[gy * nx + gx], val);
         }
     }
@@ -1061,10 +1133,12 @@ void compute_vjp(
         if (fabsf(val) > 0.0f) {
             int gy = g_base_y + bi;
             int gx = g_base_x + bj;
+	    float masked = get_cell(mask,gy,gx,ny,nx);
+	    if (masked > 0.0f) { val = 0.0f; }
             if (gy >= 0 && gy < ny && gx >= 0 && gx < nx)
                 atomicAdd(&vjp_H[gy * nx + gx], val);
         }
     }
+    
 
 }
-*/

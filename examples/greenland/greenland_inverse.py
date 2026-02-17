@@ -12,15 +12,9 @@ import numpy as np
 from scipy.optimize import fmin_l_bfgs_b
 
 
-def allocate_pinned(shape, dtype=np.float64):
-    """Allocate a pinned (page-locked) numpy array for fast GPU transfers."""
-    nbytes = int(np.prod(shape) * np.dtype(dtype).itemsize)
-    mem = cp.cuda.alloc_pinned_memory(nbytes)
-    return np.frombuffer(mem, dtype=dtype, count=int(np.prod(shape))).reshape(shape)
-
 from glide import IcePhysics
 from glide.io import VTIWriter, write_vti
-from glide.physics import abs_loss, abs_grad, tikhonov_regularization
+from glide.physics import abs_loss, tikhonov_regularization
 from glide.data import (
     load_bedmachine,
     load_velocity_mosaic,
@@ -29,35 +23,37 @@ from glide.data import (
     interpolate_to_grid,
     load_greenland_preprocessed
 )
-from glide.kernels import restrict_vfacet, restrict_hfacet, get_kernels
-from glide.solver import fascd_vcycle, adjoint_vcycle, restrict_parameters_to_hierarchy
-from glide.kernels import prolongate_cell_centered
+
+
+from glide.kernels import restrict_vfacet, restrict_hfacet, prolongate_cell_centered, get_kernels
+from glide.solver import adjoint_vcycle_fas, restrict_parameters_to_hierarchy
+from scipy.ndimage import gaussian_filter
+
 
 # =============================================================================
 # Configuration - modify these paths and parameters
 # =============================================================================
 
-GEOMETRY_PATH = "./data/BedMachineGreenland-v5.nc"
-U_OBS_PATH = "./data/greenland_vel_mosaic250_vx_v1.tif"
-V_OBS_PATH = "./data/greenland_vel_mosaic250_vy_v1.tif"
-SMB_PATH = "./data/MARv3.9-yearly-MIROC5-rcp85-ltm1995-2014.nc"
 OUTPUT_DIR = "./inverse_output"
 
 SKIP = 6              # Geometry downsampling factor
 DT = 10.0             # Time step (years)
 N_LEVELS = 5          # Multigrid levels
-REG_WEIGHT = 1e-4     # Tikhonov regularization weight
 
 # Physical constants
 RHO_ICE = 917.0
 G = 9.81
 N_GLEN = 3.0
 
-kernels = get_kernels()
+REG_WEIGHT = 1e-4     # Tikhonov regularization weight
 # =============================================================================
 # Load data - from source files
 # =============================================================================
 """
+GEOMETRY_PATH = "./data/BedMachineGreenland-v5.nc"
+U_OBS_PATH = "./data/greenland_vel_mosaic250_vx_v1.tif"
+V_OBS_PATH = "./data/greenland_vel_mosaic250_vy_v1.tif"
+SMB_PATH = "./data/MARv3.9-yearly-MIROC5-rcp85-ltm1995-2014.nc"
 
 print("Loading geometry...")
 geometry = load_bedmachine(GEOMETRY_PATH, skip=SKIP, thklim=0.1)
@@ -93,9 +89,14 @@ dataset = load_greenland_preprocessed()
 ny,nx = dataset.ny,dataset.nx
 dx = dataset.dx
 bed = dataset.bed.values
+bed = gaussian_filter(bed,1)
 surface = dataset.surface.values
 thickness = dataset.thickness.values
+thickness = gaussian_filter(thickness,1)
+beta = dataset.beta.values
+beta.fill(2.5)
 smb = dataset.smb.values
+
 u_obs_cell = dataset.vx.values
 v_obs_cell = dataset.vy.values
 
@@ -115,37 +116,19 @@ B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
 
 
 print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, thklim=0.1, water_drag=1e-6)
+physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
+        thklim=0.1,
+        n=3.0,eps_reg=1e-5,
+        m=1./3.,u_reg=1.0,
+        water_drag=1e-5,
+        calving_rate=1000.0,sigmoid_c=0.1)
+
 physics.set_geometry(bed, thickness)
-physics.set_parameters(B=B, beta=0.01, smb=smb)
+physics.set_parameters(B=B, beta=beta, smb=smb)
 
 grid = physics.grid
+kernels = get_kernels()
 
-# Reset state
-grid.u.fill(0.0)
-grid.v.fill(0.0)
-grid.H[:] = grid.H_prev
-
-# Forward solve
-restrict_parameters_to_hierarchy(grid)
-#grid.f_H[:,:] = grid.H_prev/grid.dt + grid.smb
-#for _ in range(5):
-#    fascd_vcycle(grid, physics.thklim, finest=True)
-
-physics.forward(dt=1.0,n_vcycles=5,verbose=False,update_geometry=False)
-
-# Compute loss
-J = abs_loss(grid.u, grid.v, u_obs, v_obs)
-dJdu, dJdv = abs_grad(grid.u, grid.v, u_obs, v_obs)
-
-# Adjoint solve
-grid.f_adj_u[:] = -dJdu
-grid.f_adj_v[:] = -dJdv
-grid.f_adj_H.fill(0.0)
-grid.Lambda.fill(0.0)
-
-adjoint_vcycle(grid)
-"""
 # =============================================================================
 # Build observation hierarchy for multi-resolution optimization
 # =============================================================================
@@ -159,23 +142,10 @@ while g.child is not None:
     obs_hierarchy.append((current_u, current_v))
     g = g.child
 
-# Build list of grids from finest to coarsest
-level_grids = [grid]
-g = grid
-while g.child is not None:
-    level_grids.append(g.child)
-    g = g.child
-
-# =============================================================================
-# Multi-resolution optimization
-# =============================================================================
-
-#for level_idx in range(len(level_grids) - 1, -1, -1):
-for level_idx in range(1):#len(level_grids) - 1, -1, -1):
-    current_grid = level_grids[level_idx]
+for level_idx in range(N_LEVELS - 1, -1, -1):
+    physics.set_grid_level(level_idx)
+    current_grid = physics.grid
     u_obs_level, v_obs_level = obs_hierarchy[level_idx]
-
-    print(f"\n=== Optimizing at level {level_idx}: {current_grid.ny} x {current_grid.nx} ===")
 
     writer = VTIWriter(
         f"{OUTPUT_DIR}/level_{level_idx}",
@@ -194,58 +164,43 @@ for level_idx in range(1):#len(level_grids) - 1, -1, -1):
 
     counter = [0]
 
-    # Allocate pinned memory for fast CPU-GPU transfers
-    n_params = current_grid.nh
-    x_pinned = allocate_pinned(n_params, dtype=np.float64)
-    grad_pinned = allocate_pinned(n_params, dtype=np.float64)
+    u_ref,v_ref,H_ref = physics.forward(dt=10.0,n_vcycles=10,verbose=True,update_geometry=False)
+    u_ref = cp.array(u_ref)
+    v_ref = cp.array(v_ref)
+    H_ref = cp.array(H_ref)
 
     def objective(log_beta_flat):
-        # Transfer from (pinned) CPU to GPU
-        log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32)
+
+        log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32) 
         current_grid.beta[:] = cp.exp(log_beta)
-
-        # Reset state
-        current_grid.u.fill(0.0)
-        current_grid.v.fill(0.0)
-        current_grid.H[:] = current_grid.H_prev
-
-        # Forward solve
         restrict_parameters_to_hierarchy(current_grid)
-        current_grid.f_H[:,:] = current_grid.H_prev/current_grid.dt + current_grid.smb
-        for _ in range(5):
-            fascd_vcycle(current_grid, physics.thklim, finest=True)
+
+        current_grid.u[:] = u_ref
+        current_grid.v[:] = v_ref
+        current_grid.H[:] = H_ref
+        u, v, H = physics.forward(dt=10.0, n_vcycles=5, verbose=True,update_geometry=False)
 
         # Compute loss
-        J = abs_loss(current_grid.u, current_grid.v, u_obs_level, v_obs_level)
-        dJdu, dJdv = abs_grad(current_grid.u, current_grid.v, u_obs_level, v_obs_level)
+        J_data, dJdu, dJdv = abs_loss(current_grid.u, current_grid.v, u_obs_level, v_obs_level)
+        #dJdu, dJdv = abs_grad(current_grid.u, current_grid.v, u_obs_level, v_obs_level)
+        dJdH = cp.zeros_like(H)
+    
+        current_grid.Lambda.fill(0)
+        physics.adjoint(dJdu,dJdv,dJdH,n_vcycles=5,verbose=True)
+        current_grid.compute_grad_beta()
+        grad_beta = cp.array(current_grid.grad_beta)
+        grad_log_beta = current_grid.beta*grad_beta
 
-        # Adjoint solve
-        current_grid.f_adj_u[:] = -dJdu
-        current_grid.f_adj_v[:] = -dJdv
-        current_grid.f_adj_H.fill(0.0)
-        current_grid.Lambda.fill(0.0)
+        J_tikh,tikh_grad = tikhonov_regularization(log_beta,weight=cp.float32(REG_WEIGHT))
+        J = J_data + J_tikh
+        grad_log_beta += tikh_grad
 
-        adjoint_vcycle(current_grid)
+        print(f"Level: {level_idx},  Loss: {J:.4f}, Loss Data: {J_data:.4f}, Loss Tikh: {J_tikh:.4f}")
 
-        # Gradient
-        grad_beta = current_grid.compute_grad_beta()
-        grad_log_beta = current_grid.beta * grad_beta
-
-        # Regularization
-        tik_loss, tik_grad = tikhonov_regularization(current_grid.beta)
-        tik_loss *= REG_WEIGHT
-        tik_grad *= REG_WEIGHT
-
-        total_loss = J + tik_loss
-        total_grad = grad_log_beta + tik_grad
-
-        print(f"  Loss: {J:.4f}, Reg: {tik_loss:.4f}, Total: {total_loss:.4f}")
-
-        # Transfer gradient to pinned memory (fast GPU->CPU)
-        grad_pinned[:] = total_grad.ravel().get().astype(np.float64)
-        return float(total_loss), grad_pinned
+        return float(J),grad_log_beta.ravel().get().astype(np.float64)
 
     def callback(log_beta_flat):
+        """Callback for visualization."""
         log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32)
         counter[0] += 1
 
@@ -258,33 +213,26 @@ for level_idx in range(1):#len(level_grids) - 1, -1, -1):
         })
         writer.write_pvd()
 
-    # Initialize x0 in pinned memory
-    x_pinned[:] = cp.log(current_grid.beta).ravel().get().astype(np.float64)
-    bounds = [(-6, 5)] * current_grid.nh
-
+    x_init = cp.log(current_grid.beta).ravel().get().astype(np.float64)
+    bounds = [(-5,2)]*current_grid.nh
+    #J,grad = objective(x_init)
     result = fmin_l_bfgs_b(
-        objective, x_pinned,
+        objective, x_init,
         bounds=bounds,
         callback=callback,
-        factr=1e12,
-        m=15
+        factr=1e11,
+        m=10,
+        maxiter=40
     )
 
-    # Update beta with optimized values
-    current_grid.beta[:] = cp.exp(cp.array(result[0].reshape((current_grid.ny, current_grid.nx))).astype(cp.float32))
-    current_grid.mask.fill(0.0)
-
+    current_grid.beta[:] = cp.exp(cp.array(result[0].reshape((current_grid.ny, current_grid.nx))).astype(cp.float32))     # Prolongate to finer grid for next level
     # Save result
     pickle.dump(
         current_grid.beta.get(),
         open(f"{OUTPUT_DIR}/beta_level_{level_idx}.p", 'wb')
     )
 
-    # Prolongate to finer grid for next level
     if level_idx > 0:
-        parent = level_grids[level_idx - 1]
-        prolongate_cell_centered(current_grid.beta, kernels, H_fine=parent.beta)
+        parent = physics.grids[level_idx - 1]
+        prolongate_cell_centered(current_grid.beta, kernels, H_fine=parent.beta)   
 
-print("\nOptimization complete!")
-print(f"Results saved to {OUTPUT_DIR}/")
-"""

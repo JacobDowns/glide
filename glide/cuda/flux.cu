@@ -51,10 +51,10 @@ HorizontalFluxJacobian get_horizontal_flux_jac(
     }
 
     float H_avg = 0.5f*(s.H_l + s.H_r);
-    float u_mag = sqrtf(s.u * s.u + 10.0f);//fabsf(s.u);
-    float u_sign = s.u / u_mag;//copysignf(1.0f, s.u);
-    //float u_mag = fabsf(s.u);
-    //float u_sign = copysignf(1.0f, s.u);
+    //float u_mag = sqrtf(s.u * s.u + 10.0f);//fabsf(s.u);
+    //float u_sign = s.u / u_mag;//copysignf(1.0f, s.u);
+    float u_mag = fabsf(s.u);
+    float u_sign = copysignf(1.0f, s.u);
     jac.res = H_avg*s.u - 0.5f*u_mag*(s.H_r - s.H_l);
 
     jac.d_H_l = 0.5f*(s.u + u_mag);
@@ -122,10 +122,10 @@ VerticalFluxJacobian get_vertical_flux_jac(
     }
 
     float H_avg = 0.5f*(s.H_t + s.H_b);
-    float v_mag = sqrtf(s.v * s.v + 10.0f);//fabsf(s.v);
-    float v_sign = s.v / v_mag;//copysignf(1.0f, s.v);
-    //float v_mag = fabsf(s.v);
-    //float v_sign = copysignf(1.0f, s.v);
+    //float v_mag = sqrtf(s.v * s.v + 10.0f);//fabsf(s.v);
+    //float v_sign = s.v / v_mag;//copysignf(1.0f, s.v);
+    float v_mag = fabsf(s.v);
+    float v_sign = copysignf(1.0f, s.v);
     jac.res = H_avg*s.v - 0.5f*v_mag*(s.H_t - s.H_b);
 
     jac.d_H_t = 0.5f*(s.v - v_mag);

@@ -69,7 +69,7 @@ ela = 1800
 smb = 0.5/1000.0*(srf - ela)
 
 print("Loading beta...")
-beta = cp.ones_like(thk)*0.1#cp.array(pickle.load(open(BETA_PATH, 'rb')))
+beta = cp.ones_like(thk)*2.5#cp.array(pickle.load(open(BETA_PATH, 'rb')))
 
 # Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
 B_scalar = cp.float32(1e-16 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
@@ -80,7 +80,7 @@ B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
 # =============================================================================
 
 print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, thklim=0.1,water_drag=1e-6)
+physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, thklim=0.1,water_drag=1e-6, m=1./3.)
 physics.set_geometry(bed, thk)
 physics.set_parameters(B=B, beta=beta, smb=smb)
 

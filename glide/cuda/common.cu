@@ -75,6 +75,12 @@ __device__ __forceinline__ float sigmoid_deriv(const float z, const float c) {
    return c * s * (1.0f - s);
 }
 
+__device__ __forceinline__ float get_grounded(const float H, const float B, const float sigmoid_c) 
+{
+   float z = B + 0.917f*H;
+   return sigmoid(z, sigmoid_c);
+}
+
 __device__ __forceinline__ float get_vfacet(const float* __restrict__ u, int i, int j, int ny, int nx) {
     //if (i < 0 || i >= ny || j < 0 || j > nx) return 0.0f;
     i = max(min(i,ny - 1),0);
@@ -172,6 +178,46 @@ __device__ void lu_5x5_solve(
     x[2] = (y[2] - LU[2][3]*x[3] - LU[2][4]*x[4]) / LU[2][2];
     x[1] = (y[1] - LU[1][2]*x[2] - LU[1][3]*x[3] - LU[1][4]*x[4]) / LU[1][1];
     x[0] = (y[0] - LU[0][1]*x[1] - LU[0][2]*x[2] - LU[0][3]*x[3] - LU[0][4]*x[4]) / LU[0][0];
+}
+
+__device__ __forceinline__
+void mat5x5_mat(const float* __restrict__ A,
+                const float* __restrict__ B,
+                float* __restrict__ C)
+{
+    #pragma unroll
+    for (int i = 0; i < 5; ++i)
+    {
+        #pragma unroll
+        for (int j = 0; j < 5; ++j)
+        {
+            float sum = 0.0;
+            #pragma unroll
+            for (int k = 0; k < 5; ++k)
+            {
+                sum += A[5*i + k] * B[5*k + j];
+            }
+            C[5*i + j] = sum;
+        }
+    }
+}
+
+__device__ __forceinline__
+void mat5x5_vec(const float* __restrict__ A,
+                const float* __restrict__ x,
+                float* __restrict__ y)
+{
+    #pragma unroll
+    for (int i = 0; i < 5; ++i)
+    {
+        double sum = 0.0;
+        #pragma unroll
+        for (int j = 0; j < 5; ++j)
+        {
+            sum += A[5*i + j] * x[j];
+        }
+        y[i] = sum;
+    }
 }
 
 

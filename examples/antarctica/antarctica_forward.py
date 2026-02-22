@@ -26,10 +26,10 @@ from glide.data import (
 OUTPUT_DIR = "./output"
 
 SKIP = 4           # Geometry downsampling factor
-DT = 20.0          # Time step (years)
+DT = 25.0          # Time step (years)
 N_STEPS = 20      # Number of time steps
 N_LEVELS = 5       # Multigrid levels
-N_VCYCLES = 5      # V-cycles per time step
+N_VCYCLES = 10      # V-cycles per time step
 
 # Physical constants
 RHO_ICE = 917.0
@@ -84,8 +84,8 @@ beta = cp.array(pickle.load(open(BETA_PATH, 'rb')))
 # =============================================================================
 
 # Emulate fixed calving front
-smb[surface == 0] = -50.0
-#beta[:] = 2.5
+smb[surface == 0] = -40.0
+#beta[beta>3.5] = 3.5
 
 
 # Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
@@ -95,8 +95,8 @@ B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
 print("Initializing physics...")
 physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
         thklim=0.1,
-        n=3.0,eps_reg=1e-6,
-        m=1./3.,u_reg=1000.0,
+        n=3.0,eps_reg=1e-5,
+        m=1./3.,u_reg=100.0,
         water_drag=1e-5,
         calving_rate=0.0,sigmoid_c=0.1)
 physics.set_geometry(bed, thickness)
@@ -104,6 +104,9 @@ physics.set_parameters(B=B, beta=beta, smb=smb)
 
 # Access the grid hierarchy
 grid = physics.grid
+grid.compute_grounded()
+smb[grid.grounded.get()<0.1] -= 1.0
+physics.set_parameters(smb=smb)
 
 # =============================================================================
 # Set up output

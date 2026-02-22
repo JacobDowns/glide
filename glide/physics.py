@@ -146,7 +146,7 @@ class IcePhysics:
             restrict_cell_centered(parent.H_prev, self.kernels, f_coarse=child.H_prev)
             child.gamma.fill(self.thklim)
 
-    def forward(self, dt, n_vcycles=3, verbose=False, update_geometry=True):
+    def forward(self, dt, n_vcycles=3, rtol=1e-2, atol=5.0, verbose=False, update_geometry=True):
         """
         Perform one forward time step.
 
@@ -196,10 +196,9 @@ class IcePhysics:
         # Solve
         for i in range(n_vcycles):
             fascd_vcycle(self.grid, self.thklim, finest=True)
-            #self.grid.vanka_sweep(20,n_inner=30,omega=cp.float32(0.5))
 
             if verbose:
-                self.grid.compute_residual()
+                self.grid.compute_residual(recompute_grounded=True)
                 r_combined = float(cp.sqrt(
                     cp.linalg.norm(self.grid.r_u)**2 +
                     cp.linalg.norm(self.grid.r_v)**2 +
@@ -210,7 +209,8 @@ class IcePhysics:
                       f"|r_u| = {float(cp.linalg.norm(self.grid.r_u)):.2e}, "
                       f"|r_v| = {float(cp.linalg.norm(self.grid.r_v)):.2e}, "
                       f"|r_H| = {float(cp.linalg.norm(self.grid.r_H)):.2e}")
-
+            if rel < rtol or r_combined < atol: 
+                break
         # Update H_prev for next time step
         if update_geometry:
             self.grid.H_prev[:] = self.grid.H[:]

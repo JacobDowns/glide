@@ -114,8 +114,8 @@ B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
 print("Initializing physics...")
 physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
         thklim=0.1,
-        n=3.0,eps_reg=1e-6,
-        m=1.0/3.0,u_reg=1000.0,
+        n=3.0,eps_reg=1e-5,
+        m=1.0/3.0,u_reg=100.0,
         water_drag=1e-5,
         calving_rate=0.0,sigmoid_c=0.1)
 
@@ -171,7 +171,7 @@ for level_idx in [4,3,2,1,0]:
         current_grid.u.fill(0)
         current_grid.v.fill(0)
         current_grid.H[:] = current_grid.H_prev
-        u, v, H = physics.forward(dt=10.0, n_vcycles=10, verbose=False,update_geometry=False)
+        u, v, H = physics.forward(dt=1.0, n_vcycles=10, verbose=False,update_geometry=False)
 
         # Compute loss
         J_data, dJdu, dJdv = huber_loss(current_grid.u, current_grid.v, u_obs_level, v_obs_level,epsilon=1.0,mask_threshold=0.001)
@@ -184,10 +184,10 @@ for level_idx in [4,3,2,1,0]:
         J = J_data + J_tikh
         grad_log_beta += tikh_grad
 
-        J_norm = 0.5*(log_beta**2).sum()/log_beta.size
-        J_norm_grad = log_beta/log_beta.size
+        #J_norm = 0.5*(log_beta**2).sum()/log_beta.size
+        #J_norm_grad = log_beta/log_beta.size
 
-        print(f"Level: {level_idx} {counter},  Loss: {J:.4f}, Loss Data: {J_data:.4f}, Loss Tikh: {J_tikh:.4f}, {J_norm}")
+        print(f"Level: {level_idx} {counter},  Loss: {J:.4f}, Loss Data: {J_data:.4f}, Loss Tikh: {J_tikh:.4f}")
 
         return float(J),grad_log_beta.ravel().get().astype(np.float64)
 
@@ -206,12 +206,12 @@ for level_idx in [4,3,2,1,0]:
         writer.write_pvd()
 
     x_init = cp.log(current_grid.beta).ravel().get().astype(np.float64)
-    bounds = [(-8,4)]*current_grid.nh
+    bounds = [(-8,3)]*current_grid.nh
     result = fmin_l_bfgs_b(
         objective, x_init,
         bounds=bounds,
         callback=callback,
-        factr=1e11,
+        factr=1e10,
         maxiter=200
     )
 

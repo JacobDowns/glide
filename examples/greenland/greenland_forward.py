@@ -29,10 +29,10 @@ from scipy.ndimage import gaussian_filter
 OUTPUT_DIR = "./output"
 
 SKIP = 6           # Geometry downsampling factor
-DT = 25.0          # Time step (years)
-N_STEPS = 50      # Number of time steps
+DT = 50.0          # Time step (years)
+N_STEPS = 20      # Number of time steps
 N_LEVELS = 5       # Multigrid levels
-N_VCYCLES = 5      # V-cycles per time step
+N_VCYCLES = 10      # V-cycles per time step
 
 # Physical constants
 RHO_ICE = 917.0
@@ -108,7 +108,7 @@ physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS,
         n=3.0,eps_reg=1e-5,
         m=1./3.,u_reg=1.0,
         water_drag=1e-5,
-        calving_rate=1000.0,sigmoid_c=0.1)
+        calving_rate=2000.0,sigmoid_c=0.1)
 physics.set_geometry(bed, thickness)
 physics.set_parameters(B=B, beta=beta, smb=smb)
 

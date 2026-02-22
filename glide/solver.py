@@ -20,6 +20,7 @@ def restrict_solution(grid):
     restrict_vfacet(grid.u, kernels, u_coarse=child.u)
     restrict_hfacet(grid.v, kernels, v_coarse=child.v)
     restrict_cell_centered(grid.H, kernels, f_coarse=child.H)
+    restrict_cell_centered(grid.grounded, kernels, f_coarse=child.grounded)
     restrict_max_pool(grid.mask, kernels, f_coarse=child.mask)
 
 def restrict_adjoint_solution(grid):
@@ -69,7 +70,7 @@ def restrict_solution_to_hierarchy(grid):
         restrict_solution_to_hierarchy(grid.child)
 
 
-def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),pre_steps=10,post_steps=30,final_steps=100,coarse_steps=200,newton_iterations=30):
+def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),pre_steps=0,post_steps=50,final_steps=150,coarse_steps=200,newton_iterations=30):
     """
     FASCD V-cycle for the coupled SSA + mass conservation system.
 
@@ -94,7 +95,7 @@ def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),
     if grid.child is None:
         # Coarsest level: direct solve
         grid.gamma[:] = grid.w_H + grid.chi[:]
-        grid.vanka_sweep(coarse_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=finest)
+        grid.vanka_sweep(coarse_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=finest,recompute_grounded=False)
         grid.gamma.fill(thklim)
         return
 
@@ -107,7 +108,7 @@ def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),
 
     # Pre-smooth with local constraint
     grid.gamma[:, :] = grid.w_H + grid.phi
-    grid.vanka_sweep(pre_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=finest)
+    grid.vanka_sweep(pre_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=finest,recompute_grounded=finest)
     grid.gamma.fill(thklim)
 
     # Compute coarse grid correction
@@ -118,11 +119,11 @@ def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),
     grid.child.w[:] = grid.child.U[:]
 
     # Compute and restrict residual
-    grid.compute_residual(use_mask=False,enable_calving=finest)
+    grid.compute_residual(use_mask=False,enable_calving=finest,recompute_grounded=False)
     restrict_residual(grid)
 
     # Form coarse grid RHS: f_c = F_c(I_h^H u_h) - I_h^H r_h
-    grid.child.compute_F(use_mask=False,enable_calving=False)
+    grid.child.compute_F(use_mask=False,enable_calving=False,recompute_grounded=False)
     grid.child.f[:] = grid.child.F - grid.child.r
 
     # Recursive call
@@ -142,11 +143,11 @@ def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),
 
     # Post-smooth
     grid.gamma[:, :] = grid.w_H + grid.chi
-    grid.vanka_sweep(post_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=finest)
+    grid.vanka_sweep(post_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=finest,recompute_grounded=finest)
     grid.gamma.fill(thklim)
 
     if finest:
-        grid.vanka_sweep(final_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=True)
+        grid.vanka_sweep(final_steps,n_inner=newton_iterations,verbose=verbose,omega=omega,enable_calving=True,recompute_grounded=True)
 
 
 def adjoint_vcycle_fas(grid,

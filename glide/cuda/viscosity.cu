@@ -1,3 +1,38 @@
+template <int H, int W>
+__device__ void populate_grounded(
+    float (&grounded_local)[H][W],
+    int bi, int bj,
+    int i, int j,
+    const float* __restrict__ thk,
+    const float* __restrict__ bed,
+    float sigmoid_c,
+    int ny, int nx){
+
+    float H_c = get_cell(thk,i,j,ny,nx);
+    float bed_c = get_cell(bed,i,j,ny,nx);
+    grounded_local[bi][bj] = get_grounded(H_c,bed_c,sigmoid_c);
+}
+
+extern "C" __global__
+void compute_grounded(
+    float* __restrict__ grounded,
+    const float* __restrict__ H,
+    const float* __restrict__ bed,
+    float sigmoid_c,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);    
+
+    if (i < 0 || i >= ny || j<0 || j >= nx) return;
+
+    float H_c = get_cell(H,i,j,ny,nx);
+    float bed_c = get_cell(bed,i,j,ny,nx);
+    grounded[i * nx + j] = get_grounded(H_c,bed_c,sigmoid_c);
+}
+
 /*==================================================
   ================ VISCOSITY =======================
   ==================================================*/
@@ -109,6 +144,8 @@ __device__ void populate_viscosity(
 
 }
 
+
+
 /*==================================================
   ========== Viscosity-Thickness Product ===========
   ==================================================*/
@@ -219,3 +256,5 @@ DualFloat get_eta_H_vertex_dual(EtaHVertexStencilDual s) {
     EtaHVertexJacobian jac = get_eta_H_vertex_jac(s.get_primals());
     return {jac.res,jac.apply_jvp(s.get_diffs())};
 }
+
+

@@ -4,6 +4,7 @@ void compute_grad_beta(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
+    const float* __restrict__ grounded,
     const float* __restrict__ lambda_u,
     const float* __restrict__ lambda_v,
     const float* __restrict__ lambda_H,
@@ -49,11 +50,11 @@ void compute_grad_beta(
 
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
-	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
+	    float grounded_l  = get_cell(grounded,i,j-1,ny,nx);
+	    float grounded_c  = get_cell(grounded,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,bed_l,bed_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,grounded_l,grounded_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
 
 	    float lambda_u_l = get_vfacet(lambda_u,i,j,ny,nx);
 
@@ -71,12 +72,12 @@ void compute_grad_beta(
 
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
-	    float bed_t  = get_cell(bed,i-1,j,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
+	    float grounded_t  = get_cell(grounded,i-1,j,ny,nx);
+	    float grounded_c  = get_cell(grounded,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 
-	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,bed_t,bed_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,grounded_t,grounded_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
 	    
 	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
 	    

@@ -162,6 +162,7 @@ class Grid:
         self.mask = cp.zeros((ny, nx), dtype=cp.float32)
         self.error_mask = cp.zeros((ny, nx), dtype=cp.float32)
         self.gamma = cp.zeros((ny, nx), dtype=cp.float32)
+        self.grounded = cp.zeros((ny,nx),dtype=cp.float32)
 
     def _vec_to_fields(self, x):
         """Create field views into a monolithic state vector."""
@@ -196,7 +197,7 @@ class Grid:
         grid_size = (self.nx // stride + 1, self.ny // stride + 1)
         return grid_size, block_size, stride, halo
 
-    def compute_residual(self, use_mask=True, enable_calving=True):
+    def compute_residual(self, use_mask=True, enable_calving=True, recompute_grounded=True):
         """Compute residual r = f - F(U)."""
         kernel = self.kernels.ice.get_function('compute_residual')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -211,9 +212,12 @@ class Grid:
         else:
             calving_rate = cp.float32(0.0)
 
+        if recompute_grounded:
+            self.compute_grounded()
+
         kernel(grid_size, block_size,
                (self.r_u, self.r_v, self.r_H,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 self.f_u, self.f_v, self.f_H,
                 self.bed, self.B, self.beta,
                 mask, self.gamma,
@@ -226,7 +230,7 @@ class Grid:
 
 
 
-    def compute_F(self, use_mask=True, enable_calving=True):
+    def compute_F(self, use_mask=True, enable_calving=True, recompute_grounded=True):
         """Compute F(U) (operator evaluation without RHS)."""
         kernel = self.kernels.ice.get_function('compute_residual')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -241,10 +245,13 @@ class Grid:
         else:
             calving_rate = cp.float32(0.0)
 
+        if recompute_grounded:
+            self.compute_grounded()
+
 
         kernel(grid_size, block_size,
                (self.F_u, self.F_v, self.F_H,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 self.Z_u, self.Z_v, self.Z_H,
                 self.bed, self.B, self.beta,
                 mask, self.gamma,
@@ -255,7 +262,7 @@ class Grid:
                 self.dx, self.dt,
                 self.ny, self.nx, stride, halo))
 
-    def compute_jvp(self, use_mask=True, enable_calving=True):
+    def compute_jvp(self, use_mask=True, enable_calving=True, recompute_grounded=True):
         """Compute Jacobian-vector product J @ d_U."""
         kernel = self.kernels.ice.get_function('compute_jvp')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -271,10 +278,13 @@ class Grid:
         else:
             calving_rate = cp.float32(0.0)
 
+        if recompute_grounded:
+            self.compute_grounded()
+
 
         kernel(grid_size, block_size,
                (self.j_u, self.j_v, self.j_H,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 self.d_u, self.d_v, self.d_H,
                 self.bed, self.B, self.beta,
                 mask, self.gamma,
@@ -293,7 +303,7 @@ class Grid:
         self.compute_vjp(use_mask=use_mask,enable_calving=enable_calving)
         self.F_adj[:] = -self.l
 
-    def compute_vjp(self,use_mask=True,enable_calving=True):
+    def compute_vjp(self,use_mask=True,enable_calving=True,recompute_grounded=False):
         """Compute vector-Jacobian product Lambda^T @ J."""
         kernel = self.kernels.ice.get_function('compute_vjp')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -308,10 +318,13 @@ class Grid:
         else:
             calving_rate = cp.float32(0.0)
 
+        if recompute_grounded:
+            self.compute_grounded()
+
         self.l.fill(0.0)
         kernel(grid_size, block_size,
                (self.l_u, self.l_v, self.l_H,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 self.lambda_u, self.lambda_v, self.lambda_H,
                 self.bed, self.B, self.beta,
                 mask, self.gamma,
@@ -322,7 +335,7 @@ class Grid:
                 self.dx, self.dt,
                 self.ny, self.nx, stride, halo))
 
-    def vanka_smooth(self, n_inner=1, enable_calving=True):
+    def vanka_smooth(self, n_inner=1, enable_calving=True, recompute_grounded=True, relax_grounded=0.5):
         """Apply one Vanka smoother pass (red-black)."""
         kernel = self.kernels.ice.get_function('vanka_smooth')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -332,10 +345,15 @@ class Grid:
         else:
             calving_rate = cp.float32(0.0)
 
+        if recompute_grounded:
+            grounded_prev = cp.array(self.grounded)
+            self.compute_grounded()
+            self.grounded[:] = relax_grounded*grounded_prev + (1.0 - relax_grounded)*self.grounded
+
         self.delta_U.fill(0.0)
         kernel(grid_size, block_size,
                (self.delta_u, self.delta_v, self.delta_H, self.mask,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 self.f_u, self.f_v, self.f_H,
                 self.bed, self.B, self.beta, self.gamma,
                 self._n, self._eps_reg, 
@@ -347,7 +365,7 @@ class Grid:
                 n_inner))
 
 
-    def vanka_smooth_adjoint(self, use_mask=True, enable_calving=True):
+    def vanka_smooth_adjoint(self, use_mask=True, enable_calving=True, recompute_grounded=False):
         """Apply adjoint Vanka smoother pass."""
         kernel = self.kernels.ice.get_function('vanka_smooth_adjoint')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -362,10 +380,13 @@ class Grid:
         else:
             calving_rate = cp.float32(0.0)
 
+        if recompute_grounded:
+            self.compute_grounded()
+
         self.delta_Lambda.fill(0.0)
         kernel(grid_size, block_size,
                (self.delta_lambda_u, self.delta_lambda_v, self.delta_lambda_H,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 mask,
                 self.r_adj_u, self.r_adj_v, self.r_adj_H,
                 self.bed, self.B, self.beta, self.gamma,
@@ -377,13 +398,13 @@ class Grid:
                 self.ny, self.nx, stride, halo
                 ))
 
-    def vanka_sweep(self, n_iter, verbose=False,n_inner=30, omega=cp.float32(0.5),enable_calving=True):
+    def vanka_sweep(self, n_iter, verbose=False,n_inner=30, omega=cp.float32(0.5),enable_calving=True,recompute_grounded=True):
         """Perform n_iter red-black Vanka smoothing sweeps."""
         for _ in range(n_iter):
-            self.vanka_smooth(n_inner=n_inner,enable_calving=enable_calving)
+            self.vanka_smooth(n_inner=n_inner,enable_calving=enable_calving,recompute_grounded=recompute_grounded)
             self.U[:] += omega * self.delta_U
         if verbose:
-            self.compute_residual(use_mask=True)
+            self.compute_residual(use_mask=True,recompute_grounded=False)
             print(self.dx,cp.linalg.norm(self.r_u),
                       cp.linalg.norm(self.r_v),
                       cp.linalg.norm(self.r_H))
@@ -405,7 +426,7 @@ class Grid:
         self.grad_beta.fill(0)
         kernel(grid_size, block_size,
                (self.grad_beta,
-                self.u, self.v, self.H,
+                self.u, self.v, self.H, self.grounded,
                 self.lambda_u, self.lambda_v, self.lambda_H,
                 self.bed, self.B, self.beta,
                 self.mask, self.gamma,
@@ -417,6 +438,17 @@ class Grid:
                 self.ny, self.nx, stride, halo))
 
         return self.grad_beta
+
+    def compute_grounded(self):
+        kernel = self.kernels.ice.get_function('compute_grounded')
+        grid_size, block_size, stride, halo = self._kernel_config()
+
+        kernel(grid_size, block_size,
+               (self.grounded,
+                self.H, self.bed, 
+                self._sigmoid_c,
+                self.ny, self.nx, 
+                stride, halo))
 
     def set_rhs(self):
         self.f_H[:,:] = self.H_prev/self.dt + self.smb

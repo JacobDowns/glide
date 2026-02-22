@@ -149,20 +149,20 @@ DualFloat get_vertical_flux_dual(
 
 struct CellCalvingStencil {
     float H;
-    float bed;
+    float grounded;
     float calving_rate;
     float sigmoid_c;
 };
 
 struct CellCalvingStencilDual {
     DualFloat H;
-    float bed;
+    float grounded;
     float calving_rate;
     float sigmoid_c;
 
     __device__ __forceinline__
     CellCalvingStencil get_primals() const {
-        return {H.v,bed,calving_rate,sigmoid_c};
+        return {H.v,grounded,calving_rate,sigmoid_c};
     }
 
     __device__ __forceinline__
@@ -191,13 +191,8 @@ CellCalvingJacobian get_cell_calving_jac(
 
     CellCalvingJacobian jac = {0};
 
-    float z = s.bed + 0.917f*s.H;
-    float grounded = sigmoid(z, s.sigmoid_c);
-
-    //jac.res = -s.calving_rate*(1.0f - grounded);
-    //jac.d_H = 0.0f;
-    jac.res = -s.calving_rate*(1.0f - grounded)*s.H;
-    jac.d_H = -s.calving_rate*(1.0f - grounded);
+    jac.res = -s.calving_rate*(1.0f - s.grounded)*s.H;
+    jac.d_H = -s.calving_rate*(1.0f - s.grounded);
 
     return jac;
 }
@@ -213,20 +208,20 @@ DualFloat get_cell_calving_dual(
 
 struct FacetCalvingStencil {
     float H_this, H_other;
-    float bed_this, bed_other;
+    float grounded_this, grounded_other;
     float calving_rate;
     float sigmoid_c;
 };
 
 struct FacetCalvingStencilDual {
     DualFloat H_this, H_other;
-    float bed_this, bed_other;
+    float grounded_this, grounded_other;
     float calving_rate;
     float sigmoid_c;
 
     __device__ __forceinline__
     FacetCalvingStencil get_primals() const {
-        return {H_this.v,H_other.v,bed_this,bed_other,calving_rate,sigmoid_c};
+        return {H_this.v,H_other.v,grounded_this,grounded_other,calving_rate,sigmoid_c};
     }
 
     __device__ __forceinline__
@@ -255,13 +250,7 @@ FacetCalvingJacobian get_facet_calving_jac(
 
     FacetCalvingJacobian jac = {0};
 
-    float z_this = s.bed_this + 0.917f*s.H_this;
-    float grounded_this = sigmoid(z_this, s.sigmoid_c);
-
-    float z_other = s.bed_other + 0.917f*s.H_other;
-    float grounded_other = sigmoid(z_other, s.sigmoid_c);
-
-    float coeff = (1.0f - grounded_this)*(1.0f - grounded_other);
+    float coeff = (1.0f - s.grounded_this)*(1.0f - s.grounded_other);
     jac.res = coeff * s.calving_rate * s.H_this;
     jac.d_H_this = coeff * s.calving_rate;
     

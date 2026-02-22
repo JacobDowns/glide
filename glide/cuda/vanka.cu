@@ -9,6 +9,7 @@ void vanka_smooth(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
+    const float* __restrict__ grounded,
     const float* __restrict__ f_u,
     const float* __restrict__ f_v,
     const float* __restrict__ f_H,
@@ -34,7 +35,10 @@ void vanka_smooth(
     int i = blockIdx.y * stride + (threadIdx.y - halo);
 
     __shared__ float eta_local[bny][bnx];
+    //__shared__ float grounded_local[bny][bnx];
     
+    //populate_grounded(grounded_local, bi, bj, i, j, H, bed, sigmoid_c, ny, nx);
+
     if (i < 0 || i >= ny || j<0 || j >= nx) return;
 
     populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
@@ -55,6 +59,17 @@ void vanka_smooth(
 	float v_b = get_hfacet(v, i + 1, j, ny, nx);
 	float H_c = get_cell(H, i, j, ny, nx);
 	float thklim = get_cell(gamma,i,j,ny,nx);
+	
+	//float grounded_c = grounded_local[bi][bj];
+	//float grounded_l = grounded_local[bi][bj-1];
+	//float grounded_r = grounded_local[bi][bj+1];
+	//float grounded_t = grounded_local[bi-1][bj];
+	//float grounded_b = grounded_local[bi+1][bj];
+	float grounded_c = get_cell(grounded,i,j,ny,nx);
+	float grounded_l = get_cell(grounded,i,j-1,ny,nx);
+	float grounded_r = get_cell(grounded,i,j+1,ny,nx);
+	float grounded_t = get_cell(grounded,i-1,j,ny,nx);
+	float grounded_b = get_cell(grounded,i+1,j,ny,nx);
 
 	float c_u_l = 0.0f;
 	float c_u_r = 0.0f;
@@ -63,12 +78,15 @@ void vanka_smooth(
 	float c_H_c = 0.0f;
 
 	float rnorm = 1.0f;
-	float tol = 0.000001f;
+	float tol = 0.0001f;
 	int k = 0;
    
 	while (k<n_newton && rnorm>tol){
 	    float J[25] = {0};
 	    float r[5] = {0};
+
+	    //float bed_c = get_cell(bed,i,j,ny,nx);
+	    //grounded_c = get_grounded(H_c,bed_c,sigmoid_c);// + 0.5f*grounded_c;
 
 	    r[0] -= get_vfacet(f_u,i,j,ny,nx);
 	    r[1] -= get_vfacet(f_u,i,j+1,ny,nx);
@@ -82,11 +100,6 @@ void vanka_smooth(
 	    J[24] = 1.0f / dt;
 	    r[4] += H_c/dt;// H_prev/dt - smb handled by f_H 
 
-	    //float bed_c = get_cell(bed,i,j,ny,nx);
-	    //CellCalvingJacobian j_calve = get_cell_calving_jac({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
-	    //J[24] -= j_calve.d_H;
-	    //r[4] -= j_calve.res;
-
 	    // X-Fluxes
 	    float H_l = get_cell(H,i,j-1,ny,nx);
 	    HorizontalFluxJacobian j_l = get_horizontal_flux_jac({u_l, H_l, H_c}, i, j, ny, nx);
@@ -94,9 +107,8 @@ void vanka_smooth(
 	    J[24] -= j_l.d_H_r * dx_inv;
 	    r[4]  -= j_l.res   * dx_inv;
 
-	    float bed_c = get_cell(bed,i,j,ny,nx);
-	    float bed_l = get_cell(bed,i,j-1,ny,nx);
-	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,bed_c,bed_l,calving_rate,sigmoid_c},i,j,ny,nx);
+
+	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,grounded_c,grounded_l,calving_rate,sigmoid_c},i,j,ny,nx);
 	    J[24] += j_calve_l.d_H_this * dx_inv;
 	    r[4] += j_calve_l.res*dx_inv;
 
@@ -106,8 +118,7 @@ void vanka_smooth(
 	    J[24] += j_r.d_H_l * dx_inv;
 	    r[4]  += j_r.res   * dx_inv;
 	    
-	    float bed_r = get_cell(bed,i,j+1,ny,nx);
-	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,bed_c,bed_r,calving_rate,sigmoid_c},i,j,ny,nx);
+	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,grounded_c,grounded_r,calving_rate,sigmoid_c},i,j,ny,nx);
 	    J[24] += j_calve_r.d_H_this * dx_inv;
 	    r[4] += j_calve_r.res * dx_inv;
 
@@ -118,8 +129,7 @@ void vanka_smooth(
 	    J[24] += j_t.d_H_b * dx_inv;
 	    r[4]  += j_t.res   * dx_inv;
 
-	    float bed_t = get_cell(bed,i-1,j,ny,nx);
-	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,bed_c,bed_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,grounded_c,grounded_t,calving_rate,sigmoid_c},i,j,ny,nx);
 	    J[24] += j_calve_t.d_H_this * dx_inv;
 	    r[4] += j_calve_t.res * dx_inv;
 
@@ -129,8 +139,7 @@ void vanka_smooth(
 	    J[24] -= j_b.d_H_t * dx_inv;
 	    r[4]  -= j_b.res   * dx_inv;
 
-	    float bed_b = get_cell(bed,i+1,j,ny,nx);
-	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,bed_c,bed_b,calving_rate,sigmoid_c},i,j,ny,nx);
+	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,grounded_c,grounded_b,calving_rate,sigmoid_c},i,j,ny,nx);
 	    J[24] += j_calve_b.d_H_this * dx_inv;
 	    r[4] += j_calve_b.res * dx_inv;
 
@@ -340,11 +349,9 @@ void vanka_smooth(
 	    float v_bl   = get_hfacet(v,i+1,j-1,ny,nx);
 
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
-	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,bed_l,bed_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,grounded_l,grounded_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
 	    r[0] += tau_bx_l.res;
             J[0] += tau_bx_l.d_u;
 	    J[2] += tau_bx_l.d_v_tr;
@@ -358,11 +365,9 @@ void vanka_smooth(
 	    float v_br   = get_hfacet(v,i+1,j+1,ny,nx);
 	    
 	    float H_r    = get_cell(H,i,j+1,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
-	    float bed_r  = get_cell(bed,i,j+1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float beta_r = get_cell(beta,i,j+1,ny,nx);
-	    TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,bed_c,bed_r,beta_c,beta_r,m,u_reg,water_drag,sigmoid_c});
+	    TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,grounded_c,grounded_r,beta_c,beta_r,m,u_reg,water_drag,sigmoid_c});
 	    r[1] += tau_bx_r.res;
             J[6] += tau_bx_r.d_u;
 	    J[7] += tau_bx_r.d_v_tl;
@@ -376,11 +381,9 @@ void vanka_smooth(
 	    float u_tr = get_vfacet(u,i-1,j+1,ny,nx);
 
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
-	    float bed_t  = get_cell(bed,i-1,j,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,bed_t,bed_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,grounded_t,grounded_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
 	    r[2]  += tau_by_t.res;
             J[12] += tau_by_t.d_v;
 	    J[10] += tau_by_t.d_u_bl;
@@ -394,11 +397,9 @@ void vanka_smooth(
             float u_br = get_vfacet(u,i+1,j+1,ny,nx);
 
 	    float H_b    = get_cell(H,i+1,j,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
-	    float bed_b  = get_cell(bed,i+1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float beta_b = get_cell(beta,i+1,j,ny,nx);
-	    TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,bed_c,bed_b,beta_c,beta_b,m,u_reg,water_drag,sigmoid_c});
+	    TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,grounded_c,grounded_b,beta_c,beta_b,m,u_reg,water_drag,sigmoid_c});
 	    r[3]  += tau_by_b.res;
             J[18] += tau_by_b.d_v;
 	    J[15] += tau_by_b.d_u_tl;
@@ -411,7 +412,7 @@ void vanka_smooth(
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
 	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
-	    TauDxJacobian tau_dx_l = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    TauDxJacobian tau_dx_l = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,grounded_l,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
 	    r[0] -= tau_dx_l.res;
 	    J[4] -= tau_dx_l.d_H_r;
 	    }
@@ -421,7 +422,7 @@ void vanka_smooth(
 	    float H_r    = get_cell(H,i,j+1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float bed_r  = get_cell(bed,i,j+1,ny,nx);
-	    TauDxJacobian tau_dx_r = get_tau_dx_jac({H_c,H_r,bed_c,bed_r,sigmoid_c},dx_inv,i,j+1,ny,nx);
+	    TauDxJacobian tau_dx_r = get_tau_dx_jac({H_c,H_r,bed_c,bed_r,grounded_c,grounded_r,sigmoid_c},dx_inv,i,j+1,ny,nx);
 	    r[1] -= tau_dx_r.res;
 	    J[9] -= tau_dx_r.d_H_l;
 	    }
@@ -431,7 +432,7 @@ void vanka_smooth(
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
 	    float bed_t  = get_cell(bed,i-1,j,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
-	    TauDyJacobian tau_dy_t = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    TauDyJacobian tau_dy_t = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,grounded_t,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
 	    r[2]  -= tau_dy_t.res;
 	    J[14] -= tau_dy_t.d_H_b;
 	    }
@@ -441,7 +442,7 @@ void vanka_smooth(
 	    float H_b    = get_cell(H,i+1,j,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float bed_b  = get_cell(bed,i+1,j,ny,nx);
-	    TauDyJacobian tau_dy_b = get_tau_dy_jac({H_c,H_b,bed_c,bed_b,sigmoid_c},dx_inv,i+1,j,ny,nx);
+	    TauDyJacobian tau_dy_b = get_tau_dy_jac({H_c,H_b,bed_c,bed_b,grounded_c,grounded_b,sigmoid_c},dx_inv,i+1,j,ny,nx);
 	    r[3]  -= tau_dy_b.res;
 	    J[19] -= tau_dy_b.d_H_t;
 	    }
@@ -450,28 +451,32 @@ void vanka_smooth(
             J[6]  -= 1.0f;
             J[12] -= 1.0f;
             J[18] -= 1.0f;
-
+            J[24] += 1.0f;
 	     
 	    if (j == 0) {
 	    	for(int k=0; k<5; ++k) J[0 + k] = 0.0f;
+	        for(int k=0; k<5; ++k) J[k*5 + 0] = 0.0f;
 		J[0] = 1.0f;
 		r[0] = u_l;
 	    }
 
 	    if (j == (nx - 1)) {
 	    	for(int k=0; k<5; ++k) J[5 + k] = 0.0f;
+	        for(int k=0; k<5; ++k) J[k*5 + 1] = 0.0f;
 		J[6] = 1.0f;
 		r[1] = u_r;
 	    }
 
 	    if (i == 0) {
 	    	for(int k=0; k<5; ++k) J[10 + k] = 0.0f;
+	        for(int k=0; k<5; ++k) J[k*5 + 2] = 0.0f;
 		J[12] = 1.0f;
 		r[2] = v_t;
 	    }
 
 	    if (i == (ny-1)) {
 	    	for(int k=0; k<5; ++k) J[15 + k] = 0.0f;
+	        for(int k=0; k<5; ++k) J[k*5 + 3] = 0.0f;
 		J[18] = 1.0f;
 		r[3] = v_b;
 	    }
@@ -481,6 +486,7 @@ void vanka_smooth(
 		// Active set constraint: Force H = thklim
 		masked = 1.0f;
 		for(int k=0; k<5; ++k) J[20 + k] = 0.0f;
+	        for(int k=0; k<5; ++k) J[k*5 + 4] = 0.0f;
 		J[24] = 1.0f;
 		r[4] = H_c - thklim;
 	    } else {
@@ -488,11 +494,11 @@ void vanka_smooth(
 	    
 	    }
 
-            J[24] += 1.0f;
-	    rnorm = r[0]*r[0] + r[1]*r[1] + r[2]*r[2] + r[3]*r[3] + r[4]*r[4];
 
 	    float delta_x[5] = {0};
 	    lu_5x5_solve(J,r,delta_x);
+
+	    rnorm = r[0]*r[0] + r[1]*r[1] + r[2]*r[2] + r[3]*r[3] + r[4]*r[4];
 
             float relaxation_factor = 0.5f;
 
@@ -549,6 +555,7 @@ void vanka_smooth_adjoint(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
+    const float* __restrict__ grounded,
     const float* __restrict__ mask,
     const float* __restrict__ r_adj_u,  //J^T lambda + d(cost)/dU
     const float* __restrict__ r_adj_v,
@@ -595,6 +602,12 @@ void vanka_smooth_adjoint(
 	float v_b = get_hfacet(v, i + 1, j, ny, nx);
 	float H_c = get_cell(H, i, j, ny, nx);
 
+	float grounded_c = get_cell(grounded,i,j,ny,nx);
+	float grounded_l = get_cell(grounded,i,j-1,ny,nx);
+	float grounded_r = get_cell(grounded,i,j+1,ny,nx);
+	float grounded_t = get_cell(grounded,i-1,j,ny,nx);
+	float grounded_b = get_cell(grounded,i+1,j,ny,nx);
+
 	float J[25] = {0};
 
 	// Mass Conservation Assembly
@@ -610,7 +623,7 @@ void vanka_smooth_adjoint(
 
 	float bed_c = get_cell(bed,i,j,ny,nx);
 	float bed_l = get_cell(bed,i,j-1,ny,nx);
-	FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,bed_c,bed_l,calving_rate,sigmoid_c},i,j,ny,nx);
+	FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,grounded_c,grounded_l,calving_rate,sigmoid_c},i,j,ny,nx);
 	J[24] += j_calve_l.d_H_this * dx_inv;
 
 	float H_r = get_cell(H,i,j+1,ny,nx);
@@ -619,7 +632,7 @@ void vanka_smooth_adjoint(
 	J[24] += j_r.d_H_l * dx_inv;
 	
 	float bed_r = get_cell(bed,i,j+1,ny,nx);
-	FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,bed_c,bed_r,calving_rate,sigmoid_c},i,j,ny,nx);
+	FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,grounded_c,grounded_r,calving_rate,sigmoid_c},i,j,ny,nx);
 	J[24] += j_calve_r.d_H_this * dx_inv;
 
 	// Y-Fluxes (Vertical in grid coordinates)
@@ -629,7 +642,7 @@ void vanka_smooth_adjoint(
 	J[24] += j_t.d_H_b * dx_inv;
 
 	float bed_t = get_cell(bed,i-1,j,ny,nx);
-	FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,bed_c,bed_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,grounded_c,grounded_t,calving_rate,sigmoid_c},i,j,ny,nx);
 	J[24] += j_calve_t.d_H_this * dx_inv;
 
 	float H_b = get_cell(H,i+1,j,ny,nx);
@@ -638,7 +651,7 @@ void vanka_smooth_adjoint(
 	J[24] -= j_b.d_H_t * dx_inv;
 
 	float bed_b = get_cell(bed,i+1,j,ny,nx);
-	FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,bed_c,bed_b,calving_rate,sigmoid_c},i,j,ny,nx);
+	FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,grounded_c,grounded_b,calving_rate,sigmoid_c},i,j,ny,nx);
 	J[24] += j_calve_b.d_H_this * dx_inv;
 
 	}
@@ -834,7 +847,7 @@ void vanka_smooth_adjoint(
 	float bed_c  = get_cell(bed,i,j,ny,nx);
 	float beta_l = get_cell(beta,i,j-1,ny,nx);
 	float beta_c = get_cell(beta,i,j,ny,nx);
-	TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,bed_l,bed_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
+	TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,grounded_l,grounded_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
 	J[0] += tau_bx_l.d_u;
 	J[2] += tau_bx_l.d_v_tr;
 	J[3] += tau_bx_l.d_v_br;
@@ -851,7 +864,7 @@ void vanka_smooth_adjoint(
 	float bed_r  = get_cell(bed,i,j+1,ny,nx);
 	float beta_c = get_cell(beta,i,j,ny,nx);
 	float beta_r = get_cell(beta,i,j+1,ny,nx);
-	TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,bed_c,bed_r,beta_c,beta_r,m,u_reg,water_drag,sigmoid_c});
+	TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,grounded_c,grounded_r,beta_c,beta_r,m,u_reg,water_drag,sigmoid_c});
 	J[6] += tau_bx_r.d_u;
 	J[7] += tau_bx_r.d_v_tl;
 	J[8] += tau_bx_r.d_v_bl;
@@ -868,7 +881,7 @@ void vanka_smooth_adjoint(
 	float bed_c  = get_cell(bed,i,j,ny,nx);
 	float beta_t = get_cell(beta,i-1,j,ny,nx);
 	float beta_c = get_cell(beta,i,j,ny,nx);
-	TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,bed_t,bed_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,grounded_t,grounded_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
 	J[12] += tau_by_t.d_v;
 	J[10] += tau_by_t.d_u_bl;
 	J[11] += tau_by_t.d_u_br;
@@ -885,7 +898,7 @@ void vanka_smooth_adjoint(
 	float bed_b  = get_cell(bed,i+1,j,ny,nx);
 	float beta_c = get_cell(beta,i,j,ny,nx);
 	float beta_b = get_cell(beta,i+1,j,ny,nx);
-	TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,bed_c,bed_b,beta_c,beta_b,m,u_reg,water_drag,sigmoid_c});
+	TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,grounded_c,grounded_b,beta_c,beta_b,m,u_reg,water_drag,sigmoid_c});
 	J[18] += tau_by_b.d_v;
 	J[15] += tau_by_b.d_u_tl;
 	J[16] += tau_by_b.d_u_tr;
@@ -897,7 +910,7 @@ void vanka_smooth_adjoint(
 	float H_l    = get_cell(H,i,j-1,ny,nx);
 	float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	float bed_c  = get_cell(bed,i,j,ny,nx);
-	TauDxJacobian tau_dx_l = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	TauDxJacobian tau_dx_l = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,grounded_l,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
 	J[4] -= tau_dx_l.d_H_r;
 	}
 
@@ -906,7 +919,7 @@ void vanka_smooth_adjoint(
 	float H_r    = get_cell(H,i,j+1,ny,nx);
 	float bed_c  = get_cell(bed,i,j,ny,nx);
 	float bed_r  = get_cell(bed,i,j+1,ny,nx);
-	TauDxJacobian tau_dx_r = get_tau_dx_jac({H_c,H_r,bed_c,bed_r,sigmoid_c},dx_inv,i,j+1,ny,nx);
+	TauDxJacobian tau_dx_r = get_tau_dx_jac({H_c,H_r,bed_c,bed_r,grounded_c,grounded_r,sigmoid_c},dx_inv,i,j+1,ny,nx);
 	J[9] -= tau_dx_r.d_H_l;
 	}
 
@@ -915,7 +928,7 @@ void vanka_smooth_adjoint(
 	float H_t    = get_cell(H,i-1,j,ny,nx);
 	float bed_t  = get_cell(bed,i-1,j,ny,nx);
 	float bed_c  = get_cell(bed,i,j,ny,nx);
-	TauDyJacobian tau_dy_t = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	TauDyJacobian tau_dy_t = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,grounded_t,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
 	J[14] -= tau_dy_t.d_H_b;
 	}
 
@@ -924,7 +937,7 @@ void vanka_smooth_adjoint(
 	float H_b    = get_cell(H,i+1,j,ny,nx);
 	float bed_c  = get_cell(bed,i,j,ny,nx);
 	float bed_b  = get_cell(bed,i+1,j,ny,nx);
-	TauDyJacobian tau_dy_b = get_tau_dy_jac({H_c,H_b,bed_c,bed_b,sigmoid_c},dx_inv,i+1,j,ny,nx);
+	TauDyJacobian tau_dy_b = get_tau_dy_jac({H_c,H_b,bed_c,bed_b,grounded_c,grounded_b,sigmoid_c},dx_inv,i+1,j,ny,nx);
 	J[19] -= tau_dy_b.d_H_t;
 	}
 

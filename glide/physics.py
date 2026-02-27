@@ -181,7 +181,7 @@ class IcePhysics:
         self.grid.f_H[:, :] = self.grid.H_prev / self.grid.dt + self.grid.smb
 
         # Compute initial residual for convergence tracking
-        self.grid.vanka_smooth()
+        #self.grid.vanka_smooth()
         self.grid.compute_residual()
         r0 = cp.linalg.norm(self.grid.r)
         if verbose:

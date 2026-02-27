@@ -338,7 +338,7 @@ class Grid:
                 self.dx, self.dt,
                 self.ny, self.nx, stride, halo))
 
-    def vanka_smooth(self, n_inner=1, enable_calving=True, recompute_grounded=True, relax_grounded=0.5):
+    def vanka_smooth(self, n_inner=1, enable_calving=True, recompute_grounded=True, relax_grounded=cp.float32(0.5)):
         """Apply one Vanka smoother pass (red-black)."""
         kernel = self.kernels.ice.get_function('vanka_smooth')
         grid_size, block_size, stride, halo = self._kernel_config()
@@ -349,9 +349,7 @@ class Grid:
             calving_rate = cp.float32(0.0)
 
         if recompute_grounded:
-            grounded_prev = cp.array(self.grounded)
-            self.compute_grounded()
-            self.grounded[:] = relax_grounded*grounded_prev + (1.0 - relax_grounded)*self.grounded
+            self.compute_grounded(relaxation=relax_grounded)
 
         self.delta_U.fill(0.0)
         kernel(grid_size, block_size,
@@ -442,7 +440,7 @@ class Grid:
 
         return self.grad_beta
 
-    def compute_grounded(self):
+    def compute_grounded(self, relaxation=cp.float32(0.0)):
         kernel = self.kernels.ice.get_function('compute_grounded')
         grid_size, block_size, stride, halo = self._kernel_config()
 
@@ -450,6 +448,7 @@ class Grid:
                (self.grounded,
                 self.H, self.bed, 
                 self._sigmoid_c,
+                relaxation,
                 self.ny, self.nx, 
                 stride, halo))
 

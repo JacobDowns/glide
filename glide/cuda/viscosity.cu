@@ -19,6 +19,7 @@ void compute_grounded(
     const float* __restrict__ H,
     const float* __restrict__ bed,
     float sigmoid_c,
+    float relaxation_parameter,
     int ny, int nx,
     int stride, int halo
     )
@@ -30,7 +31,8 @@ void compute_grounded(
 
     float H_c = get_cell(H,i,j,ny,nx);
     float bed_c = get_cell(bed,i,j,ny,nx);
-    grounded[i * nx + j] = get_grounded(H_c,bed_c,sigmoid_c);
+    float grounded_old = grounded[i * nx + j];
+    grounded[i * nx + j] = (1.0f - relaxation_parameter) * get_grounded(H_c,bed_c,sigmoid_c) + relaxation_parameter * grounded_old;
 }
 
 /*==================================================

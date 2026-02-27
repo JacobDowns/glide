@@ -29,10 +29,10 @@ from scipy.ndimage import gaussian_filter
 OUTPUT_DIR = "./output"
 
 SKIP = 6           # Geometry downsampling factor
-DT = 50.0          # Time step (years)
-N_STEPS = 20      # Number of time steps
+DT = 20.0          # Time step (years)
+N_STEPS = 50      # Number of time steps
 N_LEVELS = 5       # Multigrid levels
-N_VCYCLES = 10      # V-cycles per time step
+N_VCYCLES = 20      # V-cycles per time step
 
 # Physical constants
 RHO_ICE = 917.0
@@ -133,7 +133,7 @@ for step in range(N_STEPS):
     print(f"Step {step}: t = {t:.1f} yr, H_mean = {float(grid.H.mean()):.1f} m")
 
     # Forward solve
-    u, v, H = physics.forward(dt=DT, n_vcycles=N_VCYCLES, verbose=True,update_geometry=True)
+    u, v, H = physics.forward(dt=DT, n_vcycles=N_VCYCLES, verbose=True,update_geometry=True,rtol=1e-4)
     t += DT
 
     # Output

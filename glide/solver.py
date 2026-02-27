@@ -78,7 +78,7 @@ def restrict_solution_to_hierarchy(grid):
         restrict_solution_to_hierarchy(grid.child)
 
 
-def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),pre_steps=0,post_steps=150,final_steps=0,coarse_steps=200,newton_iterations=30):
+def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),pre_steps=10,post_steps=20,final_steps=50,coarse_steps=200,newton_iterations=30):
     """
     FASCD V-cycle for the coupled SSA + mass conservation system.
 
@@ -141,8 +141,8 @@ def fascd_vcycle(grid, thklim, finest=False,verbose=False,omega=cp.float32(0.5),
     grid.child.z[:] = grid.child.U - grid.child.w
 
     # Prolongate correction
-    prolongate_vfacet(grid.child.z_u, kernels, u_fine=grid.z_u, smooth=False)
-    prolongate_hfacet(grid.child.z_v, kernels, v_fine=grid.z_v, smooth=False)
+    prolongate_vfacet(grid.child.z_u, kernels, u_fine=grid.z_u, smooth=True)
+    prolongate_hfacet(grid.child.z_v, kernels, v_fine=grid.z_v, smooth=True)
     prolongate_cell_centered(grid.child.z_H, kernels, H_fine=grid.z_H, smooth=False)
 
     # Apply correction
@@ -234,8 +234,8 @@ def adjoint_vcycle_fas(grid,
 
     # Prolongate delta_2h to fine into grid.z_*
     grid.z_u.fill(0.0); grid.z_v.fill(0.0); grid.z_H.fill(0.0)
-    prolongate_vfacet(grid.child.delta_u, kernels, u_fine=grid.z_u)
-    prolongate_hfacet(grid.child.delta_v, kernels, v_fine=grid.z_v)
+    prolongate_vfacet(grid.child.delta_u, kernels, u_fine=grid.z_u, smooth=True)
+    prolongate_hfacet(grid.child.delta_v, kernels, v_fine=grid.z_v, smooth=True)
     prolongate_cell_centered(grid.child.delta_H, kernels, H_fine=grid.z_H, smooth=True)
 
     # Apply fine correction

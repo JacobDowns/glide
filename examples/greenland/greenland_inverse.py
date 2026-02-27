@@ -164,15 +164,14 @@ for level_idx in [4,4,3,2,1,0]:
 
     counter = [0]
     H0 = cp.array(current_grid.H_prev)
-    for i in range(1):
-        u, v, H = physics.forward(dt=5.0, n_vcycles=10, verbose=True, rtol=1e-3)
+    for i in range(5):
+        u, v, H = physics.forward(dt=5.0, n_vcycles=10, verbose=True, rtol=1e-4)
     uref = cp.array(u)
     vref = cp.array(v)
     Href = cp.array(H)
 
-    def objective(log_beta_flat):
+    def objective(log_beta):
 
-        log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32) 
         current_grid.beta[:] = cp.exp(log_beta)
         restrict_parameters_to_hierarchy(current_grid)
 
@@ -186,7 +185,7 @@ for level_idx in [4,4,3,2,1,0]:
         dJdH = cp.zeros_like(H)
     
         physics.adjoint(dJdu,dJdv,dJdH,n_vcycles=1,verbose=False)
-        grad_log_beta = current_grid.beta*grad_beta
+        grad_log_beta = current_grid.beta*current_grid.grad_beta
 
         J_tikh,tikh_grad = tikhonov_regularization(log_beta,weight=cp.float32(REG_WEIGHT))
         J = J_data + J_tikh
@@ -194,11 +193,10 @@ for level_idx in [4,4,3,2,1,0]:
 
         print(f"Level: {level_idx},  Loss: {J:.4f}, Loss Data: {J_data:.4f}, Loss Tikh: {J_tikh:.4f}")
 
-        return float(J),grad_log_beta.ravel().get().astype(np.float64)
+        return float(J),grad_log_beta
 
-    def callback(log_beta_flat):
+    def callback(log_beta):
         """Callback for visualization."""
-        log_beta = cp.asarray(log_beta_flat.reshape((current_grid.ny, current_grid.nx)), dtype=cp.float32)
         counter[0] += 1
 
         u_c = 0.5 * (current_grid.u[:, 1:] + current_grid.u[:, :-1])
@@ -206,18 +204,19 @@ for level_idx in [4,4,3,2,1,0]:
 
         writer.write_step(counter[0], counter[0], {
             'log_beta': log_beta,
-            'vel': [u_c, v_c]
+            'vel': [u_c * (1-current_grid.mask), v_c * (1-current_grid.mask)]
         })
         writer.write_pvd()
 
-    x_init = cp.log(current_grid.beta).ravel().get().astype(np.float64)
+    log_beta = cp.log(current_grid.beta)
 
     for i in range(50):
-        J,grad_log_beta = objective(x_init)
-        x_init -= 0.02*np.sign(grad_log_beta)
-        callback(x_init)
+        J,grad_log_beta = objective(log_beta)
+        log_beta -= 0.02*np.sign(grad_log_beta)
+        callback(log_beta)
 
-    current_grid.beta[:] = cp.exp(cp.array(x_init.reshape((current_grid.ny, current_grid.nx))).astype(cp.float32))     # Prolongate to finer grid for next level
+    current_grid.beta[:] = cp.exp(log_beta)
+
     # Save result
     pickle.dump(
         current_grid.beta.get(),

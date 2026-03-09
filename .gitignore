@@ -48,6 +48,14 @@ inverse_results/
 *.tiff
 data/
 
+# Binary / output data files
+*.vti
+*.pvd
+*.vts
+*.npz
+*.npy
+*.png
+
 # Pickled files
 *.p
 *.pkl

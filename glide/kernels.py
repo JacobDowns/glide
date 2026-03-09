@@ -70,6 +70,10 @@ class Kernels:
              )
         
         self.ice = cp.RawModule(code=ice_source, options=("--use_fast_math",))
+        self.enthalpy = cp.RawModule(
+            code=(cuda_dir / "enthalpy.cu").read_text(),
+            options=("--use_fast_math",),
+        )
 
 
 

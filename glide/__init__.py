@@ -6,8 +6,9 @@ with support for forward simulation and adjoint-based inverse modeling.
 """
 
 from .physics import IcePhysics
+from .enthalpy import EnthalpyPhysics
 from .grid import Grid
-from .io import VTIWriter, HDF5Writer
+from .io import VTIWriter, VTSWriter, HDF5Writer
 
 __version__ = "0.1.0"
-__all__ = ["IcePhysics", "Grid", "VTIWriter", "HDF5Writer"]
+__all__ = ["IcePhysics", "EnthalpyPhysics", "Grid", "VTIWriter", "VTSWriter", "HDF5Writer"]

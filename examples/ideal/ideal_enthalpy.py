@@ -1,9 +1,9 @@
 """
-Fixed-geometry enthalpy diffusion test on the spun-up ideal dome.
+Fixed-geometry polythermal enthalpy test on the spun-up ideal dome.
 
 This example loads the steady dome geometry from ideal_init.py and
-solves only vertical diffusion in terrain-following coordinates using
-implicit time stepping with one Thomas solve per ice column.
+solves vertical enthalpy advection-diffusion in terrain-following coordinates
+using implicit time stepping with Picard-linearized Thomas solves.
 """
 
 from pathlib import Path
@@ -22,17 +22,18 @@ STATIC_OUTPUT_DIR = f"{OUTPUT_DIR}/static"
 VOLUME_OUTPUT_DIR = f"{OUTPUT_DIR}/volume"
 CROSS_SECTION_OUTPUT_DIR = f"{OUTPUT_DIR}/cross_sections"
 
-NZ = 32
+NZ = 64
 DT = 20.0
-N_STEPS = 10000
+N_STEPS = 50000
 OUTPUT_EVERY = 1000
 
 THERMAL_CONDUCTIVITY = 2.1  # W m^-1 K^-1
 THERMAL_DIFFUSIVITY_M2_S = 1.09e-6
-GEOTHERMAL_FLUX = 0.0      # W m^-2
+GEOTHERMAL_FLUX = 0.05      # W m^-2
+SIGMA_VELOCITY = -1.0e-4   # yr^-1, negative = downward in sigma
 
 SEA_LEVEL_SURFACE_TEMPERATURE = -5.0  # degC
-LAPSE_RATE = 0.0 #6.5e-3                   # K m^-1
+LAPSE_RATE = 0.0
 
 
 def load_geometry(filename):
@@ -52,13 +53,38 @@ def build_boundary_fields(surface, thickness):
     return surface_enthalpy.astype(cp.float32), geothermal_flux
 
 
-def build_steady_profile(surface_enthalpy, geothermal_flux, thickness, conductivity, nz):
-    """Analytic steady conductive profile for the cold-only column model."""
+def build_steady_profile(
+    surface_enthalpy,
+    geothermal_flux,
+    sigma_velocity,
+    thickness,
+    conductivity,
+    diffusivity,
+    nz,
+):
+    """Analytic steady advection-diffusion profile for the cold-reference model."""
     sigma = (cp.arange(nz, dtype=cp.float32) + 0.5) / nz
-    height = sigma[cp.newaxis, cp.newaxis, :] * thickness[:, :, cp.newaxis]
-    basal_enthalpy = surface_enthalpy + geothermal_flux * thickness / conductivity
-    gradient = geothermal_flux / conductivity
-    return basal_enthalpy[:, :, cp.newaxis] - gradient[:, :, cp.newaxis] * height
+    sigma_3d = sigma[cp.newaxis, cp.newaxis, :]
+    diffusivity_sigma = diffusivity / cp.maximum(thickness ** 2, 1.0)
+    basal_grad_sigma = -thickness * geothermal_flux / conductivity
+    peclet = sigma_velocity / diffusivity_sigma
+
+    linear_profile = surface_enthalpy[:, :, cp.newaxis] + basal_grad_sigma[:, :, cp.newaxis] * (sigma_3d - 1.0)
+    use_linear = cp.abs(peclet) < 1.0e-6
+    peclet_safe = cp.where(use_linear, 1.0, peclet)
+    exp_profile = surface_enthalpy[:, :, cp.newaxis] + (
+        basal_grad_sigma / peclet_safe
+    )[:, :, cp.newaxis] * (
+        cp.exp(peclet_safe[:, :, cp.newaxis] * sigma_3d) - cp.exp(peclet_safe)[:, :, cp.newaxis]
+    )
+
+    thin_mask = thickness <= 0.1
+    profile = cp.where(use_linear[:, :, cp.newaxis], linear_profile, exp_profile)
+    return cp.where(
+        thin_mask[:, :, cp.newaxis],
+        surface_enthalpy[:, :, cp.newaxis],
+        profile,
+    )
 
 
 def save_state(filename, physics, surface_enthalpy, geothermal_flux, steady_profile):
@@ -71,8 +97,11 @@ def save_state(filename, physics, surface_enthalpy, geothermal_flux, steady_prof
         bed=cp.asnumpy(physics.grid.bed),
         thickness=cp.asnumpy(physics.grid.H),
         enthalpy=cp.asnumpy(physics.grid.enthalpy),
+        temperature=cp.asnumpy(physics.get_temperature()),
+        liquid_fraction=cp.asnumpy(physics.get_liquid_fraction()),
         surface_enthalpy=cp.asnumpy(surface_enthalpy),
         geothermal_flux=cp.asnumpy(geothermal_flux),
+        sigma_velocity=cp.asnumpy(physics.grid.sigma_velocity),
         steady_profile=cp.asnumpy(steady_profile),
         sigma=cp.asnumpy(physics.grid.sigma_centers()),
     )
@@ -309,12 +338,17 @@ def main():
     surface_enthalpy, geothermal_flux = build_boundary_fields(surface, thickness)
     diffusivity = physics.thermal_diffusivity_from_si(THERMAL_DIFFUSIVITY_M2_S)
     conductivity = cp.full_like(thickness, THERMAL_CONDUCTIVITY, dtype=cp.float32)
+    sigma_velocity = cp.full_like(thickness, SIGMA_VELOCITY, dtype=cp.float32)
 
     physics.set_boundary_conditions(
         surface_enthalpy=surface_enthalpy,
         geothermal_flux=geothermal_flux,
     )
-    physics.set_parameters(diffusivity=diffusivity, conductivity=conductivity)
+    physics.set_parameters(
+        diffusivity=diffusivity,
+        conductivity=conductivity,
+        sigma_velocity=sigma_velocity,
+    )
 
     initial_enthalpy = cp.broadcast_to(
         surface_enthalpy[:, :, cp.newaxis],
@@ -325,8 +359,10 @@ def main():
     steady_profile = build_steady_profile(
         surface_enthalpy,
         geothermal_flux,
+        sigma_velocity,
         thickness,
         conductivity,
+        cp.full_like(thickness, diffusivity, dtype=cp.float32),
         NZ,
     )
 
@@ -335,7 +371,8 @@ def main():
         "thk": thickness,
         "surface_enthalpy": surface_enthalpy,
         "geothermal_flux": geothermal_flux,
-        "steady_basal_enthalpy": steady_profile[:, :, 0],
+        "sigma_velocity": sigma_velocity,
+        "cold_reference_basal_enthalpy": steady_profile[:, :, 0],
     }
 
     writer = VTIWriter(OUTPUT_DIR, base="ideal_enthalpy", dx=dx)
@@ -353,7 +390,9 @@ def main():
         volume_points,
         cell_data={
             "enthalpy": physics.grid.enthalpy,
-            "steady_enthalpy": steady_profile,
+            "temperature": physics.get_temperature(),
+            "liquid_fraction": physics.get_liquid_fraction(),
+            "cold_reference_enthalpy": steady_profile,
             "enthalpy_misfit": physics.grid.enthalpy - steady_profile,
         },
     )
@@ -362,7 +401,8 @@ def main():
     print(f"Grid: {ny} x {nx} x {NZ}, dx = {dx / 1000.0:.1f} km")
     print(
         f"Running {N_STEPS} implicit steps of {DT:.1f} years "
-        f"with diffusivity = {float(diffusivity):.2f} m^2/yr"
+        f"with diffusivity = {float(diffusivity):.2f} m^2/yr "
+        f"and sigma velocity = {SIGMA_VELOCITY:.2e} yr^-1"
     )
 
     output_index = 1
@@ -374,6 +414,9 @@ def main():
         if step % OUTPUT_EVERY == 0 or step == N_STEPS - 1:
             mean_enthalpy = physics.get_mean_enthalpy()
             basal_enthalpy = physics.get_basal_enthalpy()
+            temperature = physics.get_temperature()
+            liquid_fraction = physics.get_liquid_fraction()
+            temperate_fraction = physics.get_temperate_fraction()
             surface_layer = physics.get_surface_layer_enthalpy()
             steady_misfit = cp.sqrt(cp.mean((physics.grid.enthalpy - steady_profile) ** 2, axis=2))
 
@@ -381,6 +424,8 @@ def main():
                 f"Step {step:03d}: t = {t:7.1f} yr, "
                 f"E_mean = {float(mean_enthalpy.mean()):7.2f} C, "
                 f"E_basal_max = {float(basal_enthalpy.max()):7.2f} C, "
+                f"omega_basal_max = {float(liquid_fraction[:, :, 0].max()):7.4f}, "
+                f"temperate_frac_max = {float(temperate_fraction.max()):7.3f}, "
                 f"rmse = {float(cp.sqrt(cp.mean((physics.grid.enthalpy - steady_profile) ** 2))):7.3f} C"
             )
 
@@ -390,9 +435,13 @@ def main():
                 {
                     "mean_enthalpy": mean_enthalpy,
                     "basal_enthalpy": basal_enthalpy,
+                    "mean_temperature": temperature.mean(axis=2),
+                    "basal_temperature": temperature[:, :, 0],
+                    "basal_liquid_fraction": liquid_fraction[:, :, 0],
+                    "temperate_fraction": temperate_fraction,
                     "surface_layer_enthalpy": surface_layer,
                     "surface_enthalpy": surface_enthalpy,
-                    "steady_basal_enthalpy": steady_profile[:, :, 0],
+                    "cold_reference_basal_enthalpy": steady_profile[:, :, 0],
                     "steady_rmse": steady_misfit,
                 },
             )
@@ -402,7 +451,9 @@ def main():
                 volume_points,
                 cell_data={
                     "enthalpy": physics.grid.enthalpy,
-                    "steady_enthalpy": steady_profile,
+                    "temperature": temperature,
+                    "liquid_fraction": liquid_fraction,
+                    "cold_reference_enthalpy": steady_profile,
                     "enthalpy_misfit": physics.grid.enthalpy - steady_profile,
                 },
             )

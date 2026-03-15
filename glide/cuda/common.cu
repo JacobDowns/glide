@@ -74,11 +74,23 @@ __device__ __forceinline__ float sigmoid_deriv(const float z, const float c) {
    return c * s * (1.0f - s);
 }
 
+
 __device__ __forceinline__ float get_grounded(const float H, const float B, const float sigmoid_c) 
 {
    float z = B + 0.917f*H;
    return sigmoid(z, sigmoid_c);
 }
+
+__device__ __forceinline__ float get_phi(const float H, const float bed) 
+{
+   return bed + 0.917f*H;
+}
+
+//__device__ __forceinline__ float get_phi_grad(const float H, const float bed, const float sigmoid_c) 
+//{
+//   float phi = fmaxf(bed + 0.917f*H,0.0f);
+//   return phi > 0.0f ? 0.917f : 0.0f;
+//}
 
 __device__ __forceinline__ float get_vfacet(const float* __restrict__ u, int i, int j, int ny, int nx) {
     //if (i < 0 || i >= ny || j < 0 || j > nx) return 0.0f;

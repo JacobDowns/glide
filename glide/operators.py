@@ -1,5 +1,7 @@
 import cupy as cp
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 class ForwardOperators:
     def __init__(self,grid,use_fast_math=True):
@@ -19,6 +21,8 @@ class ForwardOperators:
 
         self.kernels = cp.RawModule(code=cuda_source, options=options)
 
+        self.Z_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.Z_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
         self.Z_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 
         self.r_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
@@ -28,6 +32,10 @@ class ForwardOperators:
         self.f_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
         self.f_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
         self.f_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+        
+        self.F_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.F_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.F_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 
         self.delta_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
         self.delta_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
@@ -35,6 +43,8 @@ class ForwardOperators:
 
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
+
+        self.vanka_config = VankaConfig()
 
     @property
     def _kernel_config(self):
@@ -44,7 +54,7 @@ class ForwardOperators:
         grid_size = (self.grid.nx // stride + 1, self.grid.ny // stride + 1)
         return grid_size, block_size, stride, halo
 
-    def compute_residual(self, dt, use_mask=True, enable_calving=True, recompute_grounded=True):
+    def compute_residual(self, dt, use_mask=True, enable_calving=True, recompute_phi=True,compute_F=False,return_norms=False):
         kernel = self.kernels.get_function('compute_residual')
         grid_size, block_size, stride, halo = self._kernel_config
   
@@ -60,53 +70,63 @@ class ForwardOperators:
         else:
             calving_rate = cp.float32(0.0)
 
-        if recompute_grounded:
-            self.compute_grounded()
+        if recompute_phi:
+            self.compute_phi()
+
+        if compute_F:
+            out_u = self.F_u
+            out_v = self.F_v
+            out_H = self.F_H
+            f_u = self.Z_u
+            f_v = self.Z_v
+            f_H = self.Z_H
+        else:
+            out_u = self.r_u
+            out_v = self.r_v
+            out_H = self.r_H
+            f_u = self.f_u
+            f_v = self.f_v
+            f_H = self.f_H
 
         kernel(grid_size, block_size,
-               (self.r_u, self.r_v, self.r_H,
+               (out_u, out_v, out_H,
                 grid.state.u.data, 
                 grid.state.v.data,
                 grid.state.H.data, 
-                grid.state.grounded.data,
-                self.f_u, self.f_v, self.f_H,
+                grid.state.phi.data,
+                f_u, f_v, f_H,
                 grid.geometry.bed.data, 
                 grid.rheology.B.data, 
                 grid.sliding.beta.data,
                 mask, self.gamma,
-                grid.rheology.n.value, grid.rheology.eps_reg.value, 
-                grid.sliding.m.value, grid.sliding.u_reg.value,
-                grid.sliding.water_drag.value,
-                calving_rate, grid.geometry.sigmoid_c.value,
+                grid.rheology.n.value, grid.rheology.eps_reg.value, grid.geometry.flotation_reg_driving.value,
+                grid.sliding.m.value, grid.sliding.u_reg.value, grid.sliding.water_drag.value, grid.sliding.flotation_reg_sliding.value,
+                grid.calving.calving_rate.value, grid.calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
+        if return_norms:
+            return cp.linalg.norm(out_u),cp.linalg.norm(out_v),cp.linalg.norm(out_H)
 
-    def compute_grounded(self, relaxation=cp.float32(0.0)):
+    def compute_phi(self, relaxation=cp.float32(0.0)):
         kernel = self.kernels.get_function('compute_grounded')
         grid_size, block_size, stride, halo = self._kernel_config
         
         grid = self.grid
         kernel(grid_size, block_size,
-               (grid.state.grounded.data,
+               (grid.state.phi.data,
                 grid.state.H.data, grid.geometry.bed.data, 
-                grid.geometry.sigmoid_c.value,
+                grid.geometry.flotation_reg_driving.value,
                 relaxation,
                 grid.ny, grid.nx, 
                 stride, halo))
 
-    def vanka_smooth(self, dt, n_inner=1, enable_calving=True, recompute_grounded=True, relax_grounded=cp.float32(0.5)):
+    def vanka_smooth(self, dt, recompute_phi=True):
         kernel = self.kernels.get_function('vanka_smooth')
         grid_size, block_size, stride, halo = self._kernel_config
-
         grid = self.grid
 
-        if enable_calving:
-            calving_rate = grid.calving.calving_rate.value
-        else:
-            calving_rate = cp.float32(0.0)
-
-        if recompute_grounded:
-            self.compute_grounded(relaxation=relax_grounded)
+        if recompute_phi:
+            self.compute_phi(relaxation=self.vanka_config.relax_phi)
 
         self.delta_u.fill(0.0)
         self.delta_v.fill(0.0)
@@ -114,29 +134,66 @@ class ForwardOperators:
         kernel(grid_size, block_size,
                (self.delta_u, self.delta_v, self.delta_H, 
                 grid.state.mask.data,
-                grid.state.u.data, grid.state.v.data, grid.state.H.data, grid.state.grounded.data,
+                grid.state.u.data, grid.state.v.data, grid.state.H.data, grid.state.phi.data,
                 self.f_u, self.f_v, self.f_H,
                 grid.geometry.bed.data, grid.rheology.B.data, grid.sliding.beta.data, self.gamma,
-                grid.rheology.n.value, grid.rheology.eps_reg.value, 
-                grid.sliding.m.value, grid.sliding.u_reg.value,
-                grid.sliding.water_drag.value,
-                calving_rate, grid.geometry.sigmoid_c.value,
+                grid.rheology.n.value, grid.rheology.eps_reg.value, grid.geometry.flotation_reg_driving.value,
+                grid.sliding.m.value, grid.sliding.u_reg.value, grid.sliding.water_drag.value, grid.sliding.flotation_reg_sliding.value,
+                grid.calving.calving_rate.value, grid.calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo,
-                n_inner))
+                self.vanka_config.newton_config.steps,
+                self.vanka_config.newton_config.relaxation,
+                self.vanka_config.newton_config.ssa_damping,
+                self.vanka_config.newton_config.mc_damping)
+        )
 
-    def vanka_sweep(self, dt, n_iter, verbose=True, n_inner=30, omega=cp.float32(0.5),enable_calving=True,recompute_grounded=True):
+    def vanka_sweep(self, dt, n_iter, recompute_phi=True):
+        for i in range(n_iter):
+            self.vanka_smooth(dt,recompute_phi=recompute_phi)
+            self.grid.state.u.data[:] += self.vanka_config.omega * self.delta_u
+            self.grid.state.v.data[:] += self.vanka_config.omega * self.delta_v
+            self.grid.state.H.data[:] += self.vanka_config.omega * self.delta_H
+            self.vanka_config.hook_func(i)
 
-        for _ in range(n_iter):
-            self.vanka_smooth(dt,n_inner=n_inner,enable_calving=enable_calving,recompute_grounded=recompute_grounded)
-            self.grid.state.u.data[:] += omega * self.delta_u
-            self.grid.state.v.data[:] += omega * self.delta_v
-            self.grid.state.H.data[:] += omega * self.delta_H
-        if verbose:
-            self.compute_residual(dt,use_mask=True,recompute_grounded=False)
-            print(self.grid.dx,cp.linalg.norm(self.r_u),
-                  cp.linalg.norm(self.r_v),
-                  cp.linalg.norm(self.r_H))
+    def vanka_dump(self,dt):
+        kernel = self.kernels.get_function('vanka_dump')
+        grid_size, block_size, stride, halo = self._kernel_config
+        grid = self.grid
 
+        J = cp.zeros((self.grid.ny*self.grid.nx,25),dtype=cp.float32)
+        r = cp.zeros((self.grid.ny*self.grid.nx,5),dtype=cp.float32)
+        kernel(grid_size, block_size,
+               (J,r,
+                grid.state.u.data, grid.state.v.data, grid.state.H.data, grid.state.phi.data,
+                self.f_u, self.f_v, self.f_H,
+                grid.geometry.bed.data, grid.rheology.B.data, grid.sliding.beta.data, self.gamma,
+                grid.rheology.n.value, grid.rheology.eps_reg.value, grid.geometry.flotation_reg_driving.value,
+                grid.sliding.m.value, grid.sliding.u_reg.value, grid.sliding.water_drag.value, grid.sliding.flotation_reg_sliding.value,
+                grid.calving.calving_rate.value, grid.calving.flotation_reg_calving.value,
+                grid.dx, dt,
+                grid.ny, grid.nx, stride, halo,
+                )
+        )
+
+        return J,r
+            
     def set_rhs(self,dt):
         self.f_H[:,:] = self.grid.state.H_prev.data/dt + self.grid.forcing.smb.data
+
+@dataclass
+class NewtonConfig:
+    steps: int = 100
+    relaxation: cp.float32 = cp.float32(0.5)
+    ssa_damping: cp.float32 = cp.float32(1.0)
+    mc_damping: cp.float32 = cp.float32(1.0)
+
+@dataclass
+class VankaConfig:
+    omega: cp.float32 = cp.float32(0.5)
+    newton_config: NewtonConfig = field(default_factory = lambda: NewtonConfig())
+    relax_phi: cp.float32 = cp.float32(0.0)
+    hook_interval: int = 1
+    hook_func: Callable[[int],None] = field(default_factory = lambda: lambda i:None)
+
+

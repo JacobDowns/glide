@@ -208,20 +208,20 @@ DualFloat get_cell_calving_dual(
 
 struct FacetCalvingStencil {
     float H_this, H_other;
-    float grounded_this, grounded_other;
+    float phi_this, phi_other;
     float calving_rate;
-    float sigmoid_c;
+    float calving_length;
 };
 
 struct FacetCalvingStencilDual {
     DualFloat H_this, H_other;
-    float grounded_this, grounded_other;
+    float phi_this, phi_other;
     float calving_rate;
-    float sigmoid_c;
+    float calving_length;
 
     __device__ __forceinline__
     FacetCalvingStencil get_primals() const {
-        return {H_this.v,H_other.v,grounded_this,grounded_other,calving_rate,sigmoid_c};
+        return {H_this.v,H_other.v,phi_this,phi_other,calving_rate,calving_length};
     }
 
     __device__ __forceinline__
@@ -250,7 +250,22 @@ FacetCalvingJacobian get_facet_calving_jac(
 
     FacetCalvingJacobian jac = {0};
 
-    float coeff = (1.0f - s.grounded_this)*(1.0f - s.grounded_other);
+
+    //float phineg_this = fmaxf(-s.phi_this,0.0f)/s.calving_length;
+    //float phineg_other = fmaxf(-s.phi_other,0.0f)/s.calving_length;
+
+    //float phineg2_this = phineg_this * phineg_this;
+    //float phineg2_other = phineg_other * phineg_other;
+
+    //float chi_this = phineg2_this/(1.0f + phineg2_this);
+    //float chi_other = phineg2_other/(1.0f + phineg2_other);
+
+    //float chi_this = 1.0f - sigmoid(s.phi_this,s.calving_length);
+    //float chi_other = 1.0f - sigmoid(s.phi_other,s.calving_length);
+    float chi_this = 1.0f - s.phi_this;//sigmoid(s.phi_this,s.calving_length);
+    float chi_other = 1.0f - s.phi_other;// sigmoid(s.phi_other,s.calving_length);
+
+    float coeff = chi_this*chi_other;
     jac.res = coeff * s.calving_rate * s.H_this;
     jac.d_H_this = coeff * s.calving_rate;
     

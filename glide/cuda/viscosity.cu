@@ -35,6 +35,27 @@ void compute_grounded(
     grounded[i * nx + j] = (1.0f - relaxation_parameter) * get_grounded(H_c,bed_c,sigmoid_c) + relaxation_parameter * grounded_old;
 }
 
+extern "C" __global__
+void compute_phi(
+    float* __restrict__ phi,
+    const float* __restrict__ H,
+    const float* __restrict__ bed,
+    float relaxation_parameter,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);    
+
+    if (i < 0 || i >= ny || j<0 || j >= nx) return;
+
+    float H_c = get_cell(H,i,j,ny,nx);
+    float bed_c = get_cell(bed,i,j,ny,nx);
+    float phi_old = phi[i * nx + j];
+    phi[i * nx + j] = (1.0f - relaxation_parameter) * get_phi(H_c,bed_c) + relaxation_parameter * phi_old;
+}
+
 /*==================================================
   ================ VISCOSITY =======================
   ==================================================*/

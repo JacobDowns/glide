@@ -11,7 +11,7 @@ import cupy as cp
 import numpy as np
 
 #from glide import IcePhysics
-#from glide.io import VTIWriter, write_vti
+from glide.io import VTIWriter, write_vti
 from glide.data import (
     load_bedmachine,
     load_smb_mar,
@@ -20,13 +20,14 @@ from glide.data import (
     load_greenland_preprocessed
 )
 
+from glide.multigrid import Multigrid, FASCDSolver
 from scipy.ndimage import gaussian_filter
 
 # =============================================================================
 # Configuration - modify these paths and parameters
 # =============================================================================
 
-OUTPUT_DIR = "./output"
+OUTPUT_DIR = "./output_fmg"
 
 SKIP = 6           # Geometry downsampling factor
 DT = 20.0          # Time step (years)
@@ -87,7 +88,7 @@ thickness = gaussian_filter(thickness,1)
 beta = dataset.beta.values
 beta.fill(2.5)
 smb = dataset.smb.values
-smb -= 1
+smb += 1
 BETA_PATH = "./inverse_output/beta_level_0.p"
 beta = cp.array(pickle.load(open(BETA_PATH, 'rb')))
 #beta[beta>5] = 5
@@ -114,17 +115,127 @@ grid.sliding.beta.set(beta)
 grid.sliding.m.set(1./3.)
 grid.calving.calving_rate.set(2000.0)
 grid.rheology.eps_reg.set(1e-5)
-grid.geometry.sigmoid_c.set(0.1)
+grid.sliding.water_drag.set(1e-5)
 
-from glide.operators import ForwardOperators
-dt = cp.float32(10.0)
-operators = ForwardOperators(grid,use_fast_math=True)
-operators.set_rhs(dt)
-operators.compute_residual(dt)
-#operators.vanka_sweep(dt,300,verbose=True)
+dt = cp.float32(25.0)
+mg = Multigrid(grid)
+mg.create_grid_hierarchy(6)
+
+class VankaLogger:
+    def __init__(self,grid,level,write=False):
+        self.writer = None
+        if write:
+            self.writer = VTIWriter(OUTPUT_DIR, base=f"level_{level}", dx=grid.dx)
+        self.grid = grid
+
+    def __call__(self,i):
+        self.grid.forward_operators.compute_residual(dt,use_mask=True,recompute_phi=False)
+        print(
+            cp.linalg.norm(self.grid.forward_operators.r_u),
+            cp.linalg.norm(self.grid.forward_operators.r_v),
+            cp.linalg.norm(self.grid.forward_operators.r_H)
+        )
+
+        if self.writer:
+            u_c = 0.5*(self.grid.state.u.data[:,1:] 
+                + self.grid.state.u.data[:,:-1])
+            v_c = 0.5*(self.grid.state.v.data[1:] 
+                + self.grid.state.v.data[:-1])
+            self.writer.write_step(i, i, {
+                'r_H': self.grid.forward_operators.r_H,
+                'u': [u_c,v_c],
+                'H': self.grid.state.H.data}
+            )
+            self.writer.write_pvd()
+
+class TimeLogger:
+    def __init__(self,grid):
+        self.writer = VTIWriter(OUTPUT_DIR, base=f"greenland", dx=grid.dx)
+        self.grid = grid
+        
+    def __call__(self,i,t):
+        u_c = 0.5*(self.grid.state.u.data[:,1:] 
+            + self.grid.state.u.data[:,:-1])
+        v_c = 0.5*(self.grid.state.v.data[1:] 
+            + self.grid.state.v.data[:-1])
+        self.writer.write_step(i, t, {
+            'u': [u_c*(1-self.grid.state.mask.data),v_c*(1-self.grid.state.mask.data)],
+            'H': self.grid.state.H.data,
+            'S': self.grid.state.H.data + cp.maximum(self.grid.geometry.bed.data,-0.917*self.grid.state.H.data)}
+        )
+        self.writer.write_pvd()
+
+
+for g in mg.grids:
+    g.forward_operators.vanka_config.omega = cp.float32(0.5)
+    g.forward_operators.vanka_config.newton_steps = 30
+    g.forward_operators.vanka_config.hook_interval = 1
+    g.forward_operators.vanka_config.newton_config.relaxation = cp.float32(0.5)
+    g.forward_operators.vanka_config.newton_config.steps=30
+
+for g in mg.grids[1:]:
+    g.calving.calving_rate.set(cp.float32(0.0))
+
+cp.random.seed(0)
+grid.state.u.data[:,:] = cp.random.randn(grid.ny,grid.nx + 1)
+grid.state.v.data[:,:] = cp.random.randn(grid.ny+1,grid.nx)
+grid.state.H.data[:,:] += cp.random.randn(grid.ny,grid.nx)**2
+
+
+u0 = cp.array(grid.state.u.data)
+v0 = cp.array(grid.state.v.data)
+H0 = cp.array(grid.state.H.data)
+
+grid.forward_operators.set_rhs(dt)
+grid.forward_operators.compute_phi()
+#grid.forward_operators.vanka_config.hook_func = VankaLogger(grid,0)
+#grid.forward_operators.vanka_smooth(dt,recompute_phi=False)
+#grid.forward_operators.vanka_sweep(dt,100,recompute_phi=False)
 
 
 
+
+#J,r = grid.forward_operators.vanka_dump(dt)
+
+
+solver = FASCDSolver(mg)
+solver.config.coarse_steps = 200
+solver.config.pre_steps = 10
+solver.config.post_steps = 20
+solver.config.finest_steps = 200
+
+
+t = 0.0
+n_steps = 25
+writer = VTIWriter(OUTPUT_DIR, base="greenland", dx=dx)
+logger = TimeLogger(grid)
+for step in range(n_steps):
+    print(t)
+    solver.solve(dt,max_iter=10,rel_tol=1e-4,abs_tol=10)
+    grid.state.H_prev.data[:,:] = grid.state.H.data[:,:]
+    t += dt
+
+    logger(step,t)
+
+"""
+for level in range(5,-1,-1):
+    grid = mg.grids[level]
+    
+    logger = VankaLogger(grid,level)
+
+    grid.forward_operators.vanka_config.omega = cp.float32(0.66)
+    grid.forward_operators.vanka_config.newton_steps = 100
+    grid.forward_operators.vanka_config.hook_interval = 10
+    grid.forward_operators.vanka_config.hook_func = VankaLogger(grid,level)
+    grid.forward_operators.vanka_config.newton_config.relaxation = cp.float32(0.33)
+
+    grid.forward_operators.set_rhs(dt)
+    grid.forward_operators.vanka_sweep(dt,500)
+    if level > 0:
+        mg.prolongate_vfacet(grid.state.u.data,mg.grids[level-1].state.u.data,method='bilinear')
+        mg.prolongate_hfacet(grid.state.v.data,mg.grids[level-1].state.v.data,method='bilinear')
+        mg.prolongate_cell(grid.state.H.data,mg.grids[level-1].state.H.data,method='bilinear')
+"""
 """
 print("Initializing physics...")
 physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 

@@ -10,7 +10,7 @@ void compute_residual(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
-    const float* __restrict__ grounded,
+    const float* __restrict__ phi,
     const float* __restrict__ f_u,
     const float* __restrict__ f_v,
     const float* __restrict__ f_H,
@@ -19,9 +19,9 @@ void compute_residual(
     const float* __restrict__ beta,
     const float* __restrict__ mask,
     const float* __restrict__ gamma,
-    float n, float eps_reg,
-    float m, float u_reg, 
-    float water_drag, float calving_rate, float sigmoid_c,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding,     
+    float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
 {
@@ -57,7 +57,7 @@ void compute_residual(
 
 	    float H_c        = get_cell(H,i,j,ny,nx);
 	    //float grounded_c = grounded_local[bi][bj];
-	    float grounded_c = get_cell(grounded,i,j,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
 	    float f_H_c      = get_cell(f_H,i,j,ny,nx);
 
 	    float rH = H_c/dt - f_H_c;
@@ -68,8 +68,8 @@ void compute_residual(
 	    rH -= j_l.res*dx_inv;
 	    
 	    //float grounded_l = grounded_local[bi][bj-1];
-	    float grounded_l = get_cell(grounded,i,j-1,ny,nx);
-	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,grounded_c,grounded_l,calving_rate,sigmoid_c},i,j,ny,nx);
+	    float phi_l = get_cell(phi,i,j-1,ny,nx);
+	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,phi_c,phi_l,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    rH += j_calve_l.res*dx_inv;
 
 	    float H_r = get_cell(H,i,j+1,ny,nx);
@@ -78,8 +78,8 @@ void compute_residual(
             rH += j_r.res*dx_inv;
 	    
 	    //float grounded_r = grounded_local[bi][bj+1];
-	    float grounded_r = get_cell(grounded,i,j+1,ny,nx);
-	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,grounded_c,grounded_r,calving_rate,sigmoid_c},i,j+1,ny,nx);
+	    float phi_r = get_cell(phi,i,j+1,ny,nx);
+	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,phi_c,phi_r,calving_rate,flotation_reg_calving},i,j+1,ny,nx);
 	    rH += j_calve_r.res*dx_inv;
 
 	    float H_t = get_cell(H,i-1,j,ny,nx);
@@ -88,8 +88,8 @@ void compute_residual(
 	    rH += j_t.res*dx_inv;
 
 	    //float grounded_t = grounded_local[bi-1][bj];
-	    float grounded_t = get_cell(grounded,i-1,j,ny,nx);
-	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,grounded_c,grounded_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	    float phi_t = get_cell(phi,i-1,j,ny,nx);
+	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,phi_c,phi_t,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    rH += j_calve_t.res*dx_inv;
 
 
@@ -100,8 +100,8 @@ void compute_residual(
 
 
 	    //float grounded_b = grounded_local[bi+1][bj];
-	    float grounded_b = get_cell(grounded,i+1,j,ny,nx);
-	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,grounded_c,grounded_b,calving_rate,sigmoid_c},i+1,j,ny,nx);
+	    float phi_b = get_cell(phi,i+1,j,ny,nx);
+	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,phi_c,phi_b,calving_rate,flotation_reg_calving},i+1,j,ny,nx);
 	    rH += j_calve_b.res*dx_inv;
 
 	    float masked = get_cell(mask,i,j,ny,nx);
@@ -201,11 +201,11 @@ void compute_residual(
 	    float H_c    = get_cell(H,i,j,ny,nx);
             //float grounded_l = grounded_local[bi][bj-1];
             //float grounded_c = grounded_local[bi][bj];
-	    float grounded_l = get_cell(grounded,i,j-1,ny,nx);
-	    float grounded_c = get_cell(grounded,i,j,ny,nx);
+	    float phi_l = get_cell(phi,i,j-1,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,grounded_l,grounded_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 	    ru_l += tau_bx.res;
 	    }
 
@@ -216,9 +216,9 @@ void compute_residual(
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
             //float grounded_l = grounded_local[bi][bj-1];
             //float grounded_c = grounded_local[bi][bj];
-	    float grounded_l = get_cell(grounded,i,j-1,ny,nx);
-	    float grounded_c = get_cell(grounded,i,j,ny,nx);
-	    TauDxJacobian tau_dx = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,grounded_l,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    float phi_l = get_cell(phi,i,j-1,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
+	    TauDxJacobian tau_dx = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,phi_l,phi_c,flotation_reg_driving},dx_inv,i,j,ny,nx);
 	    ru_l -= tau_dx.res;
 	    }
 
@@ -314,12 +314,12 @@ void compute_residual(
 	    float H_c    = get_cell(H,i,j,ny,nx);
             //float grounded_t = grounded_local[bi-1][bj];
             //float grounded_c = grounded_local[bi][bj];
-	    float grounded_t = get_cell(grounded,i-1,j,ny,nx);
-	    float grounded_c = get_cell(grounded,i,j,ny,nx);
+	    float phi_t = get_cell(phi,i-1,j,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 
-	    TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,grounded_t,grounded_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 	    rv_t += tau_by.res;
 	    }
 
@@ -330,10 +330,10 @@ void compute_residual(
 	    float bed_c = get_cell(bed,i,j,ny,nx);
             //float grounded_t = grounded_local[bi-1][bj];
             //float grounded_c = grounded_local[bi][bj];
-	    float grounded_t = get_cell(grounded,i-1,j,ny,nx);
-	    float grounded_c = get_cell(grounded,i,j,ny,nx);
+	    float phi_t = get_cell(phi,i-1,j,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
 
-	    TauDyJacobian tau_dy = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,grounded_t,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    TauDyJacobian tau_dy = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,phi_t,phi_c,flotation_reg_driving},dx_inv,i,j,ny,nx);
 	    rv_t -= tau_dy.res;
 	    }
 

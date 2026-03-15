@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, fields
 import cupy as cp
 from cupy.typing import NDArray
 from .field import Field, Constant
+from .operators import ForwardOperators
 
 @dataclass
 class State:
@@ -9,11 +10,11 @@ class State:
     v: Field | None = None
     H: Field | None = None
     H_prev: Field | None = None
-    grounded: Field | None = None
+    phi: Field | None = None
     mask: Field | None = None
 
     def __repr__(self):
-        return f'{self.u.compact_string}\n{self.v.compact_string}\n{self.H.compact_string}\n{self.H_prev.compact_string}\n{self.grounded.compact_string}\n{self.mask.compact_string}'
+        return f'{self.u.compact_string}\n{self.v.compact_string}\n{self.H.compact_string}\n{self.H_prev.compact_string}\n{self.phi.compact_string}\n{self.mask.compact_string}'
 
 @dataclass
 class AdjointState:
@@ -34,19 +35,19 @@ class Geometry:
             units='m',
             attrs={'long_name':'minimum thickness'})
         )
-    sigmoid_c: Constant = field(
+    flotation_reg_driving: Constant = field(
         default_factory=lambda: Constant(
             value=cp.float32(0.1),
-            name='sigmoid_c',
+            name='flotation_reg_driving',
             units='m^{-1}',
             attrs={'long_name':("smoothing factor for sigmoidal \
-                                  grounding flag. Lower values \
-                                  imply a smoother transition from \
-                                  grounded to floating physics")})
+                                  grounding flag used in driving stress. \
+                                  Lower values imply a smoother transition \
+                                  from grounded to floating physics")})
         )
 
     def __repr__(self):
-        return f'{self.bed.compact_string}\n{self.thklim}\n{self.sigmoid_c}'
+        return f'{self.bed.compact_string}\n{self.thklim}\n{self.flotation_reg_driving}'
 
 @dataclass
 class Rheology:
@@ -93,8 +94,21 @@ class Sliding:
             units='',
             attrs={'long_name':'basal traction exerted by water'})
         )
+
+    flotation_reg_sliding: Constant = field(
+        default_factory=lambda: Constant(
+            value=cp.float32(0.1),
+            name='flotation_reg_sliding',
+            units='m',
+            attrs={'long_name':("smoothing factor for pseudo-sigmoidal \
+                                  grounding flag used in basal stress. \
+                                  Larger values imply a smoother transition \
+                                  from grounded to floating physics")})
+        )
+
+
     def __repr__(self):
-        return f'{self.beta.compact_string}\n{self.m}\n{self.u_reg}\n{self.water_drag}'
+        return f'{self.beta.compact_string}\n{self.m}\n{self.u_reg}\n{self.water_drag}\n{self.flotation_reg_sliding}'
 
 @dataclass
 class Calving:
@@ -108,8 +122,19 @@ class Calving:
                         a facet when both cells are floating"})
         )
 
+    flotation_reg_calving: Constant = field(
+        default_factory=lambda: Constant(
+            value=cp.float32(0.1),
+            name='flotation_reg_calving',
+            units='m',
+            attrs={'long_name':("smoothing factor for pseudo-sigmoidal \
+                                  grounding flag used in calving. \
+                                  Larger values imply a smoother transition \
+                                  from grounded to floating physics")})
+        )
+
     def __repr__(self):
-        return f'{self.calving_rate}'
+        return f'{self.calving_rate}\n{self.flotation_reg_calving}'
 
 @dataclass
 class Forcing:
@@ -173,6 +198,15 @@ class Grid:
         # Adjoint fields are initialized lazily
         self._adjoint  = adjoint
 
+        self._forward_operators = None
+        self._adjoint_operators = None
+
+    @property
+    def forward_operators(self):
+        if self._forward_operators is None:
+            self._forward_operators = ForwardOperators(self)
+        return self._forward_operators
+
     @property
     def adjoint(self):
         if self._adjoint is None:
@@ -204,11 +238,11 @@ class Grid:
             units='m',
             attrs={'long_name':'Ice thickness at t (beginning of time step)'})
 
-        grounded = Field(
+        phi = Field(
             data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
-            name='grounded',
-            units='',
-            attrs={'long_name':'Whether the ice is grounded. fraction in [0,1]'})
+            name='phi',
+            units='m',
+            attrs={'long_name':'Potential Head'})
 
         mask = Field(
             data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
@@ -217,7 +251,7 @@ class Grid:
             attrs={'long_name':'''Active set mask - if unity, thickness is 
                          set to thklim in Dirichlet BC fashion'''})
 
-        return State(u=u,v=v,H=H,H_prev=H_prev,grounded=grounded,mask=mask)
+        return State(u=u,v=v,H=H,H_prev=H_prev,phi=phi,mask=mask)
 
     def _allocate_adjoint_state(self):
         lambda_u = Field(

@@ -1,7 +1,7 @@
 extern "C" __global__
-void restrict_u(
-    const float* u_fine,      // (ny_fine, nx_fine+1)
-    float* u_coarse,          // (ny_coarse, nx_coarse+1)
+void restrict_vfacet(
+    const float* f_fine,      // (ny_fine, nx_fine+1)
+    float* f_coarse,          // (ny_coarse, nx_coarse+1)
     const int ny_coarse,
     const int nx_coarse)
 {
@@ -13,13 +13,107 @@ void restrict_u(
         int I = idx % (nx_coarse + 1);
         
         // Average tangentially (in y), no averaging in x
-        u_coarse[idx] = 0.5f * (u_fine[2*J * (2*nx_coarse + 1) + 2*I] + 
-                               u_fine[(2*J + 1) * (2*nx_coarse + 1) + 2*I]);
+        f_coarse[idx] = 0.5f * (f_fine[2*J * (2*nx_coarse + 1) + 2*I] + 
+                                f_fine[(2*J + 1) * (2*nx_coarse + 1) + 2*I]);
     }
 }
 
 extern "C" __global__
-void prolongate_u(
+void restrict_hfacet(
+    const float* f_fine,      // (ny_fine+1, nx_fine)
+    float* f_coarse,          // (ny_coarse+1, nx_coarse)
+    const int ny_coarse,
+    const int nx_coarse)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = (ny_coarse + 1) * nx_coarse;
+    
+    if (idx < total) {
+        int J = idx / nx_coarse;
+        int I = idx % nx_coarse;
+        
+        // Average tangentially (in x), no averaging in y (faces align!)
+        f_coarse[idx] = 0.5f * (f_fine[2*J * (2*nx_coarse) + 2*I] + 
+                                f_fine[2*J * (2*nx_coarse) + 2*I + 1]);
+    }
+}
+
+extern "C" __global__
+void restrict_cell_avg(
+    const float* f_fine,      // (ny_fine, nx_fine)
+    float* f_coarse,          // (ny_coarse, nx_coarse)
+    const int ny_coarse,
+    const int nx_coarse)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < ny_coarse * nx_coarse) {
+        int J = idx / nx_coarse;
+        int I = idx % nx_coarse;
+        
+        // Full-weighting (average 4 fine cells)
+        f_coarse[idx] = 0.25f * (f_fine[2*J * (2*nx_coarse) + 2*I] +
+                                 f_fine[2*J * (2*nx_coarse) + 2*I + 1] +
+                                 f_fine[(2*J + 1) * (2*nx_coarse) + 2*I] +
+                                 f_fine[(2*J + 1) * (2*nx_coarse) + 2*I + 1]);
+    }
+}
+
+extern "C" __global__
+void restrict_cell_max(
+    const float* f_fine,      // (ny_fine, nx_fine)
+    float* f_coarse,          // (ny_coarse, nx_coarse)
+    const int ny_coarse,
+    const int nx_coarse)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < ny_coarse * nx_coarse) {
+        int J = idx / nx_coarse;
+        int I = idx % nx_coarse;
+        
+        // Full-weighting (average 4 fine cells)
+        float f_tl =  f_fine[2*J * (2*nx_coarse) + 2*I];
+        float f_tr =  f_fine[2*J * (2*nx_coarse) + 2*I + 1];
+        float f_bl =  f_fine[(2*J + 1) * (2*nx_coarse) + 2*I];
+        float f_br =  f_fine[(2*J + 1) * (2*nx_coarse) + 2*I + 1];
+
+	float max_f_t = fmaxf(f_tl,f_tr);
+	float max_f_b = fmaxf(f_bl,f_br);
+
+        f_coarse[idx] = fmaxf(max_f_t,max_f_b);
+    }
+}
+
+extern "C" __global__
+void restrict_cell_min(
+    const float* f_fine,      // (ny_fine, nx_fine)
+    float* f_coarse,          // (ny_coarse, nx_coarse)
+    const int ny_coarse,
+    const int nx_coarse)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < ny_coarse * nx_coarse) {
+        int J = idx / nx_coarse;
+        int I = idx % nx_coarse;
+        
+        // Full-weighting (average 4 fine cells)
+        float f_tl = f_fine[2*J * (2*nx_coarse) + 2*I];
+        float f_tr = f_fine[2*J * (2*nx_coarse) + 2*I + 1];
+        float f_bl = f_fine[(2*J + 1) * (2*nx_coarse) + 2*I];
+        float f_br = f_fine[(2*J + 1) * (2*nx_coarse) + 2*I + 1];
+
+	float min_f_t = fminf(f_tl,f_tr);
+	float min_f_b = fminf(f_bl,f_br);
+
+        f_coarse[idx] = fminf(min_f_t,min_f_b);
+    }
+}
+
+
+extern "C" __global__
+void prolongate_vfacet_injection(
     const float* u_coarse,    // (ny_coarse, nx_coarse+1)
     float* u_fine,            // (ny_fine, nx_fine+1)
     const int ny_fine,
@@ -54,157 +148,7 @@ void prolongate_u(
 }
 
 extern "C" __global__
-void restrict_cell_centered(
-    const float* h_fine,      // (ny_fine, nx_fine)
-    float* h_coarse,          // (ny_coarse, nx_coarse)
-    const int ny_coarse,
-    const int nx_coarse)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx < ny_coarse * nx_coarse) {
-        int J = idx / nx_coarse;
-        int I = idx % nx_coarse;
-        
-        // Full-weighting (average 4 fine cells)
-        h_coarse[idx] = 0.25f * (h_fine[2*J * (2*nx_coarse) + 2*I] +
-                                h_fine[2*J * (2*nx_coarse) + 2*I + 1] +
-                                h_fine[(2*J + 1) * (2*nx_coarse) + 2*I] +
-                                h_fine[(2*J + 1) * (2*nx_coarse) + 2*I + 1]);
-    }
-}
-
-extern "C" __global__
-void restrict_max_pool(
-    const float* h_fine,      // (ny_fine, nx_fine)
-    float* h_coarse,          // (ny_coarse, nx_coarse)
-    const int ny_coarse,
-    const int nx_coarse)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx < ny_coarse * nx_coarse) {
-        int J = idx / nx_coarse;
-        int I = idx % nx_coarse;
-        
-        // Full-weighting (average 4 fine cells)
-        float h_tl = h_fine[2*J * (2*nx_coarse) + 2*I];
-        float h_tr = h_fine[2*J * (2*nx_coarse) + 2*I + 1];
-        float h_bl =  h_fine[(2*J + 1) * (2*nx_coarse) + 2*I];
-        float h_br =  h_fine[(2*J + 1) * (2*nx_coarse) + 2*I + 1];
-
-	float max_h_t = fmaxf(h_tl,h_tr);
-	float max_h_b = fmaxf(h_bl,h_br);
-
-        h_coarse[idx] = fmaxf(max_h_t,max_h_b);
-    }
-}
-
-extern "C" __global__
-void restrict_min_pool(
-    const float* h_fine,      // (ny_fine, nx_fine)
-    float* h_coarse,          // (ny_coarse, nx_coarse)
-    const int ny_coarse,
-    const int nx_coarse)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx < ny_coarse * nx_coarse) {
-        int J = idx / nx_coarse;
-        int I = idx % nx_coarse;
-        
-        // Full-weighting (average 4 fine cells)
-        float h_tl = h_fine[2*J * (2*nx_coarse) + 2*I];
-        float h_tr = h_fine[2*J * (2*nx_coarse) + 2*I + 1];
-        float h_bl =  h_fine[(2*J + 1) * (2*nx_coarse) + 2*I];
-        float h_br =  h_fine[(2*J + 1) * (2*nx_coarse) + 2*I + 1];
-
-	float min_h_t = fminf(h_tl,h_tr);
-	float min_h_b = fminf(h_bl,h_br);
-
-        h_coarse[idx] = fminf(min_h_t,min_h_b);
-    }
-}
-
-
-extern "C" __global__
-void prolongate_cell_centered(
-    const float* h_coarse,    // (ny_coarse, nx_coarse)
-    float* h_fine,            // (ny_fine, nx_fine)
-    const int ny_fine,
-    const int nx_fine)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (idx < ny_fine * nx_fine) {
-        int j = idx / nx_fine;
-        int i = idx % nx_fine;
-        
-        int J = j / 2;
-        int I = i / 2;
-        
-        // Injection (as you suggested)
-        h_fine[idx] = h_coarse[J * (nx_fine/2) + I];
-    }
-}
-
-extern "C" __global__
-void restrict_v(
-    const float* v_fine,      // (ny_fine+1, nx_fine)
-    float* v_coarse,          // (ny_coarse+1, nx_coarse)
-    const int ny_coarse,
-    const int nx_coarse)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = (ny_coarse + 1) * nx_coarse;
-    
-    if (idx < total) {
-        int J = idx / nx_coarse;
-        int I = idx % nx_coarse;
-        
-        // Average tangentially (in x), no averaging in y (faces align!)
-        v_coarse[idx] = 0.5f * (v_fine[2*J * (2*nx_coarse) + 2*I] + 
-                               v_fine[2*J * (2*nx_coarse) + 2*I + 1]);
-    }
-}
-
-extern "C" __global__
-void prolongate_v(
-    const float* v_coarse,    // (ny_coarse+1, nx_coarse)
-    float* v_fine,            // (ny_fine+1, nx_fine)
-    const int ny_fine,
-    const int nx_fine)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = (ny_fine + 1) * nx_fine;
-    
-    if (idx < total) {
-        int j = idx / nx_fine;
-        int i = idx % nx_fine;
-        
-        int J = j / 2;  // Coarse face row
-        int I = i / 2;  // Coarse cell column
-        
-        if (j % 2 == 0) {
-            // Fine face aligns with coarse face in y
-            // Constant in tangential (x) direction
-            v_fine[idx] = v_coarse[J * (nx_fine/2) + I];
-        } else {
-            // Fine face between coarse faces in y
-            // Linear interpolation in normal (y) direction
-            if (J < ny_fine/2) {
-                v_fine[idx] = 0.5f * (v_coarse[J * (nx_fine/2) + I] + 
-                                     v_coarse[(J + 1) * (nx_fine/2) + I]);
-            } else {
-                // Boundary case at bottom
-                v_fine[idx] = v_coarse[J * (nx_fine/2) + I];
-            }
-        }
-    }
-}
-
-extern "C" __global__
-void prolongate_u_smooth(
+void prolongate_vfacet_bilinear(
     const float* u_coarse,    // (ny_coarse, nx_coarse+1)
     float* u_fine,            // (ny_fine, nx_fine+1)
     const int ny_fine,
@@ -259,7 +203,45 @@ void prolongate_u_smooth(
 
 
 extern "C" __global__
-void prolongate_v_smooth(
+void prolongate_hfacet_injection(
+    const float* v_coarse,    // (ny_coarse+1, nx_coarse)
+    float* v_fine,            // (ny_fine+1, nx_fine)
+    const int ny_fine,
+    const int nx_fine)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = (ny_fine + 1) * nx_fine;
+    
+    if (idx < total) {
+        int j = idx / nx_fine;
+        int i = idx % nx_fine;
+        
+        int J = j / 2;  // Coarse face row
+        int I = i / 2;  // Coarse cell column
+        
+        if (j % 2 == 0) {
+            // Fine face aligns with coarse face in y
+            // Constant in tangential (x) direction
+            v_fine[idx] = v_coarse[J * (nx_fine/2) + I];
+        } else {
+            // Fine face between coarse faces in y
+            // Linear interpolation in normal (y) direction
+            if (J < ny_fine/2) {
+                v_fine[idx] = 0.5f * (v_coarse[J * (nx_fine/2) + I] + 
+                                     v_coarse[(J + 1) * (nx_fine/2) + I]);
+            } else {
+                // Boundary case at bottom
+                v_fine[idx] = v_coarse[J * (nx_fine/2) + I];
+            }
+        }
+    }
+}
+
+
+
+
+extern "C" __global__
+void prolongate_hfacet_bilinear(
     const float* v_coarse,    // (ny_coarse+1, nx_coarse)
     float* v_fine,            // (ny_fine+1, nx_fine)
     const int ny_fine,
@@ -312,8 +294,32 @@ void prolongate_v_smooth(
                 + t_y         * ((1.0f - t_x) * v10 + t_x * v11);
 }
 
+
+
 extern "C" __global__
-void prolongate_H_smooth(
+void prolongate_cell_injection(
+    const float* h_coarse,    // (ny_coarse, nx_coarse)
+    float* h_fine,            // (ny_fine, nx_fine)
+    const int ny_fine,
+    const int nx_fine)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < ny_fine * nx_fine) {
+        int j = idx / nx_fine;
+        int i = idx % nx_fine;
+        
+        int J = j / 2;
+        int I = i / 2;
+        
+        h_fine[idx] = h_coarse[J * (nx_fine/2) + I];
+    }
+}
+
+
+
+extern "C" __global__
+void prolongate_cell_bilinear(
     const float* H_coarse,
     float* H_fine,
     const int ny_fine,

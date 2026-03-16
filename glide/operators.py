@@ -5,7 +5,10 @@ from typing import Callable
 from .closure import eval_grounded_fraction_kernel
 
 class ForwardOperators:
-    def __init__(self,grid,use_fast_math=True,use_subgrid_bed_closure=False):
+    def __init__(self,grid,
+            use_fast_math=True,
+            use_subgrid_bed_closure=False):
+
         self.grid = grid
 
         cuda_dir = Path(__file__).parent / "cuda"
@@ -52,7 +55,13 @@ class ForwardOperators:
         grid_size = (self.grid.nx // stride + 1, self.grid.ny // stride + 1)
         return grid_size, block_size, stride, halo
 
-    def compute_residual(self, dt, use_mask=True, operator_only=False, freeze_phi=True, freeze_calving=False,return_norms=False):
+    def compute_residual(self, dt, 
+            use_mask=True, 
+            operator_only=False, 
+            freeze_calving=False, 
+            freeze_phi=False,
+            return_norms=False):
+
         kernel = self.kernels.get_function('compute_residual')
         grid_size, block_size, stride, halo = self._kernel_config
   
@@ -124,10 +133,12 @@ class ForwardOperators:
                     grid.ny, grid.nx, 
                     stride, halo))
 
-    def vanka_smooth(self, dt, freeze_phi=False,freeze_calving=False):
+    def vanka_smooth(self, dt,
+            freeze_calving=False,
+            freeze_phi=False):
+
         kernel = self.kernels.get_function('vanka_smooth')
         grid_size, block_size, stride, halo = self._kernel_config
-        grid = self.grid
 
         grid = self.grid
         state = grid.state
@@ -137,13 +148,13 @@ class ForwardOperators:
         calving = grid.calving
         forcing = grid.forcing
 
+        if freeze_calving:
+            calving_rate = cp.float32(0.0)
+        else:
+            calving_rate = calving.calving_rate.value
+
         if not freeze_phi:
             self.compute_phi(relaxation=self.vanka_config.relax_phi)
-
-        if freeze_calving:
-            calving_rate=cp.float32(0.0)
-        else:
-            calving_rate=grid.calving.calving_rate.value
 
         self.delta_u.fill(0.0)
         self.delta_v.fill(0.0)
@@ -151,18 +162,18 @@ class ForwardOperators:
         kernel(grid_size, block_size,
                (self.delta_u, self.delta_v, self.delta_H, 
                 state.mask.data,
-                state.u.data, state.v.data, state.H.data, state.phi.data,
+                state.u.data, state.v.data, state.H.data, 
+                state.phi.data,
                 self.f_u, self.f_v, self.f_H,
-                geometry.bed.data, 
-                rheology.B.data, 
-                sliding.beta.data, 
+                geometry.bed.data, rheology.B.data, sliding.beta.data, 
                 self.gamma,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.flotation_reg_driving.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value,
+                sliding.water_drag.value, 
                 sliding.flotation_reg_sliding.value,
-                calving_rate, calving.flotation_reg_calving.value,
+                calving_rate, 
+                calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo,
                 self.vanka_config.newton_config.steps,
@@ -171,9 +182,11 @@ class ForwardOperators:
                 self.vanka_config.newton_config.mc_damping)
         )
 
-    def vanka_sweep(self, dt, n_iter, freeze_phi=False, freeze_calving=False):
+    def vanka_sweep(self, dt, n_iter, 
+            freeze_calving=False,
+            freeze_phi=False):
         for i in range(n_iter):
-            self.vanka_smooth(dt,freeze_phi=freeze_phi,freeze_calving=freeze_calving)
+            self.vanka_smooth(dt,freeze_calving=freeze_calving,freeze_phi=freeze_phi)
             self.grid.state.u.data[:] += self.vanka_config.omega * self.delta_u
             self.grid.state.v.data[:] += self.vanka_config.omega * self.delta_v
             self.grid.state.H.data[:] += self.vanka_config.omega * self.delta_H
@@ -209,7 +222,7 @@ class NewtonConfig:
     steps: int = 100
     relaxation: cp.float32 = cp.float32(0.5)
     ssa_damping: cp.float32 = cp.float32(0.01)
-    mc_damping: cp.float32 = cp.float32(1.0)
+    mc_damping: cp.float32 = cp.float32(0.01)
 
 @dataclass
 class VankaConfig:

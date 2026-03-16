@@ -89,7 +89,7 @@ thickness = gaussian_filter(thickness,1)
 beta = dataset.beta.values
 beta.fill(2.5)
 smb = dataset.smb.values
-smb -= 1.0
+smb += 0.0
 BETA_PATH = "./inverse_output/beta_level_0.p"
 beta = cp.array(pickle.load(open(BETA_PATH, 'rb')))
 #beta[beta>5] = 5
@@ -184,8 +184,6 @@ for g in mg.grids:
     g.forward_operators.vanka_config.newton_config.relaxation = cp.float32(0.5)
     g.forward_operators.vanka_config.newton_config.steps=30
 
-for g in mg.grids[1:]:
-    g.calving.calving_rate.set(cp.float32(0.0))
 
 cp.random.seed(0)
 grid.state.u.data[:,:] = cp.random.randn(grid.ny,grid.nx + 1)
@@ -202,17 +200,16 @@ grid.forward_operators.compute_phi()
 #grid.forward_operators.vanka_config.hook_func = VankaLogger(grid,0)
 
 solver = FASCDSolver(mg)
-solver.config.use_tau_correction_for_coarse_calving = True
 solver.config.coarse_steps = 200
 solver.config.pre_steps = 10
 solver.config.post_steps = 150
 solver.config.finest_steps = 0
+solver.config.freeze_coarse_phi = True
 
 t = 0.0
-n_steps = 25
 writer = VTIWriter(OUTPUT_DIR, base="greenland", dx=dx)
 logger = TimeLogger(grid)
-for step in range(n_steps):
+for step in range(N_STEPS):
     print(t)
     solver.solve(dt,max_iter=10,rel_tol=1e-3,abs_tol=10)
     grid.state.H_prev.data[:,:] = grid.state.H.data[:,:]

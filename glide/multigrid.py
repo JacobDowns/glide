@@ -1,19 +1,12 @@
 import cupy as cp
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from .grid import Grid
-
-#from .kernels import (
-#    restrict_vfacet, restrict_hfacet, restrict_cell_centered,
-#    restrict_max_pool, restrict_min_pool, prolongate_vfacet, prolongate_hfacet,
-#    prolongate_cell_centered
-#)
+from .operators import VankaConfig,NewtonConfig
+from .field import LocalOption,BroadcastOption
 
 class Multigrid:
-    def __init__(self,finest_grid,use_fast_math=True):
-        self.finest_grid = finest_grid
-        self.grids = [finest_grid]
-        self.initialized = False
+    def __init__(self,n_levels: int,finest_grid=None,ny=None,nx=None,dx=None,use_fast_math=True):
 
         cuda_dir = Path(__file__).parent / "cuda"
 
@@ -28,14 +21,40 @@ class Multigrid:
 
         self.kernels = cp.RawModule(code=cuda_source, options=options)
 
-    def create_grid_hierarchy(self,n_grids,restrict_fields=True):
-        self.grids = [self.finest_grid]
-        for i in range(1,n_grids):
-            coarse_grid = self.create_coarse_grid(self.grids[-1],
-                restrict_fields=restrict_fields)
-            self.grids.append(coarse_grid)
-        return self.grids
+        if finest_grid is not None:
+            print("Instantiating multigrid from existing grid")
+            self.finest_grid = finest_grid
+        else:
+            print("Instantiating multigrid from new grid")
+            self.finest_grid = Grid(ny,nx,dx)
 
+        self.n_levels = n_levels
+
+        if n_levels is not None:
+            self.create_grid_hierarchy(n_levels,restrict_fields=True)
+
+        self.state = MGStateManager(self)
+        self.geometry = MGGeometryManager(self)
+        self.rheology = MGRheologyManager(self)
+        self.sliding = MGSlidingManager(self)
+        self.calving = MGCalvingManager(self)
+        self.forcing = MGForcingManager(self)
+
+        self._adjoint = None
+
+    @property
+    def adjoint(self):
+        if self._adjoint is None:
+            self._adjoint = MGAdjointManager(self)
+        return self._adjoint
+
+    def create_grid_hierarchy(self,n_levels,restrict_fields=True):
+        self.levels = [self.finest_grid]
+        for i in range(1,n_levels):
+            coarse_grid = self.create_coarse_grid(self.levels[-1],
+                restrict_fields=restrict_fields)
+            self.levels.append(coarse_grid)
+        return self.levels
 
     def create_coarse_grid(self,parent_grid,restrict_fields=True):
         child_grid = Grid(
@@ -230,8 +249,229 @@ class Multigrid:
 
         kernel((grid_size,), (block_size,),
                (coarse_field, fine_field, ny_fine, nx_fine))
-        return fine_field    
+        return fine_field   
 
+class HierarchyFieldManager:
+    def __init__(self, levels, getter, restrict,name=None):
+        self._levels = levels
+        self._getter = getter
+        self._restrict = restrict
+        self._name = name
+
+    def set(self, value):
+        finest = self._getter(self._levels[0])
+        finest.set(value)
+        self.restrict_down()
+
+    def restrict_down(self):
+        for l in range(len(self._levels) - 1):
+            fine = self._getter(self._levels[l])
+            coarse = self._getter(self._levels[l + 1])
+            self._restrict(fine, coarse)
+
+    def set_level(self, level, value):
+        self._getter(self._levels[level].grid).set(value)
+
+class MGStateManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.u = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.u,
+            restrict=lambda f,c: mg.restrict_vfacet(f.data,c.data),
+            name="u",
+        )
+
+        self.v = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.v,
+            restrict=lambda f,c: mg.restrict_hfacet(f.data,c.data),
+            name="v",
+        )
+
+        self.H = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.H,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="H",
+        )
+        
+        self.H_prev = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.H_prev,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="H_prev",
+        )
+
+        self.phi = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.phi,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="phi",
+        )
+
+        self.mask = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.mask,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='max'),
+            name="mask",
+        )
+
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].state.__repr__()
+
+class MGAdjointManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.lambda_u = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.adjoint.lambda_u,
+            restrict=lambda f,c: mg.restrict_vfacet(f.data,c.data),
+            name="lambda_u",
+        )
+
+        self.lambda_v = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.adjoint.lambda_v,
+            restrict=lambda f,c: mg.restrict_hfacet(f.data,c.data),
+            name="lambda_v",
+        )
+
+        self.lambda_H = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.adjoint.lambda_H,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="lambda_H",
+        )
+        
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].adjoint.__repr__()
+
+class MGGeometryManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.bed = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.geometry.bed,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="bed",
+        )
+
+        self.flotation_reg_driving = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.geometry.flotation_reg_driving,
+            restrict=lambda f,c: c.set(f.value),
+            name="flotation_reg_driving",
+        )
+
+        self.thklim = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.geometry.thklim,
+            restrict=lambda f,c: c.set(f.value),
+            name="thklim",
+        )
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].geometry.__repr__()
+
+class MGRheologyManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.B = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.B,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="B",
+        )
+
+        self.n = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.n,
+            restrict=lambda f,c: c.set(f.value),
+            name="n",
+        )
+
+        self.eps_reg = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.eps_reg,
+            restrict=lambda f,c: c.set(f.value),
+            name="eps_reg",
+        )
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].rheology.__repr__()
+
+class MGSlidingManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.beta = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.beta,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="beta",
+        )
+
+        self.m = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.m,
+            restrict=lambda f,c: c.set(f.value),
+            name="m",
+        )
+        
+        self.u_reg = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.u_reg,
+            restrict=lambda f,c: c.set(f.value),
+            name="u_reg",
+        )
+        
+        self.water_drag = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.water_drag,
+            restrict=lambda f,c: c.set(f.value),
+            name="water_drag",
+        )
+        
+        self.flotation_reg_sliding = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.flotation_reg_sliding,
+            restrict=lambda f,c: c.set(f.value),
+            name="flotation_reg_sliding",
+        )
+
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].sliding.__repr__()
+
+class MGCalvingManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.calving_rate = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.calving.calving_rate,
+            restrict=lambda f,c: c.set(f.value),
+            name="calving_rate",
+        )
+        
+        self.flotation_reg_calving = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.calving.flotation_reg_calving,
+            restrict=lambda f,c: c.set(f.value),
+            name="flotation_reg_calving",
+        )
+
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].calving.__repr__()
+
+class MGForcingManager:
+    def __init__(self, mg):
+        self.mg = mg
+        self.smb = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.forcing.smb,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="smb",
+        )
+
+    def __repr__(self):
+        return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].forcing.__repr__()
 
 class FASCDScratch:
     def __init__(self,grid):
@@ -252,46 +492,59 @@ class FASCDScratch:
         self.chi = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.phi = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 
-@dataclass
-class FASCDLevel:
-    grid: Grid
-    scratch: FASCDScratch
 
-@dataclass
-class FASCDConfig:
-    freeze_coarse_calving: bool = True
-    freeze_coarse_phi: bool = True
-    coarsest_steps: int = 200
-    pre_steps: int = 10
-    post_steps: int = 20
-    finest_steps: int = 50
 
 class FASCDSolver:
     def __init__(self,multigrid):
         self.multigrid = multigrid
-        self.levels = [FASCDLevel(grid, FASCDScratch(grid)) for grid in multigrid.grids]
-        self.config = FASCDConfig()
+        self.levels = [FASCDLevel(grid, FASCDScratch(grid)) for grid in multigrid.levels]
+
+        self._fas_config = FASCDConfig()
+        self.fas_options = FASCDOptions(self._fas_config)
+        
+        self.vanka_options = VankaOptions(
+            self.levels,
+            getter=lambda lev: lev.grid.forward_operators.vanka_config,
+        )
+
         self.n_levels = len(self.levels)
         self.dt = None
 
-    def solve(self,dt,max_iter=10,rel_tol=1e-3,abs_tol=10.0):
+    def solve(self,dt,start_level=0,report_norms=True):
         self.dt = cp.float32(dt)
-        self.multigrid.grids[0].forward_operators.set_rhs(dt)
-        ru_0,rv_0,rH_0 = self.multigrid.grids[0].forward_operators.compute_residual(dt,return_norms=True)
-        rel_err = 1.0
-        abs_err_0 = abs_err = cp.sqrt(ru_0**2 + rv_0**2 + rH_0**2)
+        
+        start_level_ = self.multigrid.levels[start_level]
+        start_level_.forward_operators.set_rhs(dt)
+        
+        ru_init,rv_init,rH_init = start_level_.forward_operators.compute_residual(dt,return_norms=True)
+        initial_residual_norm = cp.sqrt(ru_init**2 + rv_init**2 + rH_init**2)
+        relative_residual_norm = cp.float32(1.0)
+
+        if report_norms:
+            print(f"  Initial: |r| = {initial_residual_norm:.4e}, "
+                  f"|r_u| = {float(ru_init):.4e}, "
+                  f"|r_v| = {float(rv_init):.4e}, "
+                  f"|r_H| = {float(rH_init):.4e}")
+
+        absolute_residual_norm = initial_residual_norm
         iteration = 0
-        print(ru_0,rv_0,rH_0)
-        while rel_err > rel_tol and abs_err > abs_tol and iteration < max_iter:
-            self.vcycle(0)
-            ru,rv,rH = self.multigrid.grids[0].forward_operators.compute_residual(dt,freeze_phi=True,return_norms=True)
-            abs_err = cp.sqrt(ru**2 + rv**2 + rH**2)
-            rel_err = abs_err / abs_err_0
+        while (relative_residual_norm > self._fas_config.relative_tolerance 
+                and absolute_residual_norm > self._fas_config.absolute_tolerance
+                and iteration < self._fas_config.maximum_vcycles):
+            self.vcycle(start_level,finest=True)
+            ru,rv,rH = start_level_.forward_operators.compute_residual(dt,freeze_phi=True,return_norms=True)
+
+            absolute_residual_norm = cp.sqrt(ru**2 + rv**2 + rH**2)
+            relative_residual_norm = absolute_residual_norm / initial_residual_norm
+            if report_norms:
+                print(f"  V-cycle {iteration}: |r|/|r0| = {relative_residual_norm:.4e}, "
+                      f"|r_u| = {float(ru):.4e}, "
+                      f"|r_v| = {float(rv):.4e}, "
+                      f"|r_H| = {float(rH):.4e}")
             iteration += 1
-            print(iteration,rel_err,abs_err,ru,rv,rH)
 
         
-    def vcycle(self, l):
+    def vcycle(self, l, finest=False):
         """
         FASCD V-cycle for the coupled SSA + mass conservation system.
 
@@ -302,8 +555,7 @@ class FASCDSolver:
         ----------
         l : Current grid level
         """
-        finest = l == 0
-        coarse = l > 0
+        coarse = not finest
         mg = self.multigrid
         dt = self.dt
         level = self.levels[l]
@@ -317,7 +569,11 @@ class FASCDSolver:
         if l == self.n_levels - 1:
             # Coarsest level: direct solve
             level.grid.forward_operators.gamma[:,:] = level.scratch.w_H[:,:] + level.scratch.chi[:,:]
-            level.grid.forward_operators.vanka_sweep(self.dt,self.config.coarsest_steps,freeze_calving=self.config.freeze_coarse_calving,freeze_phi=self.config.freeze_coarse_phi)
+            level.grid.forward_operators.vanka_sweep(self.dt,
+                self._fas_config.coarsest_steps,
+                freeze_calving=self._fas_config.freeze_coarse_calving,
+                freeze_phi=self._fas_config.freeze_coarse_phi
+            )
             level.grid.forward_operators.gamma.fill(level.grid.geometry.thklim.value)
             return
 
@@ -332,9 +588,9 @@ class FASCDSolver:
 
         # Pre-smooth with local constraint
         level.grid.forward_operators.gamma[:, :] = level.scratch.w_H + level.scratch.phi
-        level.grid.forward_operators.vanka_sweep(self.dt,self.config.pre_steps,
-                freeze_calving=coarse and self.config.freeze_coarse_calving,
-                freeze_phi=coarse and self.config.freeze_coarse_phi)
+        level.grid.forward_operators.vanka_sweep(self.dt,self._fas_config.pre_steps,
+                freeze_calving=coarse and self._fas_config.freeze_coarse_calving,
+                freeze_phi=coarse and self._fas_config.freeze_coarse_phi)
         level.grid.forward_operators.gamma.fill(level.grid.geometry.thklim.value)
 
         # Compute coarse grid correction
@@ -350,15 +606,15 @@ class FASCDSolver:
 
         # Compute and restrict residual
         level.grid.forward_operators.compute_residual(dt, use_mask=False, 
-                freeze_calving=coarse and self.config.freeze_coarse_calving,
+                freeze_calving=coarse and self._fas_config.freeze_coarse_calving,
                 freeze_phi=True)
         mg.restrict_residual(level.grid,next_level.grid)
 
         # Form coarse grid RHS: f_c = F_c(I_h^H u_h) - I_h^H r_h
         next_level.grid.forward_operators.compute_residual(dt, use_mask=False, 
                 operator_only=True, 
-                freeze_calving=self.config.freeze_coarse_calving,
-                freeze_phi=self.config.freeze_coarse_phi)
+                freeze_calving=self._fas_config.freeze_coarse_calving,
+                freeze_phi=self._fas_config.freeze_coarse_phi)
 
         next_level.grid.forward_operators.f_u[:,:] = next_level.grid.forward_operators.F_u[:,:] - next_level.grid.forward_operators.r_u[:,:]
         next_level.grid.forward_operators.f_v[:,:] = next_level.grid.forward_operators.F_v[:,:] - next_level.grid.forward_operators.r_v[:,:]
@@ -388,13 +644,200 @@ class FASCDSolver:
 
         # Post-smooth
         level.grid.forward_operators.gamma[:, :] = level.scratch.w_H + level.scratch.chi
-        level.grid.forward_operators.vanka_sweep(self.dt,self.config.post_steps,
-                freeze_calving=coarse and self.config.freeze_coarse_calving,
-                freeze_phi=coarse and self.config.freeze_coarse_phi)
+        level.grid.forward_operators.vanka_sweep(self.dt,self._fas_config.post_steps,
+                freeze_calving=coarse and self._fas_config.freeze_coarse_calving,
+                freeze_phi=coarse and self._fas_config.freeze_coarse_phi)
         level.grid.forward_operators.gamma.fill(level.grid.geometry.thklim.value)
 
         if not coarse:
-            level.grid.forward_operators.vanka_sweep(self.dt,self.config.finest_steps,freeze_phi=False,freeze_calving=False)
+            level.grid.forward_operators.vanka_sweep(self.dt,
+                self._fas_config.finest_steps,
+                freeze_phi=False,
+                freeze_calving=False)
+
+@dataclass
+class FASCDLevel:
+    grid: Grid
+    scratch: FASCDScratch
+
+@dataclass
+class FASCDConfig:
+    freeze_coarse_calving: bool = True
+    freeze_coarse_phi: bool = True
+    coarsest_steps: int = 200
+    pre_steps: int = 10
+    post_steps: int = 20
+    finest_steps: int = 50
+    maximum_vcycles: int = 10
+    relative_tolerance: cp.float32 = cp.float32(1e-3)
+    absolute_tolerance: cp.float32 = cp.float32(5.0)
+
+def dataclass_field_names(cls):
+    return [f.name for f in fields(cls)]
+
+def validate_kwargs(config_cls, kwargs):
+    valid = set(dataclass_field_names(config_cls))
+    unknown = set(kwargs) - valid
+    if unknown:
+        raise AttributeError(
+            f"Unknown {config_cls.__name__} option(s): {sorted(unknown)}. "
+            f"Valid options are: {sorted(valid)}"
+        )
+
+class FASCDOptions:
+    """
+    User-facing wrapper around a single FASCDConfig.
+    """
+
+    def __init__(self, config: FASCDConfig):
+        self._config = config
+
+        self.options = ['freeze_coarse_calving',
+            'freeze_coarse_phi',
+            'coarsest_steps',
+            'pre_steps',
+            'post_steps',
+            'finest_steps']
+
+        self.freeze_coarse_calving = LocalOption(
+            getter=lambda: self._config.freeze_coarse_calving,
+            setter=lambda v: setattr(self._config, "freeze_coarse_calving", v),
+            name="freeze_coarse_calving",
+        )
+        self.freeze_coarse_phi = LocalOption(
+            getter=lambda: self._config.freeze_coarse_phi,
+            setter=lambda v: setattr(self._config, "freeze_coarse_phi", v),
+            name="freeze_coarse_phi",
+        )
+        self.coarsest_steps = LocalOption(
+            getter=lambda: self._config.coarsest_steps,
+            setter=lambda v: setattr(self._config, "coarsest_steps", v),
+            name="coarsest_steps",
+        )
+        self.pre_steps = LocalOption(
+            getter=lambda: self._config.pre_steps,
+            setter=lambda v: setattr(self._config, "pre_steps", v),
+            name="pre_steps",
+        )
+        self.post_steps = LocalOption(
+            getter=lambda: self._config.post_steps,
+            setter=lambda v: setattr(self._config, "post_steps", v),
+            name="post_steps",
+        )
+        self.finest_steps = LocalOption(
+            getter=lambda: self._config.finest_steps,
+            setter=lambda v: setattr(self._config, "finest_steps", v),
+            name="finest_steps",
+        )
+
+        self.maximum_vcycles = LocalOption(
+            getter=lambda: self._config.maximum_vcycles,
+            setter=lambda v: setattr(self._config, "maximum_vcycles", v),
+            name="maximum_vcyles",
+        )
+        
+        self.relative_tolerance = LocalOption(
+            getter=lambda: self._config.relative_tolerance,
+            setter=lambda v: setattr(self._config, "relative_tolerance", v),
+            name="relative_tolerance",
+        )
+        
+        self.absolute_tolerance = LocalOption(
+            getter=lambda: self._config.absolute_tolerance,
+            setter=lambda v: setattr(self._config, "absolute_tolerance", v),
+            name="absolute_tolerance",
+        )
+
+
+
+    def set(self, **kwargs):
+        validate_kwargs(FASCDConfig, kwargs)
+        for k, v in kwargs.items():
+            setattr(self._config, k, v)
+
+    def __repr__(self):
+        return 'fas_options={' + ', '.join([f"{getattr(self,o)}" for o in self.options]) + '}'
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(self.options))
+
+
+
+class VankaOptions:
+    """
+    Broadcast wrapper around VankaConfig across all solver levels.
+    """
+
+    def __init__(self, levels, getter):
+        self._levels = levels
+        self._getter = getter  # level -> VankaConfig
+
+        self.options = ['omega','relax_phi']
+
+        self.omega = BroadcastOption(self._levels, self._getter, "omega")
+        self.relax_phi = BroadcastOption(self._levels, self._getter, "relax_phi")
+
+        self.newton_options = NewtonOptions(
+            self._levels,
+            getter=lambda lev: self._getter(lev).newton_config,
+        )
+
+    def set(self, **kwargs):
+        validate_kwargs(VankaConfig, kwargs)
+        for lev in self._levels:
+            cfg = self._getter(lev)
+            for k, v in kwargs.items():
+                setattr(cfg, k, v)
+
+    def set_level(self, level_index: int, **kwargs):
+        validate_kwargs(VankaConfig, kwargs)
+        cfg = self._getter(self._levels[level_index])
+        for k, v in kwargs.items():
+            setattr(cfg, k, v)
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(self.options))
+
+    def __repr__(self):
+        return 'vanka_options={' + ', '.join([f"{getattr(self,o)}" for o in self.options]) + '}'
+
+
+
+class NewtonOptions:
+    """
+    Broadcast wrapper around NewtonConfig across all solver levels.
+    """
+
+    def __init__(self, levels, getter):
+        self._levels = levels
+        self._getter = getter  # level -> NewtonConfig
+        self.options = ['steps','relaxation','ssa_damping','mc_damping']
+
+        self.steps = BroadcastOption(self._levels, self._getter, "steps")
+        self.relaxation = BroadcastOption(self._levels, self._getter, "relaxation")
+        self.ssa_damping = BroadcastOption(self._levels, self._getter, "ssa_damping")
+        self.mc_damping = BroadcastOption(self._levels, self._getter, "mc_damping")
+
+    def set(self, **kwargs):
+        validate_kwargs(NewtonConfig, kwargs)
+        for lev in self._levels:
+            cfg = self._getter(lev)
+            for k, v in kwargs.items():
+                setattr(cfg, k, v)
+
+    def set_level(self, level_index: int, **kwargs):
+        validate_kwargs(NewtonConfig, kwargs)
+        cfg = self._getter(self._levels[level_index])
+        for k, v in kwargs.items():
+            setattr(cfg, k, v)
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(self.options))
+
+    def __repr__(self):
+        return 'newton_options={' + ', '.join([f"{getattr(self,o)}" for o in self.options]) + '}'
+
+
 
 """
     def adjoint_vcycle_fas(grid,

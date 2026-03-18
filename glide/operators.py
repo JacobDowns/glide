@@ -219,10 +219,10 @@ class ForwardOperators:
 
 @dataclass
 class NewtonConfig:
-    steps: int = 100
+    steps: int = 30
     relaxation: cp.float32 = cp.float32(0.5)
     ssa_damping: cp.float32 = cp.float32(0.01)
-    mc_damping: cp.float32 = cp.float32(0.01)
+    mc_damping: cp.float32 = cp.float32(1.0)
 
 @dataclass
 class VankaConfig:

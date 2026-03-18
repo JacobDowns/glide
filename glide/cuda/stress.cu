@@ -256,40 +256,23 @@ TauBxJacobian get_tau_bx_jac(
 {
     TauBxJacobian jac = {0};
 
-    //float phiplus_l = fmaxf(s.phi_l,0.0f)/s.flotation_reg_sliding;
-    //float phiplus_r = fmaxf(s.phi_r,0.0f)/s.flotation_reg_sliding;
-
-    //float phiplus2_l = phiplus_l * phiplus_l;
-    //float phiplus2_r = phiplus_r * phiplus_r;
-	    
-    //float N_l = phiplus2_l/(1.0f + phiplus2_l);
-    //float N_r = phiplus2_r/(1.0f + phiplus2_r);
-
-    //float grounded_l = sigmoid(s.phi_l,s.flotation_reg_sliding);
-    //float grounded_r = sigmoid(s.phi_r,s.flotation_reg_sliding);
-
     float grounded_l = s.phi_l;
     float grounded_r = s.phi_r;
 
-    //float beta_eff_l = s.beta_l * N_l;
-    //float beta_eff_r = s.beta_r * N_r;
-    float beta_eff_l = s.beta_l * grounded_l + (1.0f - grounded_l)*s.water_drag;
-    float beta_eff_r = s.beta_r * grounded_r + (1.0f - grounded_r)*s.water_drag;
+    float beta_eff_l = s.beta_l * grounded_l;
+    float beta_eff_r = s.beta_r * grounded_r;
     float beta_eff = 0.5f*(beta_eff_l + beta_eff_r);
 
     float unorm_sq = s.u * s.u + 0.25f*(s.v_tl * s.v_tl + s.v_tr * s.v_tr + s.v_bl * s.v_bl + s.v_br * s.v_br);
     float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
     float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
 
-    jac.res = -beta_eff * unorm_sq_pow * s.u;
-    //jac.d_u = -(beta_eff * (2.0f * unorm_sq_deriv * s.u * s.u + unorm_sq_pow) + s.water_drag);
-    jac.d_u = -beta_eff * (2.0f * unorm_sq_deriv * s.u * s.u + unorm_sq_pow);
+    jac.res = -(beta_eff * unorm_sq_pow + s.water_drag)* s.u;
+    jac.d_u = -(beta_eff * (2.0f * unorm_sq_deriv * s.u * s.u + unorm_sq_pow) + s.water_drag);
     jac.d_v_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tl);
     jac.d_v_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tr);
     jac.d_v_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_bl);
     jac.d_v_br = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_br);
-    //jac.d_beta_l = -0.5f * N_l * unorm_sq_pow * s.u;
-    //jac.d_beta_r = -0.5f * N_r * unorm_sq_pow * s.u;
     jac.d_beta_l = -0.5f * grounded_l * unorm_sq_pow * s.u;
     jac.d_beta_r = -0.5f * grounded_r * unorm_sq_pow * s.u;
     return jac;
@@ -361,22 +344,11 @@ TauByJacobian get_tau_by_jac(
 {
     TauByJacobian jac = {0};
 
-    //float phiplus_t = fmaxf(s.phi_t,0.0f)/s.flotation_reg_sliding;
-    //float phiplus_b = fmaxf(s.phi_b,0.0f)/s.flotation_reg_sliding;
+    float grounded_t = s.phi_t;
+    float grounded_b = s.phi_b;
 
-    //float phiplus2_t = phiplus_t * phiplus_t;
-    //float phiplus2_b = phiplus_b * phiplus_b;
-	    
-    //float N_t = phiplus2_t/(1.0f + phiplus2_t);
-    //float N_b = phiplus2_b/(1.0f + phiplus2_b);
-
-    float grounded_t = s.phi_t;//sigmoid(s.phi_t,s.flotation_reg_sliding);
-    float grounded_b = s.phi_b;//sigmoid(s.phi_b,s.flotation_reg_sliding);
-
-    //float beta_eff_t = s.beta_t * N_t;
-    //float beta_eff_b = s.beta_b * N_b;
-    float beta_eff_t = s.beta_t * grounded_t + (1.0f - grounded_t)*s.water_drag;
-    float beta_eff_b = s.beta_b * grounded_b + (1.0f - grounded_b)*s.water_drag;
+    float beta_eff_t = s.beta_t * grounded_t;
+    float beta_eff_b = s.beta_b * grounded_b;
     
     float beta_eff = 0.5f*(beta_eff_t + beta_eff_b);
 
@@ -384,16 +356,12 @@ TauByJacobian get_tau_by_jac(
     float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
     float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
 
-    //jac.res = -(beta_eff * unorm_sq_pow + s.water_drag) * s.v;
-    jac.res = -beta_eff * unorm_sq_pow * s.v;
-    //jac.d_v = -(beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow) + s.water_drag);
-    jac.d_v = -beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow);
+    jac.res = -(beta_eff * unorm_sq_pow + s.water_drag) * s.v;
+    jac.d_v = -(beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow) + s.water_drag);
     jac.d_u_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tl);
     jac.d_u_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tr);
     jac.d_u_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_bl);
     jac.d_u_br = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_br);
-    //jac.d_beta_t = -0.5f * N_t * unorm_sq_pow * s.v;
-    //jac.d_beta_b = -0.5f * N_b * unorm_sq_pow * s.v;
     jac.d_beta_t = -0.5f * grounded_t * unorm_sq_pow * s.v;
     jac.d_beta_b = -0.5f * grounded_b * unorm_sq_pow * s.v;
 
@@ -491,7 +459,6 @@ DualFloat get_tau_dx_dual(
     TauDxJacobian jac = get_tau_dx_jac(s.get_primals(),dx_inv,i,j,ny,nx);
     return {jac.res,jac.apply_jvp(s.get_diffs())};
 }
-
 
 struct TauDyStencil {
     float H_t, H_b;

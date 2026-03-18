@@ -74,7 +74,40 @@ class Constant:
         string = f'Constant: {self.name}, {self.value:.3f}, {self.units}'
         return string
 
-
 @dataclass
 class SubgridField(Field):
     quantiles: Any | None = None
+
+class LocalOption:
+    def __init__(self, getter, setter, name: str):
+        self._getter = getter
+        self._setter = setter
+        self._name = name
+
+    def get(self):
+        return self._getter()
+
+    def set(self, value):
+        self._setter(value)
+
+    def __repr__(self):
+        return f"{self._name}={self.get()!r}"
+
+
+class BroadcastOption:
+    def __init__(self, levels, getter, attr_name: str):
+        self._levels = levels
+        self._getter = getter
+        self._attr_name = attr_name
+
+    def get(self):
+        # Representative value from the first level
+        return getattr(self._getter(self._levels[0]), self._attr_name)
+
+    def set(self, value):
+        for lev in self._levels:
+            cfg = self._getter(lev)
+            setattr(cfg, self._attr_name, value)
+
+    def __repr__(self):
+        return f"{self._attr_name}={self.get()!r}"

@@ -7,7 +7,6 @@ below to match your setup.
 import cupy as cp
 import numpy as np
 
-#from glide import IcePhysics
 from glide.io import VTIWriter, write_vti
 from glide.data import load_greenland_preprocessed
 

@@ -1,102 +1,85 @@
-"""
-Greenland inverse modeling example.
 
-Infers basal friction (beta) from observed surface velocities using
-adjoint-based optimization. Run interactively or as a script.
 """
+Greenland inverse simulation example.
 
-import xarray as xr
-import pickle
+Run interactively or execute as a script. Modify the paths and parameters
+below to match your setup.
+"""
 import cupy as cp
 import numpy as np
-from scipy.optimize import fmin_l_bfgs_b
 
-
-from glide import IcePhysics
+#from glide import IcePhysics
 from glide.io import VTIWriter, write_vti
-from glide.physics import abs_loss, tikhonov_regularization
-from glide.data import (
-    load_bedmachine,
-    load_velocity_mosaic,
-    load_smb_mar,
-    prepare_grid,
-    interpolate_to_grid,
-    load_greenland_preprocessed
-)
+from glide.data import load_greenland_preprocessed
 
-
-from glide.kernels import restrict_vfacet, restrict_hfacet, prolongate_cell_centered, get_kernels
-from glide.solver import adjoint_vcycle_fas, restrict_parameters_to_hierarchy
+from glide.multigrid import Multigrid, FASCDSolver
 from scipy.ndimage import gaussian_filter
+from glide.hooks import TimeLogger
 
-
-# =============================================================================
-# Configuration - modify these paths and parameters
-# =============================================================================
-
-OUTPUT_DIR = "./inverse_output"
-
-SKIP = 6              # Geometry downsampling factor
-DT = 10.0             # Time step (years)
-N_LEVELS = 5          # Multigrid levels
-
-# Physical constants
-RHO_ICE = 917.0
-G = 9.81
-N_GLEN = 3.0
-
-REG_WEIGHT = 1e-4     # Tikhonov regularization weight
-# =============================================================================
-# Load data - from source files
-# =============================================================================
-"""
-GEOMETRY_PATH = "./data/BedMachineGreenland-v5.nc"
-U_OBS_PATH = "./data/greenland_vel_mosaic250_vx_v1.tif"
-V_OBS_PATH = "./data/greenland_vel_mosaic250_vy_v1.tif"
-SMB_PATH = "./data/MARv3.9-yearly-MIROC5-rcp85-ltm1995-2014.nc"
-
-print("Loading geometry...")
-geometry = load_bedmachine(GEOMETRY_PATH, skip=SKIP, thklim=0.1)
-geometry = prepare_grid(geometry, n_levels=N_LEVELS)
-
-ny, nx = geometry['ny'], geometry['nx']
-dx = geometry['dx']
-x, y = geometry['x'], geometry['y']
-
-print(f"Grid: {ny} x {nx}, dx = {dx:.1f} m")
-
-print("Loading observed velocities...")
-vel_data = load_velocity_mosaic(U_OBS_PATH, V_OBS_PATH)
-
-u_obs_cell = interpolate_to_grid(vel_data['u'], vel_data['x'], vel_data['y'], x, y)
-v_obs_cell = interpolate_to_grid(vel_data['v'], vel_data['x'], vel_data['y'], x, y)
-
-# Interpolate to faces
-u_obs = cp.zeros((ny, nx + 1), dtype=cp.float32)
-u_obs[:, 1:-1] = (u_obs_cell[:, 1:] + u_obs_cell[:, :-1]) / 2.0
-v_obs = cp.zeros((ny + 1, nx), dtype=cp.float32)
-v_obs[1:-1] = (v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0
-
-print("Loading SMB...")
-smb_data = load_smb_mar(SMB_PATH)
-smb = interpolate_to_grid(smb_data['smb'], smb_data['x'], smb_data['y'], x, y)
-"""
-# =============================================================================
-# Load data - From prepackaged
-# =============================================================================
-
+### Load a dataset (here a preprocessed greenland dataset)
 dataset = load_greenland_preprocessed()
-ny,nx = dataset.ny,dataset.nx
-dx = dataset.dx
-bed = dataset.bed.values
-bed = gaussian_filter(bed,1)
-surface = dataset.surface.values
-thickness = dataset.thickness.values
-thickness = gaussian_filter(thickness,1)
-beta = dataset.beta.values
-beta.fill(2.5)
-smb = dataset.smb.values
 
+### Initialize grid
+# ny and nx must both divide by 2^(n_levels - 1) cleanly!
+ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
+mg = Multigrid(n_levels=6,ny=ny,nx=nx,dx=dx)
+
+### Initialize state
+thk = gaussian_filter(dataset.thickness.values,1)
+mg.state.H.set(thk)
+mg.state.H_prev.set(thk)
+
+### Initialize geometry
+bed = gaussian_filter(dataset.bed.values,1)
+mg.geometry.bed.set(bed)
+mg.geometry.flotation_reg_driving.set(0.1)
+
+### Initialize rheology
+# Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
+B = cp.zeros((ny,nx), dtype=cp.float32)
+B.fill(1e-17 ** (-1.0 / 3.0) / (917 * 9.81)) 
+mg.rheology.B.set(B)
+mg.rheology.eps_reg.set(1e-6)
+mg.rheology.n.set(3.0)
+
+### Initialize sliding
+BETA_PATH = None
+#BETA_PATH = "./inverse_output/beta_level_0.p"
+if BETA_PATH:
+    import pickle
+    beta = cp.array(pickle.load(open(BETA_PATH, 'rb')))
+else:
+    beta = cp.zeros((ny,nx), dtype=cp.float32)
+    beta.fill(2.5)
+
+mg.sliding.beta.set(beta)
+mg.sliding.m.set(1./3.)
+mg.sliding.water_drag.set(1e-4)
+
+### Initialize calving
+mg.calving.calving_rate.set(2000.0)
+
+### Initialize forcing
+smb = dataset.smb.values
+#smb += -1.0
+mg.forcing.smb.set(smb)
+
+### Initialize solver
+solver = FASCDSolver(mg)
+
+solver.vanka_options.omega.set(0.5)
+solver.vanka_options.newton_options.relaxation.set(0.5)
+solver.vanka_options.newton_options.steps.set(30)
+
+solver.fas_options.coarsest_steps.set(200)
+solver.fas_options.pre_steps.set(10)
+solver.fas_options.post_steps.set(50)
+solver.fas_options.finest_steps.set(150)
+solver.fas_options.maximum_vcycles.set(10)
+solver.fas_options.relative_tolerance.set(1e-3)
+solver.fas_options.absolute_tolerance.set(10.0)
+
+### Load velocity data ###
 u_obs_cell = dataset.vx.values
 v_obs_cell = dataset.vy.values
 
@@ -106,32 +89,10 @@ u_obs[:, 1:-1] = cp.array((u_obs_cell[:, 1:] + u_obs_cell[:, :-1]) / 2.0)
 v_obs = cp.zeros((ny + 1, nx), dtype=cp.float32)
 v_obs[1:-1] = cp.array((v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0)
 
-# =============================================================================
-# Initialize physics
-# =============================================================================
-
-# Compute B (rate factor)
-B_scalar = cp.float32(1e-17 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
-B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
 
 
-print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
-        thklim=0.1,
-        n=3.0,eps_reg=1e-5,
-        m=1./3.,u_reg=1.0,
-        water_drag=1e-5,
-        calving_rate=2000.0,sigmoid_c=0.1)
 
-physics.set_geometry(bed, thickness)
-physics.set_parameters(B=B, beta=beta, smb=smb)
 
-grid = physics.grid
-kernels = get_kernels()
-
-# =============================================================================
-# Build observation hierarchy for multi-resolution optimization
-# =============================================================================
 
 obs_hierarchy = [(u_obs, v_obs)]
 current_u, current_v = u_obs, v_obs

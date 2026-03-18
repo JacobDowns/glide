@@ -348,14 +348,19 @@ void compute_jvp(
     const float* __restrict__ d_u,
     const float* __restrict__ d_v,
     const float* __restrict__ d_H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
     const float* __restrict__ bed,
     const float* __restrict__ B,
     const float* __restrict__ beta,
-    const float* __restrict__ mask,
     const float* __restrict__ gamma,
-    float n, float eps_reg,
-    float m, float u_reg,
-    float water_drag, float calving_rate, float sigmoid_c,
+    bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding,     
+    float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
 {
@@ -386,20 +391,19 @@ void compute_jvp(
 
 	if (has_cell){
 	    DualFloat H_c      = get_cell(H,d_H,i,j,ny,nx);
+	    float phi_c        = get_cell(phi,i,j,ny,nx);
 
 	    float d_rH = H_c.d/dt;
 
 	    float bed_c = get_cell(bed,i,j,ny,nx);
-	    //DualFloat calve = get_cell_calving_dual({H_c,bed_c,calving_rate,sigmoid_c},i, j, ny, nx);
-	    //d_rH -= calve.d;
 
 	    DualFloat H_l = get_cell(H,d_H,i,j-1,ny,nx);
 	    DualFloat u_l = get_vfacet(u,d_u,i,j,ny,nx);
 	    DualFloat q_l = get_horizontal_flux_dual({u_l,H_l,H_c}, i, j, ny, nx);
 	    d_rH -= q_l.d*dx_inv;
 
-	    float bed_l = get_cell(bed,i,j-1,ny,nx);
-	    DualFloat q_calve_l = get_facet_calving_dual({H_c,H_l,bed_c,bed_l,calving_rate,sigmoid_c},i,j,ny,nx);
+	    float phi_l = get_cell(phi,i,j-1,ny,nx);
+	    DualFloat q_calve_l = get_facet_calving_dual({H_c,H_l,phi_c,phi_l,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    d_rH += q_calve_l.d*dx_inv;
 
 	    DualFloat H_r = get_cell(H,d_H,i,j+1,ny,nx);
@@ -407,8 +411,8 @@ void compute_jvp(
 	    DualFloat q_r = get_horizontal_flux_dual({u_r,H_c,H_r}, i, j + 1, ny, nx);
             d_rH += q_r.d*dx_inv;
 
-	    float bed_r = get_cell(bed,i,j+1,ny,nx);
-	    DualFloat q_calve_r = get_facet_calving_dual({H_c,H_r,bed_c,bed_r,calving_rate,sigmoid_c},i,j+1,ny,nx);
+	    float phi_r = get_cell(phi,i,j+1,ny,nx);
+	    DualFloat q_calve_r = get_facet_calving_dual({H_c,H_r,phi_c,phi_r,calving_rate,flotation_reg_calving},i,j+1,ny,nx);
 	    d_rH += q_calve_r.d*dx_inv;
 
 	    DualFloat H_t = get_cell(H,d_H,i-1,j,ny,nx);
@@ -416,8 +420,8 @@ void compute_jvp(
 	    DualFloat q_t = get_vertical_flux_dual({v_t,H_t,H_c}, i, j, ny, nx);
 	    d_rH += q_t.d*dx_inv;
 
-	    float bed_t = get_cell(bed,i-1,j,ny,nx);
-	    DualFloat q_calve_t = get_facet_calving_dual({H_c,H_t,bed_c,bed_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	    float phi_t = get_cell(phi,i-1,j,ny,nx);
+	    DualFloat q_calve_t = get_facet_calving_dual({H_c,H_t,phi_c,phi_t,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    d_rH += q_calve_t.d*dx_inv;
 
 	    DualFloat H_b = get_cell(H,d_H,i+1,j,ny,nx);
@@ -425,19 +429,17 @@ void compute_jvp(
 	    DualFloat q_b = get_vertical_flux_dual({v_b,H_c,H_b}, i + 1, j, ny, nx);
             d_rH -= q_b.d*dx_inv;
 
-	    float bed_b = get_cell(bed,i+1,j,ny,nx);
-	    DualFloat q_calve_b = get_facet_calving_dual({H_c,H_b,bed_c,bed_b,calving_rate,sigmoid_c},i+1,j,ny,nx);
+	    float phi_b = get_cell(phi,i+1,j,ny,nx);
+	    DualFloat q_calve_b = get_facet_calving_dual({H_c,H_b,phi_c,phi_b,calving_rate,flotation_reg_calving},i+1,j,ny,nx);
 	    d_rH += q_calve_b.d*dx_inv;
 
-	    float masked = get_cell(mask,i,j,ny,nx);
-	    if (masked > 0.5) {d_rH = 0.0f;}
-            jvp_H[i * nx + j] = d_rH;
+	    float masked = use_mask ? get_cell(mask,i,j,ny,nx) : 0.0f;
+            jvp_H[i * nx + j] = (1.0f - masked) * d_rH;
 
 	}
 
 	// Residual for the u-momentum equation on the left side of the cell
 	// the right side residual is handled by the next cell to the right!
-	
 	if (has_u){
 	    float d_ru_l = 0.0f;
 
@@ -522,11 +524,11 @@ void compute_jvp(
 
 	    DualFloat H_l    = get_cell(H,d_H,i,j-1,ny,nx);
 	    DualFloat H_c    = get_cell(H,d_H,i,j,ny,nx);
-	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
-	    float bed_c  = get_cell(bed,i,j,ny,nx);
+	    float phi_l  = get_cell(phi,i,j-1,ny,nx);
+	    float phi_c  = get_cell(phi,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,bed_l,bed_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 	    d_ru_l += tau_bx.d;
 	    }
 
@@ -535,7 +537,9 @@ void compute_jvp(
 	    DualFloat H_c    = get_cell(H,d_H,i,j,ny,nx);
 	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
-	    DualFloat tau_dx = get_tau_dx_dual({H_l,H_c,bed_l,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    float phi_l = get_cell(phi,i,j-1,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
+	    DualFloat tau_dx = get_tau_dx_dual({H_l,H_c,bed_l,bed_c,phi_l,phi_c,flotation_reg_driving},dx_inv,i,j,ny,nx);
 	    d_ru_l -= tau_dx.d;
 	    }
 
@@ -627,12 +631,12 @@ void compute_jvp(
 
 	    DualFloat H_t    = get_cell(H,d_H,i-1,j,ny,nx);
 	    DualFloat H_c    = get_cell(H,d_H,i,j,ny,nx);
-	    float bed_t      = get_cell(bed,i-1,j,ny,nx);
-	    float bed_c      = get_cell(bed,i,j,ny,nx);
+	    float phi_t      = get_cell(phi,i-1,j,ny,nx);
+	    float phi_c      = get_cell(phi,i,j,ny,nx);
 	    float beta_t     = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c     = get_cell(beta,i,j,ny,nx);
 
-	    DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,bed_t,bed_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 	    d_rv_t += tau_by.d;
 	    }
 
@@ -641,8 +645,10 @@ void compute_jvp(
 	    DualFloat H_c    = get_cell(H,d_H,i,j,ny,nx);
 	    float bed_t = get_cell(bed,i-1,j,ny,nx);
 	    float bed_c = get_cell(bed,i,j,ny,nx);
+	    float phi_t      = get_cell(phi,i-1,j,ny,nx);
+	    float phi_c      = get_cell(phi,i,j,ny,nx);
 
-	    DualFloat tau_dy = get_tau_dy_dual({H_t,H_c,bed_t,bed_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    DualFloat tau_dy = get_tau_dy_dual({H_t,H_c,bed_t,bed_c,phi_t,phi_c,flotation_reg_sliding},dx_inv,i,j,ny,nx);
 	    d_rv_t -= tau_dy.d;
 	    }
 
@@ -652,7 +658,6 @@ void compute_jvp(
 	}
     }
 }
-
 
 /*=========================================================
   ==================== VJP Computation ====================

@@ -671,19 +671,22 @@ void compute_vjp(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
-    const float* __restrict__ grounded,
     const float* __restrict__ lambda_u,
     const float* __restrict__ lambda_v,
     const float* __restrict__ lambda_H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
     const float* __restrict__ bed,
     const float* __restrict__ B,
     const float* __restrict__ beta,
-    const float* __restrict__ mask,
     const float* __restrict__ gamma,
-    float n, float eps_reg, 
-    float m, float u_reg,
-    float water_drag,
-    float calving_rate, float sigmoid_c,
+    bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding,     
+    float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
 {
@@ -733,7 +736,7 @@ void compute_vjp(
 	    // Mass matrix contribution
 	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c/dt);
 
-	    float grounded_c = get_cell(grounded,i,j,ny,nx);
+	    float phi_c = get_cell(phi,i,j,ny,nx);
 
 	    float H_l = get_cell(H,i,j-1,ny,nx);
 	    float u_l = get_vfacet(u,i,j,ny,nx);
@@ -742,8 +745,8 @@ void compute_vjp(
             atomicAdd(&s_adj_H[bi][bj-1], -lambda_H_c*j_q_l.d_H_l*dx_inv);
             atomicAdd(&s_adj_u[bi][bj]  , -lambda_H_c*j_q_l.d_u*dx_inv);
 
-	    float grounded_l = get_cell(grounded,i,j-1,ny,nx);
-	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,grounded_c,grounded_l,calving_rate,sigmoid_c},i,j,ny,nx);
+	    float phi_l = get_cell(phi,i,j-1,ny,nx);
+	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,phi_c,phi_l,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    atomicAdd(&s_adj_H[bi][bj],   lambda_H_c*j_calve_l.d_H_this*dx_inv);
            
 	    float H_r = get_cell(H,i,j+1,ny,nx);
@@ -753,8 +756,8 @@ void compute_vjp(
             atomicAdd(&s_adj_H[bi][bj+1], lambda_H_c*j_q_r.d_H_r*dx_inv);
             atomicAdd(&s_adj_u[bi][bj+1], lambda_H_c*j_q_r.d_u*dx_inv);
 
-	    float grounded_r = get_cell(grounded,i,j+1,ny,nx);
-	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,grounded_c,grounded_r,calving_rate,sigmoid_c},i,j+1,ny,nx);
+	    float phi_r = get_cell(phi,i,j+1,ny,nx);
+	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,phi_c,phi_r,calving_rate,flotation_reg_calving},i,j+1,ny,nx);
 	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_r.d_H_this*dx_inv);
 
 	    float H_t = get_cell(H,i-1,j,ny,nx);
@@ -764,8 +767,8 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi-1][bj], lambda_H_c*j_q_t.d_H_t*dx_inv);
 	    atomicAdd(&s_adj_v[bi][bj],   lambda_H_c*j_q_t.d_v*dx_inv);
 
-	    float grounded_t = get_cell(grounded,i-1,j,ny,nx);
-	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,grounded_c,grounded_t,calving_rate,sigmoid_c},i,j,ny,nx);
+	    float phi_t = get_cell(phi,i-1,j,ny,nx);
+	    FacetCalvingJacobian j_calve_t = get_facet_calving_jac({H_c,H_t,phi_c,phi_t,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_t.d_H_this*dx_inv);
 
 
@@ -776,13 +779,14 @@ void compute_vjp(
             atomicAdd(&s_adj_H[bi+1][bj], -lambda_H_c*j_q_b.d_H_b*dx_inv);
 	    atomicAdd(&s_adj_v[bi+1][bj], -lambda_H_c*j_q_b.d_v*dx_inv);
 
-	    float grounded_b = get_cell(grounded,i+1,j,ny,nx);
-	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,grounded_c,grounded_b,calving_rate,sigmoid_c},i+1,j,ny,nx);
+	    float phi_b = get_cell(phi,i+1,j,ny,nx);
+	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,phi_c,phi_b,calving_rate,flotation_reg_calving},i+1,j,ny,nx);
 	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_b.d_H_this*dx_inv);
 
-	    float masked = get_cell(mask,i,j,ny,nx);
-	    float lambda_H_c_ = get_cell(lambda_H,i,j,ny,nx);
-            atomicAdd(&s_adj_H[bi][bj],    lambda_H_c_*masked);
+
+	    //float masked = use_mask ? get_cell(mask,i,j,ny,nx) : 0.0f;
+	    //float lambda_H_c_ = get_cell(lambda_H,i,j,ny,nx);
+            //atomicAdd(&s_adj_H[bi][bj], (1.0f - masked) * lambda_H_c_);
 	}
 
 	// Residual for the u-momentum equation on the left side of the cell
@@ -911,13 +915,11 @@ void compute_vjp(
 
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
-	    //float bed_l  = get_cell(bed,i,j-1,ny,nx);
-	    //float bed_c  = get_cell(bed,i,j,ny,nx);
-	    float grounded_l  = get_cell(grounded,i,j-1,ny,nx);
-	    float grounded_c  = get_cell(grounded,i,j,ny,nx);
+	    float phi_l  = get_cell(phi,i,j-1,ny,nx);
+	    float phi_c  = get_cell(phi,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,grounded_l,grounded_c,beta_l,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 
 
 	    float lambda_u_l = get_vfacet(lambda_u,i,j,ny,nx);
@@ -939,9 +941,9 @@ void compute_vjp(
 	    
 	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
-	    float grounded_l  = get_cell(grounded,i,j-1,ny,nx);
-	    float grounded_c  = get_cell(grounded,i,j,ny,nx);
-	    TauDxJacobian j_tau_dx = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,grounded_l,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    float phi_l  = get_cell(phi,i,j-1,ny,nx);
+	    float phi_c  = get_cell(phi,i,j,ny,nx);
+	    TauDxJacobian j_tau_dx = get_tau_dx_jac({H_l,H_c,bed_l,bed_c,phi_l,phi_c,flotation_reg_driving},dx_inv,i,j,ny,nx);
 
             atomicAdd(&s_adj_H[bi][bj-1],-lambda_u_l * j_tau_dx.d_H_l);
             atomicAdd(&s_adj_H[bi][bj],  -lambda_u_l * j_tau_dx.d_H_r);
@@ -1070,14 +1072,12 @@ void compute_vjp(
 
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
-	    //float bed_t  = get_cell(bed,i-1,j,ny,nx);
-	    //float bed_c  = get_cell(bed,i,j,ny,nx);
-	    float grounded_t  = get_cell(grounded,i-1,j,ny,nx);
-	    float grounded_c  = get_cell(grounded,i,j,ny,nx);
+	    float phi_t  = get_cell(phi,i-1,j,ny,nx);
+	    float phi_c  = get_cell(phi,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 
-	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,grounded_t,grounded_c,beta_t,beta_c,m,u_reg,water_drag,sigmoid_c});
+	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 	    
 	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
 	    
@@ -1098,10 +1098,10 @@ void compute_vjp(
 	    float H_c    = get_cell(H,i,j,ny,nx);
 	    float bed_t = get_cell(bed,i-1,j,ny,nx);
 	    float bed_c = get_cell(bed,i,j,ny,nx);
-	    float grounded_t  = get_cell(grounded,i-1,j,ny,nx);
-	    float grounded_c  = get_cell(grounded,i,j,ny,nx);
+	    float phi_t  = get_cell(phi,i-1,j,ny,nx);
+	    float phi_c  = get_cell(phi,i,j,ny,nx);
 
-	    TauDyJacobian j_tau_dy = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,grounded_t,grounded_c,sigmoid_c},dx_inv,i,j,ny,nx);
+	    TauDyJacobian j_tau_dy = get_tau_dy_jac({H_t,H_c,bed_t,bed_c,phi_t,phi_c,flotation_reg_driving},dx_inv,i,j,ny,nx);
 	    atomicAdd(&s_adj_H[bi-1][bj],-lambda_v_t * j_tau_dy.d_H_t);
 	    atomicAdd(&s_adj_H[bi][bj],  -lambda_v_t * j_tau_dy.d_H_b);
 	    }

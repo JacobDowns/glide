@@ -2,35 +2,17 @@ import cupy as cp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from glide import IcePhysics
+from glide.grid import Grid
 
+L = 10000.0
+dt = cp.float32(1.0)
 
-# =============================================================================
-# Configuration - modify these paths and parameters
-# =============================================================================
-
-L = 80000
-EXP = 'C'
-
-# Physical constants
-RHO_ICE = 917.0
-G = 9.81
-N_GLEN = 3.0
-
-# =============================================================================
-# Configure Domain
-# =============================================================================
-
-base_res = 128
-
+base_res = 32
 y_factr = 7
 x_factr = 7
 
 ny = base_res*y_factr
 nx = base_res*x_factr
-
-y_slice = int((y_factr//2  +  1./4) * base_res)
-x_slice = slice(x_factr//2*base_res,(x_factr//2 + 1)*base_res,1)
 
 x = cp.linspace(0,x_factr*L,nx,dtype=cp.float32)
 y = cp.linspace(0,y_factr*L,ny,dtype=cp.float32)
@@ -38,68 +20,65 @@ dx = (x[1] - x[0]).item()
 
 X,Y = cp.meshgrid(x,y)
 
-srf = 1000.0 * cp.ones((ny,nx),dtype=cp.float32) - cp.tan(cp.deg2rad(0.1))*Y + 10000
+srf = 1000.0 * cp.ones((ny,nx),dtype=cp.float32) - cp.tan(cp.deg2rad(0.1))*X + 10000
 bed = srf - 1000 
 thk = srf - bed
 
-if EXP == 'C':
-    beta = (1000*cp.sin(2*cp.pi*X/L)*cp.sin(2*cp.pi*Y/L) + 1000)/(RHO_ICE*G)
-elif EXP == 'D':
-    beta = (1000*cp.sin(2*cp.pi*X/L) + 1000)/(RHO_ICE*G)
-else:
-    raise NotImplementedError('Only support ISMIP-HOM C and D for now')
+rho_i = cp.float32(917.0)
+g = cp.float32(9.81)
+beta = (1000*cp.sin(2*cp.pi*X/L)*cp.sin(2*cp.pi*Y/L) + 1000)/(rho_i * g)
 
-smb = cp.zeros_like(thk)
+B = cp.ones((ny,nx),dtype=cp.float32)
+B.fill((1e-16 ** -(1./3))/(rho_i * g))
 
-# Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
-B_scalar = cp.float32(1e-16 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
-B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
+grid = Grid(ny,nx,dx)
 
-# =============================================================================
-# Initialize physics
-# =============================================================================
+grid.geometry.bed.set(bed)
+grid.rheology.B.set(B)
+grid.sliding.beta.set(beta)
+grid.sliding.m.set(1.0)
+grid.sliding.u_reg.set(1.0)
+grid.state.H.set(thk)
+grid.state.H_prev.set(thk)
 
-print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=1,m=1./3)
-physics.set_geometry(bed, thk)
-physics.set_parameters(B=B, beta=beta, smb=smb)
+grid.forward_operators.set_rhs(dt)
+grid.forward_operators.vanka_sweep(dt,4000)
 
-# Access the grid hierarchy
-grid = physics.grid
-grid.set_rhs()
-grid.vanka_sweep(1000)
+grid.state.mask.data[:,:] = cp.random.randint(0,2,size=(ny,nx)).astype(cp.float32)
+
+grid.forward_operators.var_u[:,:] = cp.random.randn(ny,nx+1,dtype=cp.float32)
+grid.forward_operators.var_u[:,0].fill(0)
+grid.forward_operators.var_u[:,-1].fill(0)
+
+grid.forward_operators.var_v[:,:] = cp.random.randn(ny+1,nx,dtype=cp.float32)
+grid.forward_operators.var_v[0].fill(0)
+grid.forward_operators.var_v[-1].fill(0)
+
+grid.forward_operators.var_H[:,:] = cp.random.randn(ny,nx,dtype=cp.float32)
+grid.forward_operators.var_H[grid.state.mask.data>0.5] = 0
+
+grid.adjoint.lambda_u.data[:,:] = cp.random.randn(ny,nx+1,dtype=cp.float32)
+grid.adjoint.lambda_u.data[:,0].fill(0)
+grid.adjoint.lambda_u.data[:,-1].fill(0)
+
+grid.adjoint.lambda_v.data[:,:] = cp.random.randn(ny+1,nx,dtype=cp.float32)
+grid.adjoint.lambda_v.data[0].fill(0)
+grid.adjoint.lambda_v.data[-1].fill(0)
+
+grid.adjoint.lambda_H.data[:,:] = cp.random.randn(ny,nx,dtype=cp.float32)
+grid.adjoint.lambda_H.data[grid.state.mask.data>0.5] = 0
 
 
-grid.mask[:,:] = cp.random.randint(0,2,size=grid.mask.shape).astype(cp.float32)
-#grid.mask.fill(0)
+grid.forward_operators.compute_jvp(dt)
+grid.adjoint_operators.compute_vjp(dt)
 
-grid.d_u[:,:] = cp.random.randn(*grid.u.shape,dtype=cp.float32)
-grid.d_u[:,0].fill(0)
-grid.d_u[:,-1].fill(0)
+t1 = ((grid.adjoint_operators.vjp_u * grid.forward_operators.var_u).sum() +
+         (grid.adjoint_operators.vjp_v * grid.forward_operators.var_v).sum() + 
+         (grid.adjoint_operators.vjp_H * grid.forward_operators.var_H).sum())
 
-grid.d_v[:,:] = cp.random.randn(*grid.v.shape,dtype=cp.float32)
-grid.d_v[0].fill(0)
-grid.d_v[-1].fill(0)
-
-grid.d_H[:,:] = cp.random.randn(*grid.H.shape,dtype=cp.float32)
-grid.d_H[grid.mask>0.5] = 0
-
-grid.lambda_u[:,:] = cp.random.randn(*grid.u.shape,dtype=cp.float32)
-grid.lambda_u[:,0].fill(0)
-grid.lambda_u[:,-1].fill(0)
-
-grid.lambda_v[:,:] = cp.random.randn(*grid.v.shape,dtype=cp.float32)
-grid.lambda_v[0].fill(0)
-grid.lambda_v[-1].fill(0)
-
-grid.lambda_H[:,:] = cp.random.randn(*grid.H.shape,dtype=cp.float32)
-grid.lambda_H[grid.mask>0.5] = 0.0
-
-grid.compute_jvp()
-grid.compute_vjp()
-
-t1 = (grid.l*grid.d_U).sum() 
-t2 = (grid.Lambda*grid.j).sum()
+t2 = ((grid.forward_operators.jvp_u * grid.adjoint.lambda_u.data).sum() +
+         (grid.forward_operators.jvp_v * grid.adjoint.lambda_v.data).sum() + 
+         (grid.forward_operators.jvp_H * grid.adjoint.lambda_H.data).sum())
 
 print(t1,t2,(t1 - t2)/(0.5*(t1 + t2)))
 

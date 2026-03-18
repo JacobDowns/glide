@@ -2,7 +2,7 @@ from dataclasses import dataclass, field, fields
 import cupy as cp
 from cupy.typing import NDArray
 from .field import Field, SubgridField, Constant
-from .operators import ForwardOperators
+from .operators import ForwardOperators, AdjointOperators
 
 @dataclass
 class State:
@@ -206,6 +206,12 @@ class Grid:
         if self._forward_operators is None:
             self._forward_operators = ForwardOperators(self)
         return self._forward_operators
+
+    @property
+    def adjoint_operators(self):
+        if self._adjoint_operators is None:
+            self._adjoint_operators = AdjointOperators(self)
+        return self._adjoint_operators
 
     @property
     def adjoint(self):

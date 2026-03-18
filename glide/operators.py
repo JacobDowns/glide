@@ -352,19 +352,14 @@ class AdjointOperators:
         self.f_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
         self.f_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         
-        self.F_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
-        self.F_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
-        self.F_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-
-        self.delta_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
-        self.delta_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
-        self.delta_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-
+        self.vjp_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.vjp_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.vjp_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+        
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
 
         self.vanka_config = VankaConfig()
-        self.use_subgrid_bed_closure = use_subgrid_bed_closure
 
     @property
     def _kernel_config(self):
@@ -431,26 +426,48 @@ class AdjointOperators:
         if return_norms:
             return cp.linalg.norm(out_u),cp.linalg.norm(out_v),cp.linalg.norm(out_H)
 
-    def compute_phi(self, relaxation=cp.float32(0.0)):
-        if self.use_subgrid_bed_closure:
-            self.grid.state.phi.data[:,:] = eval_grounded_fraction_kernel(
-                self.grid.state.H.data,
-                self.grid.geometry.bed.quantiles,
-                cp.float32(0.0)
-                )
 
+    def compute_vjp(self, dt, 
+            use_mask=True, 
+            freeze_calving=False, 
+            return_norms=False):
+
+        kernel = self.kernels.get_function('compute_vjp')
+        grid_size, block_size, stride, halo = self._kernel_config
+  
+        grid = self.grid
+        state = grid.state
+        adjoint = grid.adjoint
+        geometry = grid.geometry        
+        rheology = grid.rheology
+        sliding = grid.sliding
+        calving = grid.calving
+        forcing = grid.forcing
+
+        if freeze_calving:
+            calving_rate = cp.float32(0.0)
         else:
-            kernel = self.kernels.get_function('compute_grounded')
-            grid_size, block_size, stride, halo = self._kernel_config
-            
-            grid = self.grid
-            kernel(grid_size, block_size,
-                   (grid.state.phi.data,
-                    grid.state.H.data, grid.geometry.bed.data, 
-                    grid.geometry.flotation_reg_driving.value,
-                    relaxation,
-                    grid.ny, grid.nx, 
-                    stride, halo))
+            calving_rate = calving.calving_rate.value
+
+        kernel(grid_size, block_size,
+               (self.vjp_u, self.vjp_v, self.vjp_H,
+                state.u.data, state.v.data, state.H.data, 
+                adjoint.lambda_u.data, adjoint.lambda_v.data, adjoint.lambda_H.data, 
+                state.phi.data, state.mask.data,
+                self.f_u, self.f_v, self.f_H,
+                geometry.bed.data, 
+                rheology.B.data, 
+                sliding.beta.data,
+                self.gamma,
+                use_mask,
+                rheology.n.value, rheology.eps_reg.value, 
+                geometry.flotation_reg_driving.value,
+                sliding.m.value, sliding.u_reg.value, 
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                calving_rate, calving.flotation_reg_calving.value,
+                grid.dx, dt,
+                grid.ny, grid.nx, stride, halo)) 
+
 
     def vanka_smooth(self, dt,
             freeze_calving=False,
@@ -511,27 +528,7 @@ class AdjointOperators:
             self.grid.state.H.data[:] += self.vanka_config.omega * self.delta_H
             self.vanka_config.hook_func(i)
 
-    def vanka_dump(self,dt):
-        kernel = self.kernels.get_function('vanka_dump')
-        grid_size, block_size, stride, halo = self._kernel_config
-        grid = self.grid
 
-        J = cp.zeros((self.grid.ny*self.grid.nx,25),dtype=cp.float32)
-        r = cp.zeros((self.grid.ny*self.grid.nx,5),dtype=cp.float32)
-        kernel(grid_size, block_size,
-               (J,r,
-                grid.state.u.data, grid.state.v.data, grid.state.H.data, grid.state.phi.data,
-                self.f_u, self.f_v, self.f_H,
-                grid.geometry.bed.data, grid.rheology.B.data, grid.sliding.beta.data, self.gamma,
-                grid.rheology.n.value, grid.rheology.eps_reg.value, grid.geometry.flotation_reg_driving.value,
-                grid.sliding.m.value, grid.sliding.u_reg.value, grid.sliding.water_drag.value, grid.sliding.flotation_reg_sliding.value,
-                grid.calving.calving_rate.value, grid.calving.flotation_reg_calving.value,
-                grid.dx, dt,
-                grid.ny, grid.nx, stride, halo,
-                )
-        )
-
-        return J,r
 
 
 

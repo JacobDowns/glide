@@ -683,7 +683,7 @@ void compute_vjp(
     const float* __restrict__ B,
     const float* __restrict__ beta,
     const float* __restrict__ gamma,
-    bool use_mask,
+    bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding,     
     float calving_rate, float flotation_reg_calving,
@@ -783,10 +783,10 @@ void compute_vjp(
 	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,phi_c,phi_b,calving_rate,flotation_reg_calving},i+1,j,ny,nx);
 	    atomicAdd(&s_adj_H[bi][bj], lambda_H_c*j_calve_b.d_H_this*dx_inv);
 
-
 	    //float masked = use_mask ? get_cell(mask,i,j,ny,nx) : 0.0f;
 	    //float lambda_H_c_ = get_cell(lambda_H,i,j,ny,nx);
             //atomicAdd(&s_adj_H[bi][bj], (1.0f - masked) * lambda_H_c_);
+	    if (use_forcing) atomicAdd(&s_adj_H[bi][bj], -get_cell(f_H,i,j,ny,nx));
 	}
 
 	// Residual for the u-momentum equation on the left side of the cell
@@ -948,6 +948,8 @@ void compute_vjp(
             atomicAdd(&s_adj_H[bi][bj-1],-lambda_u_l * j_tau_dx.d_H_l);
             atomicAdd(&s_adj_H[bi][bj],  -lambda_u_l * j_tau_dx.d_H_r);
 	    }
+
+	    if (use_forcing) atomicAdd(&s_adj_u[bi][bj], -get_vfacet(f_u,i,j,ny,nx));
 	
  	}
 
@@ -1105,7 +1107,8 @@ void compute_vjp(
 	    atomicAdd(&s_adj_H[bi-1][bj],-lambda_v_t * j_tau_dy.d_H_t);
 	    atomicAdd(&s_adj_H[bi][bj],  -lambda_v_t * j_tau_dy.d_H_b);
 	    }
-
+	    
+	    if (use_forcing) atomicAdd(&s_adj_v[bi][bj], -get_hfacet(f_v,i,j,ny,nx));
 	}
 
     }

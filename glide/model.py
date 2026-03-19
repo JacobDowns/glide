@@ -7,378 +7,81 @@ computations into a clean interface.
 
 import cupy as cp
 from .grid import Grid
-from .kernels import get_kernels, restrict_cell_centered
-from .solver import fascd_vcycle, adjoint_vcycle_fas, restrict_parameters_to_hierarchy, restrict_solution_to_hierarchy
+from .multigrid import Multigrid, FASCDSolver,FASAdjointSolver
 
 
 # Physical constants
 RHO_ICE = 917.0  # kg/m^3
 G = 9.81  # m/s^2
 
+class IceDynamics:
+    def __init__(self,mg=None,
+            n_levels=None,grid=None,
+            ny=None,nx=None,dx=None):
+        if mg is not None:
+            self.mg = mg
+        elif grid is not None and n_levels is not None:
+            self.mg = Multigrid(n_levels,finest_grid=grid)
+        elif ny and nx and dx and n_levels:
+            self.mg = Multigrid(n_levels,ny=ny,nx=nx,dx=dx)
+        else:
+            raise ValueError('Must supply either (a) a multigrid object \
+                              (b) a grid and number of levels \
+                              (c) ny/nx/dx and number of levels')
 
-class IcePhysics:
-    """
-    GPU-accelerated shallow shelf approximation ice sheet model.
+        self._forward_solver = None
+        self._adjoint_solver = None
+        self.top_level = 0
 
-    Provides forward simulation and adjoint-based gradient computation
-    for the coupled momentum + mass conservation system.
+        self._post_forward_hooks = []
 
-    Parameters
-    ----------
-    ny, nx : int
-        Grid dimensions (number of cells)
-    dx : float
-        Grid spacing in meters
-    n_levels : int
-        Number of multigrid levels (default 5)
-    n : float
-        Glen's flow law exponent (default 3.0)
-    eps_reg : float
-        Strain rate regularization (default 1e-5)
-    thklim : float
-        Minimum thickness constraint (default 0.1)
+    @property
+    def forward_solver(self):
+        if self._forward_solver is None:
+            self._forward_solver = FASCDSolver(self.mg)
+        return self._forward_solver
+    
+    @property
+    def adjoint_solver(self):
+        if self._adjoint_solver is None:
+            self._adjoint_solver = FASAdjointSolver(self.mg)
+        return self._adjoint_solver
 
-    Examples
-    --------
-    >>> physics = IcePhysics(ny=512, nx=512, dx=1500.0)
-    >>> physics.set_geometry(bed, thickness)
-    >>> physics.set_parameters(B=B, beta=beta, smb=smb)
-    >>> u, v, H = physics.forward(dt=10.0, n_vcycles=3)
-    """
+    def set_top_level(self,level):
+        self.top_level = level
 
-    def __init__(self, ny, nx, dx, n_levels=5, 
-            n=3.0, eps_reg=1e-5,
-            m=1.0, u_reg=1.0,
-            thklim=0.1, 
-            water_drag=1e-3,calving_rate=1.0,sigmoid_c=0.1):
-        self.ny = ny
-        self.nx = nx
-        self.dx = dx
-        self.n_levels = n_levels
-        self.n = cp.float32(n)
-        self.eps_reg = cp.float32(eps_reg)
-        self.m = cp.float32(m)
-        self.u_reg = cp.float32(u_reg)
-        self.thklim = cp.float32(thklim)
-        self.water_drag = cp.float32(water_drag)
-        self.calving_rate = cp.float32(calving_rate)
-        self.sigmoid_c=cp.float32(sigmoid_c)
+    def register_post_forward_hook(self,hook):
+        self._post_forward_hooks.append(hook)
 
-        # Load kernels
-        self.kernels = get_kernels()
-
-        # Create grid hierarchy
-        self._init_hierarchy()
-
-    def _init_hierarchy(self):
-        """Initialize the multigrid hierarchy."""
-        self.grid = Grid(
-            self.ny, self.nx, self.dx, dt=1.0,
-            kernels=self.kernels,
-            n=self.n, eps_reg=self.eps_reg,
-            m=self.m, u_reg=self.u_reg,
-            water_drag=self.water_drag,calving_rate=self.calving_rate,
-            sigmoid_c=self.sigmoid_c)
-        self.grids = [self.grid]
-
-        for _ in range(self.n_levels - 1):
-            self.grids.append(self.grids[-1].spawn_child())
-
-    def set_grid_level(self,level=0):
-        self.grid = self.grids[level]
-
-    def set_geometry(self, bed, thickness):
-        """
-        Set the ice sheet geometry.
-
-        Parameters
-        ----------
-        bed : array_like
-            Bed topography (ny, nx), in meters
-        thickness : array_like
-            Ice thickness (ny, nx), in meters
-        """
-        self.grid.bed[:] = cp.asarray(bed, dtype=cp.float32)
-        self.grid.H[:] = cp.asarray(thickness, dtype=cp.float32)
-        self.grid.H_prev[:] = self.grid.H[:]
-        self.grid.gamma.fill(self.thklim)
-
-        # Propagate geometry to child grids
-        self._propagate_geometry_to_hierarchy()
-
-    def set_parameters(self, B=None, beta=None, smb=None):
-        """
-        Set physical parameters.
-
-        Parameters
-        ----------
-        B : array_like, optional
-            Rate factor field (ny, nx). If scalar, broadcasts to all cells.
-            Units: Pa^(-n) s^(-1) (normalized by rho*g internally)
-        beta : array_like, optional
-            Basal friction coefficient (ny, nx)
-        smb : array_like, optional
-            Surface mass balance (ny, nx), in m/yr ice equivalent
-        """
-        if B is not None:
-            B_arr = cp.asarray(B, dtype=cp.float32)
-            if B_arr.ndim == 0:
-                self.grid.B.fill(float(B_arr))
-            else:
-                self.grid.B[:] = B_arr
-
-        if beta is not None:
-            self.grid.beta[:] = cp.asarray(beta, dtype=cp.float32)
-
-        if smb is not None:
-            self.grid.smb[:] = cp.asarray(smb, dtype=cp.float32)
-
-        # Propagate parameters to child grids
-        restrict_parameters_to_hierarchy(self.grid)
-
-    def _propagate_geometry_to_hierarchy(self):
-        """Propagate geometry (bed, H, H_prev, gamma) to all child grids."""
-        for i in range(len(self.grids) - 1):
-            parent = self.grids[i]
-            child = self.grids[i + 1]
-            restrict_cell_centered(parent.bed, self.kernels, f_coarse=child.bed)
-            restrict_cell_centered(parent.H, self.kernels, f_coarse=child.H)
-            restrict_cell_centered(parent.H_prev, self.kernels, f_coarse=child.H_prev)
-            child.gamma.fill(self.thklim)
-
-    def forward(self, dt, n_vcycles=3, rtol=1e-2, atol=5.0, verbose=False, update_geometry=True):
-        """
-        Perform one forward time step.
-
-        Solves the coupled SSA momentum equations and mass conservation
-        for the ice velocity and thickness after time dt.
-
-        Parameters
-        ----------
-        dt : float
-            Time step in years
-        n_vcycles : int
-            Number of multigrid V-cycles (default 3)
-        verbose : bool
-            Print convergence info
-
-        Returns
-        -------
-        u : cupy.ndarray
-            x-velocity on vertical faces (ny, nx+1), m/yr
-        v : cupy.ndarray
-            y-velocity on horizontal faces (ny+1, nx), m/yr
-        H : cupy.ndarray
-            Ice thickness (ny, nx), m
-        """
-        self.grid.dt = cp.float32(dt)
-
-        # Propagate dt to all levels
-        for g in self.grids:
-            g.dt = self.grid.dt
-
-        # Set up RHS for mass equation
-        self.grid.f_H[:, :] = self.grid.H_prev / self.grid.dt + self.grid.smb
-
-        # Compute initial residual for convergence tracking
-        #self.grid.vanka_smooth()
-        self.grid.compute_residual()
-        r0 = cp.linalg.norm(self.grid.r)
-        if verbose:
-            print(f"  Initial: |r| = {r0:.2e}, "
-                  f"|r_u| = {float(cp.linalg.norm(self.grid.r_u)):.2e}, "
-                  f"|r_v| = {float(cp.linalg.norm(self.grid.r_v)):.2e}, "
-                  f"|r_H| = {float(cp.linalg.norm(self.grid.r_H)):.2e}")
-
-        # Solve
-        for i in range(n_vcycles):
-            fascd_vcycle(self.grid, self.thklim, omega=cp.float32(0.5), finest=True)
-
-            self.grid.compute_residual(recompute_grounded=False)
-            r1 = cp.linalg.norm(self.grid.r)
-            rel = r1 / r0 if r0 > 0 else 0.0
-            if verbose:
-                print(f"  V-cycle {i}: |r|/|r0| = {rel:.2e}, "
-                      f"|r_u| = {float(cp.linalg.norm(self.grid.r_u)):.2e}, "
-                      f"|r_v| = {float(cp.linalg.norm(self.grid.r_v)):.2e}, "
-                      f"|r_H| = {float(cp.linalg.norm(self.grid.r_H)):.2e}")
-            if rel < rtol or r1 < atol: 
-                break
-        # Update H_prev for next time step
+    def forward(self,t,dt,update_geometry=True):
+        self.forward_solver.solve(dt,start_level=self.top_level)
         if update_geometry:
-            self.grid.H_prev[:] = self.grid.H[:]
+            self.mg.levels[self.top_level].state.H_prev.data[:,:] = (
+                self.mg.levels[self.top_level].state.H.data[:,:]
+            )
+        for f in self._post_forward_hooks:
+            f(t+dt)
 
-        return self.grid.u, self.grid.v, self.grid.H
+    def backward(self,t,dt,dJdu=None,dJdv=None,dJdH=None):
+        if dJdu is not None:
+            self.mg.levels[self.top_level].adjoint_operators.f_u[:,:] = -dJdu
+        else:
+            self.mg.levels[self.top_level].adjoint_operators.f_u.fill(0.0)            
+        if dJdv is not None:
+            self.mg.levels[self.top_level].adjoint_operators.f_v[:,:] = -dJdv
+        else:
+            self.mg.levels[self.top_level].adjoint_operators.f_v.fill(0.0)
+        if dJdH is not None:
+            self.mg.levels[self.top_level].adjoint_operators.f_H[:,:] = -dJdH
+        else:    
+            self.mg.levels[self.top_level].adjoint_operators.f_H.fill(0.0)
 
-    def adjoint(self, dL_du, dL_dv, dL_dH,n_vcycles=2,verbose=False):
-        """
-        Compute adjoint (reverse-mode AD) for gradient computation.
-
-        Given gradients of a loss function w.r.t. velocities,
-        computes gradients w.r.t. parameters (beta).
-
-        Parameters
-        ----------
-        dL_du : cupy.ndarray
-            Gradient of loss w.r.t. u velocity (ny, nx+1)
-        dL_dv : cupy.ndarray
-            Gradient of loss w.r.t. v velocity (ny+1, nx)
-
-        Returns
-        -------
-        grad_beta : cupy.ndarray
-            Gradient of loss w.r.t. beta (ny, nx)
-        """
-        restrict_solution_to_hierarchy(self.grid)
-
-        # Set adjoint forcing
-        self.grid.f_adj_u[:] = cp.asarray(-dL_du, dtype=cp.float32)
-        self.grid.f_adj_v[:] = cp.asarray(-dL_dv, dtype=cp.float32)
-        self.grid.f_adj_H[:] = cp.asarray(-dL_dH, dtype=cp.float32)
-
-        self.grid.Lambda.fill(0.0)
-        # Solve adjoint system
-        for _ in range(n_vcycles):
-            adjoint_vcycle_fas(self.grid,omega=cp.float32(0.5),verbose=verbose,finest=True)
-
-        # Compute parameter gradient
-        return self.grid.compute_grad_beta()
-
-    def reset_solution(self):
-        """Reset velocity fields to zero."""
-        self.grid.u.fill(0.0)
-        self.grid.v.fill(0.0)
-        self.grid.H[:] = self.grid.H_prev[:]
-
-    def get_surface(self):
-        """Compute ice surface elevation."""
-        base = cp.maximum(self.grid.bed, -RHO_ICE / 1000.0 * self.grid.H)
-        return self.grid.H + base
-
-    def get_velocities_cell_centered(self):
-        """Return velocities interpolated to cell centers."""
-        u_c = 0.5 * (self.grid.u[:, 1:] + self.grid.u[:, :-1])
-        v_c = 0.5 * (self.grid.v[1:] + self.grid.v[:-1])
-        return u_c, v_c
-
-def abs_loss(u, v, u_obs, v_obs,mask_threshold=1.0):
-    """
-    Compute Huber-like loss for velocity misfit.
-
-    Parameters
-    ----------
-    u, v : cupy.ndarray
-        Model velocities
-    u_obs, v_obs : cupy.ndarray
-        Observed velocities
-    eps : float
-        Smoothing parameter
-
-    Returns
-    -------
-    loss : float
-        Loss value
-    """
-    u = u.astype(cp.float64)
-    v = v.astype(cp.float64)
-    
-    u_obs = u_obs.astype(cp.float64)
-    v_obs = v_obs.astype(cp.float64)
-    
-    n_u = u.size
-    n_v = v.size
-    
-    mask_u = abs(u_obs) < mask_threshold
-    mask_v = abs(v_obs) < mask_threshold
-    
-    delta_u = u - u_obs
-    delta_v = v - v_obs
-    
-    L = abs(delta_u[~mask_u]).sum()/n_u + abs(delta_v[~mask_v]).sum()/n_v
-
-    dLdu = cp.sign(delta_u)/n_u
-    dLdu[mask_u] = 0.0
-    
-    dLdv = cp.sign(delta_v)/n_v
-    dLdv[mask_v] = 0.0
+        self.adjoint_solver.solve(dt,start_level=self.top_level)
+        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_beta()
+        
 
 
-    return L, dLdu, dLdv
-
-def huber_loss(u, v, u_obs, v_obs, epsilon=10.0, mask_threshold=1.0):
-    """
-    Compute Huber-like loss for velocity misfit.
-
-    Parameters
-    ----------
-    u, v : cupy.ndarray
-        Model velocities
-    u_obs, v_obs : cupy.ndarray
-        Observed velocities
-    eps : float
-        Smoothing parameter
-
-    Returns
-    -------
-    loss : float
-        Loss value
-    """
-    u = u.astype(cp.float64)
-    v = v.astype(cp.float64)
-    
-    u_obs = u_obs.astype(cp.float64)
-    v_obs = v_obs.astype(cp.float64)
-    
-    n_u = u.size
-    n_v = v.size
-    
-    mask_u = abs(u_obs) < mask_threshold
-    mask_v = abs(v_obs) < mask_threshold
-    
-    delta_u = u - u_obs
-    delta_v = v - v_obs
-    
-    delta_u_mag = (delta_u ** 2 + epsilon**2)**0.5
-    delta_v_mag = (delta_v ** 2 + epsilon**2)**0.5
-
-    L = delta_u_mag.sum()/n_u + delta_v_mag.sum()/n_v
-
-    dLdu = (delta_u/delta_u_mag)/n_u
-    dLdu[mask_u] = 0.0
-    
-    dLdv = (delta_v/delta_v_mag)/n_v
-    dLdv[mask_v] = 0.0
-    
-    return L, dLdu, dLdv
 
 
-def tikhonov_regularization(field,weight=cp.float32(1.0)):
-    """
-    Compute Tikhonov (gradient smoothness) regularization.
+        
 
-    Parameters
-    ----------
-    field : cupy.ndarray
-        2D field to regularize
-
-    Returns
-    -------
-    loss : float
-        Regularization loss
-    grad : cupy.ndarray
-        Gradient of loss w.r.t. field
-    """
-    diff_x = field[:, 1:] - field[:, :-1]
-    diff_y = field[1:, :] - field[:-1, :]
-
-    loss = 0.5 * (cp.sum(diff_x**2) + cp.sum(diff_y**2))
-
-    grad = cp.zeros_like(field)
-    grad[:, 1:-1] -= (field[:, 2:] - 2 * field[:, 1:-1] + field[:, :-2])
-    grad[:, 0] -= (field[:, 1] - field[:, 0])
-    grad[:, -1] -= (field[:, -2] - field[:, -1])
-    grad[1:-1, :] -= (field[2:, :] - 2 * field[1:-1, :] + field[:-2, :])
-    grad[0, :] -= (field[1, :] - field[0, :])
-    grad[-1, :] -= (field[-2, :] - field[-1, :])
-
-    return float(weight*loss), weight*grad

@@ -258,13 +258,13 @@ class HierarchyFieldManager:
         self._restrict = restrict
         self._name = name
 
-    def set(self, value):
-        finest = self._getter(self._levels[0])
+    def set(self, value, start_level=0):
+        finest = self._getter(self._levels[start_level])
         finest.set(value)
-        self.restrict_down()
+        self.restrict_down(start_level)
 
-    def restrict_down(self):
-        for l in range(len(self._levels) - 1):
+    def restrict_down(self, start_level):
+        for l in range(start_level,len(self._levels) - 1):
             fine = self._getter(self._levels[l])
             coarse = self._getter(self._levels[l + 1])
             self._restrict(fine, coarse)
@@ -473,27 +473,6 @@ class MGForcingManager:
     def __repr__(self):
         return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].forcing.__repr__()
 
-class FASCDScratch:
-    def __init__(self,grid):
-        ny,nx = grid.ny,grid.nx
-        
-        self.w_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
-        self.w_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
-        self.w_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-
-        self.y_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
-        self.y_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
-        self.y_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-        
-        self.z_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
-        self.z_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
-        self.z_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-
-        self.chi = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-        self.phi = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
-
-
-
 class FASCDSolver:
     def __init__(self,multigrid):
         self.multigrid = multigrid
@@ -520,11 +499,11 @@ class FASCDSolver:
         initial_residual_norm = cp.sqrt(ru_init**2 + rv_init**2 + rH_init**2)
         relative_residual_norm = cp.float32(1.0)
 
-        if report_norms:
-            print(f"  Initial: |r| = {initial_residual_norm:.4e}, "
-                  f"|r_u| = {float(ru_init):.4e}, "
-                  f"|r_v| = {float(rv_init):.4e}, "
-                  f"|r_H| = {float(rH_init):.4e}")
+        if self._fas_config.report_norms:
+            print(f"  Initial:   |r0|     = {initial_residual_norm:.2e}, "
+                  f"|r_u| = {float(ru_init):.2e}, "
+                  f"|r_v| = {float(rv_init):.2e}, "
+                  f"|r_H| = {float(rH_init):.2e}")
 
         absolute_residual_norm = initial_residual_norm
         iteration = 0
@@ -536,11 +515,11 @@ class FASCDSolver:
 
             absolute_residual_norm = cp.sqrt(ru**2 + rv**2 + rH**2)
             relative_residual_norm = absolute_residual_norm / initial_residual_norm
-            if report_norms:
-                print(f"  V-cycle {iteration}: |r|/|r0| = {relative_residual_norm:.4e}, "
-                      f"|r_u| = {float(ru):.4e}, "
-                      f"|r_v| = {float(rv):.4e}, "
-                      f"|r_H| = {float(rH):.4e}")
+            if self._fas_config.report_norms:
+                print(f"  V-cycle {iteration}: |r|/|r0| = {relative_residual_norm:.2e}, "
+                      f"|r_u| = {float(ru):.2e}, "
+                      f"|r_v| = {float(rv):.2e}, "
+                      f"|r_H| = {float(rH):.2e}")
             iteration += 1
 
         
@@ -560,7 +539,7 @@ class FASCDSolver:
         dt = self.dt
         level = self.levels[l]
         
-        if l == 0:
+        if finest:
             level.scratch.w_u[:,:] = level.grid.state.u.data[:,:]
             level.scratch.w_v[:,:] = level.grid.state.v.data[:,:]
             level.scratch.w_H[:,:] = level.grid.state.H.data[:,:]
@@ -571,8 +550,8 @@ class FASCDSolver:
             level.grid.forward_operators.gamma[:,:] = level.scratch.w_H[:,:] + level.scratch.chi[:,:]
             level.grid.forward_operators.vanka_sweep(self.dt,
                 self._fas_config.coarsest_steps,
-                freeze_calving=self._fas_config.freeze_coarse_calving,
-                freeze_phi=self._fas_config.freeze_coarse_phi
+                freeze_calving=coarse and self._fas_config.freeze_coarse_calving,
+                freeze_phi=coarse and self._fas_config.freeze_coarse_phi
             )
             level.grid.forward_operators.gamma.fill(level.grid.geometry.thklim.value)
             return
@@ -649,11 +628,30 @@ class FASCDSolver:
                 freeze_phi=coarse and self._fas_config.freeze_coarse_phi)
         level.grid.forward_operators.gamma.fill(level.grid.geometry.thklim.value)
 
-        if not coarse:
+        if finest:
             level.grid.forward_operators.vanka_sweep(self.dt,
                 self._fas_config.finest_steps,
                 freeze_phi=False,
                 freeze_calving=False)
+
+class FASCDScratch:
+    def __init__(self,grid):
+        ny,nx = grid.ny,grid.nx
+        
+        self.w_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.w_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.w_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+
+        self.y_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.y_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.y_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+        
+        self.z_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.z_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.z_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+
+        self.chi = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+        self.phi = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 
 @dataclass
 class FASCDLevel:
@@ -671,6 +669,7 @@ class FASCDConfig:
     maximum_vcycles: int = 10
     relative_tolerance: cp.float32 = cp.float32(1e-3)
     absolute_tolerance: cp.float32 = cp.float32(5.0)
+    report_norms: bool = True
 
 def dataclass_field_names(cls):
     return [f.name for f in fields(cls)]
@@ -748,6 +747,11 @@ class FASCDOptions:
             name="absolute_tolerance",
         )
 
+        self.report_norms = LocalOption(
+            getter=lambda: self._config.absolute_tolerance,
+            setter=lambda v: setattr(self._config, "report_norms", v),
+            name="report_norms",
+        )
 
 
     def set(self, **kwargs):
@@ -839,80 +843,213 @@ class NewtonOptions:
 
 
 
-"""
-    def adjoint_vcycle_fas(grid,
-                           verbose=False,
-                           finest=False,
-                           omega=cp.float32(1.0),
-                           pre_steps=10,
-                           post_steps=30,
-                           final_steps=100,
-                           coarse_steps=200):
-        kernels = grid.kernels
 
-        # --- Coarsest level ---
-        if grid.child is None:
-            grid.vanka_sweep_adjoint(coarse_steps, omega=omega,verbose=verbose)
+class FASAdjointSolver:
+    def __init__(self,multigrid):
+        self.multigrid = multigrid
+        self.levels = [FASAdjointLevel(grid, FASAdjointScratch(grid)) for grid in multigrid.levels]
+
+        self._fas_config = FASAdjointConfig()
+        self.fas_options = FASAdjointOptions(self._fas_config)
+        
+        self.vanka_options = VankaOptions(
+            self.levels,
+            getter=lambda lev: lev.grid.adjoint_operators.vanka_config,
+        )
+
+        self.n_levels = len(self.levels)
+        self.dt = None
+
+    def solve(self,dt,start_level=0,report_norms=True):
+        self.dt = cp.float32(dt)
+        
+        start_level_ = self.multigrid.levels[start_level]
+        
+        ru_init,rv_init,rH_init = start_level_.adjoint_operators.compute_residual(dt,return_norms=True)
+        initial_residual_norm = cp.sqrt(ru_init**2 + rv_init**2 + rH_init**2)
+        relative_residual_norm = cp.float32(1.0)
+
+        if self._fas_config.report_norms:
+            print(f"  Initial:   |r0|     = {initial_residual_norm:.2e}, "
+                  f"|r_u| = {float(ru_init):.2e}, "
+                  f"|r_v| = {float(rv_init):.2e}, "
+                  f"|r_H| = {float(rH_init):.2e}")
+
+        absolute_residual_norm = initial_residual_norm
+        iteration = 0
+        while (relative_residual_norm > self._fas_config.relative_tolerance 
+                and absolute_residual_norm > self._fas_config.absolute_tolerance
+                and iteration < self._fas_config.maximum_vcycles):
+            self.vcycle(start_level,finest=True)
+            ru,rv,rH = start_level_.adjoint_operators.compute_residual(dt,return_norms=True)
+
+            absolute_residual_norm = cp.sqrt(ru**2 + rv**2 + rH**2)
+            relative_residual_norm = absolute_residual_norm / initial_residual_norm
+            if self._fas_config.report_norms:
+                print(f"  V-cycle {iteration}: |r|/|r0| = {relative_residual_norm:.2e}, "
+                      f"|r_u| = {float(ru):.2e}, "
+                      f"|r_v| = {float(rv):.2e}, "
+                      f"|r_H| = {float(rH):.2e}")
+            iteration += 1
+
+    def vcycle(self, l, finest=False):
+
+        coarse = not finest
+        mg = self.multigrid
+        dt = self.dt
+        level = self.levels[l]
+
+        # Coarsest level - smooth to convergence
+        if l == self.n_levels - 1:
+            level.grid.adjoint_operators.vanka_sweep(dt,
+                self._fas_config.coarsest_steps)
             return
 
-        # =========================
-        # 1) Pre-smooth on fine
-        # =========================
-        grid.vanka_sweep_adjoint(pre_steps, omega=omega,verbose=verbose)
-        restrict_adjoint_solution(grid)
-        grid.child.Lambda_0[:] = grid.child.Lambda[:]
+        next_level = self.levels[l+1]
 
-        # =========================
-        # 4) Build coarse RHS via tau-correction:
-        #    f_2h = R f_h + tau_2h
-        #    tau_2h = N_2h(R lambda_h) - R N_h(lambda_h)
-        # =========================
+        # Pre-smooth
+        level.grid.adjoint_operators.vanka_sweep(dt,
+            self._fas_config.pre_steps)
 
-        grid.compute_residual_adjoint(use_mask=False)
-        restrict_adjoint_residual(grid)
+        # Restrict adjoint solution to child
+        #mg.restrict_adjoint_state(level.grid,next_level.grid)
+        mg.restrict_vfacet(level.grid.adjoint.lambda_u.data,next_level.grid.adjoint.lambda_u.data)
+        mg.restrict_hfacet(level.grid.adjoint.lambda_v.data,next_level.grid.adjoint.lambda_v.data)
+        mg.restrict_cell(level.grid.adjoint.lambda_H.data,next_level.grid.adjoint.lambda_H.data)
+
+        next_level.scratch.w_lambda_u[:,:] = next_level.grid.adjoint.lambda_u.data[:,:]
+        next_level.scratch.w_lambda_v[:,:] = next_level.grid.adjoint.lambda_v.data[:,:]
+        next_level.scratch.w_lambda_H[:,:] = next_level.grid.adjoint.lambda_H.data[:,:]
+
+        # Compute and restrict adjoint residual
+        level.grid.adjoint_operators.compute_residual(dt,use_mask=False)
+        mg.restrict_vfacet(level.grid.adjoint_operators.r_u,next_level.grid.adjoint_operators.r_u)
+        mg.restrict_hfacet(level.grid.adjoint_operators.r_v,next_level.grid.adjoint_operators.r_v)
+        mg.restrict_cell(level.grid.adjoint_operators.r_H,next_level.grid.adjoint_operators.r_H)
         
-        grid.child.compute_F_adjoint(use_mask=False)
-        grid.child.f_adj[:] = grid.child.r_adj - grid.child.F_adj
+        next_level.grid.adjoint_operators.compute_vjp(dt,use_mask=False)
+        next_level.grid.adjoint_operators.f_u[:,:] = next_level.grid.adjoint_operators.vjp_u[:,:] - next_level.grid.adjoint_operators.r_u[:,:]
+        next_level.grid.adjoint_operators.f_v[:,:] = next_level.grid.adjoint_operators.vjp_v[:,:] - next_level.grid.adjoint_operators.r_v[:,:]
+        next_level.grid.adjoint_operators.f_H[:,:] = next_level.grid.adjoint_operators.vjp_H[:,:] - next_level.grid.adjoint_operators.r_H[:,:]
 
+        # recursive call
+        self.vcycle(l+1)
 
-        # =========================
-        # 5) Recurse on coarse: solve N_2h(lambda_2h) = f_2h
-        # =========================
-        adjoint_vcycle_fas(grid.child,
-                           verbose=verbose,
-                           omega=omega,
-                           pre_steps=pre_steps,
-                           post_steps=post_steps,
-                           coarse_steps=coarse_steps)
+        # compute coarse_correction
+        next_level.scratch.z_lambda_u[:,:] = next_level.grid.adjoint.lambda_u.data[:,:] - next_level.scratch.w_lambda_u[:,:]
+        next_level.scratch.z_lambda_v[:,:] = next_level.grid.adjoint.lambda_v.data[:,:] - next_level.scratch.w_lambda_v[:,:]
+        next_level.scratch.z_lambda_H[:,:] = next_level.grid.adjoint.lambda_H.data[:,:] - next_level.scratch.w_lambda_H[:,:]
 
-
-        # =========================
-        # 6) Prolongate CORRECTION (difference) and apply:
-        #    lambda_h <- lambda_h + P( lambda_2h - R lambda_h )
-        # =========================
-
-        # Form coarse correction delta_2h = lambda_2h(new) - lambda_2h^0
-        # Need coarse scratch arrays for delta_* (or reuse existing)
-        grid.child.delta_u[:] = grid.child.lambda_u - grid.child.lambda_u_0
-        grid.child.delta_v[:] = grid.child.lambda_v - grid.child.lambda_v_0
-        grid.child.delta_H[:] = grid.child.lambda_H - grid.child.lambda_H_0
-
-        # Prolongate delta_2h to fine into grid.z_*
-        grid.z_u.fill(0.0); grid.z_v.fill(0.0); grid.z_H.fill(0.0)
-        prolongate_vfacet(grid.child.delta_u, kernels, u_fine=grid.z_u, smooth=True)
-        prolongate_hfacet(grid.child.delta_v, kernels, v_fine=grid.z_v, smooth=True)
-        prolongate_cell_centered(grid.child.delta_H, kernels, H_fine=grid.z_H, smooth=True)
+        mg.prolongate_vfacet(next_level.scratch.z_lambda_u,level.scratch.z_lambda_u,method='bilinear')
+        mg.prolongate_hfacet(next_level.scratch.z_lambda_v,level.scratch.z_lambda_v,method='bilinear')
+        mg.prolongate_cell(next_level.scratch.z_lambda_H,level.scratch.z_lambda_H,method='bilinear')
 
         # Apply fine correction
-        grid.lambda_u[:] += grid.z_u
-        grid.lambda_v[:] += grid.z_v
-        grid.lambda_H[:] += grid.z_H
+        level.grid.adjoint.lambda_u.data[:,:] += level.scratch.z_lambda_u[:,:]
+        level.grid.adjoint.lambda_v.data[:,:] += level.scratch.z_lambda_v[:,:]
+        level.grid.adjoint.lambda_H.data[:,:] += level.scratch.z_lambda_H[:,:]
 
-        # =========================
-        # 7) Post-smooth
-        # =========================
-        grid.vanka_sweep_adjoint(post_steps, omega=omega, verbose=verbose)
+        # Post-smooth
+        level.grid.adjoint_operators.vanka_sweep(dt, self._fas_config.post_steps)
 
-        if finest:
-            grid.vanka_sweep_adjoint(final_steps,omega=omega,verbose=verbose)
-"""
+        if not coarse:
+            level.grid.adjoint_operators.vanka_sweep(dt, self._fas_config.finest_steps)
+
+
+class FASAdjointScratch:
+    def __init__(self,grid):
+        ny,nx = grid.ny,grid.nx
+        
+        self.w_lambda_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.w_lambda_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.w_lambda_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+
+        self.z_lambda_u = cp.zeros((grid.ny,grid.nx+1),dtype=cp.float32)
+        self.z_lambda_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
+        self.z_lambda_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+
+@dataclass
+class FASAdjointLevel:
+    grid: Grid
+    scratch: FASAdjointScratch
+
+@dataclass
+class FASAdjointConfig:
+    coarsest_steps: int = 200
+    pre_steps: int = 10
+    post_steps: int = 20
+    finest_steps: int = 50
+    maximum_vcycles: int = 10
+    relative_tolerance: cp.float32 = cp.float32(1e-3)
+    absolute_tolerance: cp.float32 = cp.float32(5.0)
+    report_norms: bool = True
+
+
+class FASAdjointOptions:
+    """
+    User-facing wrapper around a single FASCDConfig.
+    """
+
+    def __init__(self, config: FASCDConfig):
+        self._config = config
+
+        self.options = ['coarsest_steps',
+            'pre_steps',
+            'post_steps',
+            'finest_steps']
+
+        self.coarsest_steps = LocalOption(
+            getter=lambda: self._config.coarsest_steps,
+            setter=lambda v: setattr(self._config, "coarsest_steps", v),
+            name="coarsest_steps",
+        )
+        self.pre_steps = LocalOption(
+            getter=lambda: self._config.pre_steps,
+            setter=lambda v: setattr(self._config, "pre_steps", v),
+            name="pre_steps",
+        )
+        self.post_steps = LocalOption(
+            getter=lambda: self._config.post_steps,
+            setter=lambda v: setattr(self._config, "post_steps", v),
+            name="post_steps",
+        )
+        self.finest_steps = LocalOption(
+            getter=lambda: self._config.finest_steps,
+            setter=lambda v: setattr(self._config, "finest_steps", v),
+            name="finest_steps",
+        )
+
+        self.maximum_vcycles = LocalOption(
+            getter=lambda: self._config.maximum_vcycles,
+            setter=lambda v: setattr(self._config, "maximum_vcycles", v),
+            name="maximum_vcyles",
+        )
+        
+        self.relative_tolerance = LocalOption(
+            getter=lambda: self._config.relative_tolerance,
+            setter=lambda v: setattr(self._config, "relative_tolerance", v),
+            name="relative_tolerance",
+        )
+        
+        self.absolute_tolerance = LocalOption(
+            getter=lambda: self._config.absolute_tolerance,
+            setter=lambda v: setattr(self._config, "absolute_tolerance", v),
+            name="absolute_tolerance",
+        )
+
+        self.report_norms = LocalOption(
+            getter=lambda: self._config.absolute_tolerance,
+            setter=lambda v: setattr(self._config, "report_norms", v),
+            name="report_norms",
+        )
+
+    def set(self, **kwargs):
+        validate_kwargs(FASAdjointConfig, kwargs)
+        for k, v in kwargs.items():
+            setattr(self._config, k, v)
+
+    def __repr__(self):
+        return 'fas_options={' + ', '.join([f"{getattr(self,o)}" for o in self.options]) + '}'
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(self.options))

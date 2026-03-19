@@ -12,9 +12,10 @@ import numpy as np
 from glide.io import VTIWriter, write_vti
 from glide.data import load_greenland_preprocessed
 
-from glide.multigrid import Multigrid, FASCDSolver
+from glide.model import IceDynamics
+from glide.multigrid import Multigrid, FASCDSolver, FASAdjointSolver
 from scipy.ndimage import gaussian_filter
-from glide.hooks import TimeLogger
+from glide.hooks import InverseLogger
 
 ### Load a dataset (here a preprocessed greenland dataset)
 dataset = load_greenland_preprocessed()
@@ -22,7 +23,11 @@ dataset = load_greenland_preprocessed()
 ### Initialize grid
 # ny and nx must both divide by 2^(n_levels - 1) cleanly!
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
-mg = Multigrid(n_levels=6,ny=ny,nx=nx,dx=dx)
+model = IceDynamics(n_levels=6,ny=ny,nx=nx,dx=dx)
+mg = model.mg
+
+grid = mg.levels[0]
+dt = cp.float32(10.0)
 
 ### Initialize state
 thk = gaussian_filter(dataset.thickness.values,1)
@@ -64,21 +69,6 @@ smb = dataset.smb.values
 #smb += -1.0
 mg.forcing.smb.set(smb)
 
-### Initialize solver
-solver = FASCDSolver(mg)
-
-solver.vanka_options.omega.set(0.5)
-solver.vanka_options.newton_options.relaxation.set(0.5)
-solver.vanka_options.newton_options.steps.set(30)
-
-solver.fas_options.coarsest_steps.set(200)
-solver.fas_options.pre_steps.set(10)
-solver.fas_options.post_steps.set(50)
-solver.fas_options.finest_steps.set(150)
-solver.fas_options.maximum_vcycles.set(10)
-solver.fas_options.relative_tolerance.set(1e-3)
-solver.fas_options.absolute_tolerance.set(10.0)
-
 ### Load velocity data ###
 u_obs_cell = dataset.vx.values
 v_obs_cell = dataset.vy.values
@@ -89,11 +79,107 @@ u_obs[:, 1:-1] = cp.array((u_obs_cell[:, 1:] + u_obs_cell[:, :-1]) / 2.0)
 v_obs = cp.zeros((ny + 1, nx), dtype=cp.float32)
 v_obs[1:-1] = cp.array((v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0)
 
+forward_solver = model.forward_solver
+forward_solver.vanka_options.omega.set(0.5)
+forward_solver.vanka_options.newton_options.relaxation.set(0.5)
+forward_solver.vanka_options.newton_options.steps.set(30)
+
+forward_solver.fas_options.coarsest_steps.set(200)
+forward_solver.fas_options.pre_steps.set(10)
+forward_solver.fas_options.post_steps.set(50)
+forward_solver.fas_options.finest_steps.set(150)
+forward_solver.fas_options.maximum_vcycles.set(10)
+forward_solver.fas_options.relative_tolerance.set(1e-3)
+forward_solver.fas_options.absolute_tolerance.set(10.0)
+
+adjoint_solver = model.adjoint_solver
+adjoint_solver.fas_options.coarsest_steps.set(200)
+adjoint_solver.fas_options.pre_steps.set(10)
+adjoint_solver.fas_options.post_steps.set(50)
+adjoint_solver.fas_options.finest_steps.set(150)
+adjoint_solver.fas_options.maximum_vcycles.set(10)
+adjoint_solver.fas_options.absolute_tolerance.set(cp.float32(10.0))
+adjoint_solver.fas_options.relative_tolerance.set(cp.float32(0.01))
+adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(0.1))
+adjoint_solver.vanka_options.omega.set(cp.float32(0.5))
+
+def tikhonov_regularization(field,weight=cp.float32(1.0)):
+    """
+    Compute Tikhonov (gradient smoothness) regularization.
+
+    Parameters
+    ----------
+    field : cupy.ndarray
+        2D field to regularize
+
+    Returns
+    -------
+    loss : float
+        Regularization loss
+    grad : cupy.ndarray
+        Gradient of loss w.r.t. field
+    """
+    diff_x = field[:, 1:] - field[:, :-1]
+    diff_y = field[1:, :] - field[:-1, :]
+
+    loss = 0.5 * (cp.sum(diff_x**2) + cp.sum(diff_y**2))
+
+    grad = cp.zeros_like(field)
+    grad[:, 1:-1] -= (field[:, 2:] - 2 * field[:, 1:-1] + field[:, :-2])
+    grad[:, 0] -= (field[:, 1] - field[:, 0])
+    grad[:, -1] -= (field[:, -2] - field[:, -1])
+    grad[1:-1, :] -= (field[2:, :] - 2 * field[1:-1, :] + field[:-2, :])
+    grad[0, :] -= (field[1, :] - field[0, :])
+    grad[-1, :] -= (field[-2, :] - field[-1, :])
+
+    return float(weight*loss), weight*grad
+
+obs_hierarchy = [(u_obs,v_obs)]
+for j in range(5):
+    u_obs_coarse = mg.restrict_vfacet(obs_hierarchy[-1][0])
+    v_obs_coarse = mg.restrict_hfacet(obs_hierarchy[-1][1])
+    obs_hierarchy.append((u_obs_coarse,v_obs_coarse))
+t = cp.float32(0.0)
+
+for level in range(5,-1,-1):
+    logger = InverseLogger(mg.levels[level],pvd_directory='./inverse/',pvd_base=f'level_{level}')
+    model.set_top_level(level)
+    u_obs,v_obs = obs_hierarchy[level]
+    u_mask = abs(u_obs) > 0.01
+    v_mask = abs(v_obs) > 0.01
+    log_beta = cp.log(model.mg.levels[level].sliding.beta.data)
+    for i in range(50):
+        print("Solving Forward")
+        mg.sliding.beta.set(cp.exp(log_beta),start_level=level)    
+        model.forward(t,dt,update_geometry=False)
+
+        u = mg.levels[level].state.u.data
+        v = mg.levels[level].state.v.data
+
+        n_pts = mg.levels[level].ny*mg.levels[level].nx
+
+        dJdu = cp.sign(u - u_obs)*u_mask#/n_pts
+        dJdv = cp.sign(v - v_obs)*v_mask#/n_pts
+
+        print("Solving Adjoint")
+        model.backward(t,dt,dJdu=dJdu,dJdv=dJdv)
+
+        J_tikh,grad_log_beta_tikh = tikhonov_regularization(log_beta,weight=cp.float32(10.0))
+
+        grad_log_beta_data = mg.levels[level].sliding.beta.grad * mg.levels[level].sliding.beta.data
+
+        grad_log_beta = grad_log_beta_data + grad_log_beta_tikh
 
 
+        J = (abs(u - u_obs)*u_mask).sum()/n_pts + (abs(v - v_obs)*v_mask).sum()/n_pts
+        log_beta -= 0.02 * grad_log_beta / (abs(grad_log_beta) + 1e-3)
 
+        logger(i)
 
-
+        print("J",J,J_tikh/n_pts)
+    if level>0:
+        mg.prolongate_cell(mg.levels[level].sliding.beta.data,mg.levels[level-1].sliding.beta.data,method='bilinear')
+"""
 obs_hierarchy = [(u_obs, v_obs)]
 current_u, current_v = u_obs, v_obs
 g = grid
@@ -157,7 +243,6 @@ for level_idx in [4,4,3,2,1,0]:
         return float(J),grad_log_beta
 
     def callback(log_beta):
-        """Callback for visualization."""
         counter[0] += 1
 
         u_c = 0.5 * (current_grid.u[:, 1:] + current_grid.u[:, :-1])
@@ -187,4 +272,4 @@ for level_idx in [4,4,3,2,1,0]:
     if level_idx > 0:
         parent = physics.grids[level_idx - 1]
         prolongate_cell_centered(current_grid.beta, kernels, H_fine=parent.beta)   
-
+"""

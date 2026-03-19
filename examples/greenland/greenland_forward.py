@@ -10,7 +10,7 @@ import numpy as np
 from glide.io import VTIWriter, write_vti
 from glide.data import load_greenland_preprocessed
 
-from glide.multigrid import Multigrid, FASCDSolver
+from glide.model import IceDynamics
 from scipy.ndimage import gaussian_filter
 from glide.hooks import TimeLogger
 
@@ -20,7 +20,9 @@ dataset = load_greenland_preprocessed()
 ### Initialize grid
 # ny and nx must both divide by 2^(n_levels - 1) cleanly!
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
-mg = Multigrid(n_levels=6,ny=ny,nx=nx,dx=dx)
+model = IceDynamics(n_levels=6,ny=ny,nx=nx,dx=dx)
+
+mg = model.mg
 
 ### Initialize state
 thk = gaussian_filter(dataset.thickness.values,1)
@@ -63,7 +65,7 @@ smb = dataset.smb.values
 mg.forcing.smb.set(smb)
 
 ### Initialize solver
-solver = FASCDSolver(mg)
+solver = model.forward_solver
 
 solver.vanka_options.omega.set(0.5)
 solver.vanka_options.newton_options.relaxation.set(0.5)
@@ -77,18 +79,17 @@ solver.fas_options.maximum_vcycles.set(10)
 solver.fas_options.relative_tolerance.set(1e-3)
 solver.fas_options.absolute_tolerance.set(10.0)
 
-step = 0
+#model.set_top_level(0)
+
+logger = TimeLogger(mg.levels[model.top_level],
+        pvd_directory='forward',pvd_base='greenland')
+model.register_post_step_hook(logger)
+
 t = cp.float32(0.0)
 t_end = cp.float32(1000.0)
 dt = cp.float32(25.0)
-level = 0
-logger = TimeLogger(mg.levels[level],pvd_directory='forward',pvd_base='greenland')
 while t < t_end:
-    print(t)
-    solver.solve(dt,start_level=level)
-    mg.levels[level].state.H_prev.data[:,:] = mg.levels[level].state.H.data[:,:]
-    #mg.state.H_prev.set(mg.levels[level].state.H.data)
+    print(f"Solving forward problem at t={t}")
+    model.forward(t,dt)
     t += dt
-    step += 1
-    logger(step,t)
 

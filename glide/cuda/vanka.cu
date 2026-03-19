@@ -658,7 +658,7 @@ void vanka_smooth(
 	mask[i * nx + j]              = masked;
     }
 }
-/*
+
 extern "C" __global__
 void vanka_smooth_adjoint(
     float* __restrict__ lambda_u_out,
@@ -667,7 +667,7 @@ void vanka_smooth_adjoint(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
-    const float* __restrict__ grounded,
+    const float* __restrict__ phi,
     const float* __restrict__ mask,
     const float* __restrict__ r_adj_u,  
     const float* __restrict__ r_adj_v,
@@ -676,11 +676,12 @@ void vanka_smooth_adjoint(
     const float* __restrict__ B,
     const float* __restrict__ beta,
     const float* __restrict__ gamma,
-    float n, float eps_reg,
-    float m, float u_reg, 
-    float water_drag, float calving_rate, float sigmoid_c,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding,
+    float calving_rate, float flotation_reg_calving,
     float dx, float dt,
-    int ny, int nx, int stride, int halo
+    int ny, int nx, int stride, int halo,
+    float ssa_damping, float mc_damping
     ) 
 {
     const int bny = 16;
@@ -720,18 +721,18 @@ void vanka_smooth_adjoint(
 	// discarded.  
 	build_5x5_vanka(J, rhs,
 		u_l, u_r, v_t, v_b, H_c,
-		u, v, H, eta_local, grounded,
+		u, v, H, eta_local, phi,
 		bed, B, beta, gamma,
-		n, eps_reg,
-		m, u_reg,
-		water_drag, calving_rate, sigmoid_c,
+		n, eps_reg, flotation_reg_driving,
+		m, u_reg, water_drag, flotation_reg_sliding, 
+		calving_rate, flotation_reg_calving,
 		dx, dt, ny, nx, i, j, bi, bj);
 
-	J[0]  -= 0.1f;
-        J[6]  -= 0.1f;
-        J[12] -= 0.1f;
-        J[18] -= 0.1f;
-        J[24] += 1.0f;
+	J[0]  -= ssa_damping;
+        J[6]  -= ssa_damping;
+        J[12] -= ssa_damping;
+        J[18] -= ssa_damping;
+        J[24] += mc_damping;
 
         rhs[0] = get_vfacet(r_adj_u, i, j, ny, nx);
         rhs[1] = get_vfacet(r_adj_u, i, j+1, ny, nx);
@@ -794,7 +795,7 @@ void vanka_smooth_adjoint(
 	atomicAdd(&lambda_H_out[i * nx + j],                 delta_lambda[4]);
     }
 }
-*/
+
 
 extern "C" __global__
 void vanka_dump(

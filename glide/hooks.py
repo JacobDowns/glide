@@ -30,20 +30,41 @@ class VankaLogger:
             self.writer.write_pvd()
 
 class TimeLogger:
-    def __init__(self,grid, pvd_directory=None,pvd_base='forward'):
+    def __init__(self, grid, pvd_directory=None, pvd_base='forward'):
+        self.i = 0
         self.writer = None
         if pvd_directory is not None:
             self.writer = VTIWriter(pvd_directory, base=pvd_base, dx=grid.dx)
         self.grid = grid
         
-    def __call__(self,i,t):
+    def __call__(self,t):
         u_c = 0.5*(self.grid.state.u.data[:,1:] 
             + self.grid.state.u.data[:,:-1])
         v_c = 0.5*(self.grid.state.v.data[1:] 
             + self.grid.state.v.data[:-1])
-        self.writer.write_step(i, t, {
+        self.writer.write_step(self.i, t, {
             'u': [u_c*(1-self.grid.state.mask.data),v_c*(1-self.grid.state.mask.data)],
             'H': self.grid.state.H.data,
             'S': self.grid.state.H.data + cp.maximum(self.grid.geometry.bed.data,-0.917*self.grid.state.H.data)}
         )
         self.writer.write_pvd()
+        self.i += 1
+
+class InverseLogger:
+    def __init__(self, grid, pvd_directory=None, pvd_base='inverse'):
+        self.writer = None
+        if pvd_directory is not None:
+            self.writer = VTIWriter(pvd_directory, base=pvd_base, dx=grid.dx)
+        self.grid = grid
+        
+    def __call__(self,i):
+        u_c = 0.5*(self.grid.state.u.data[:,1:] 
+            + self.grid.state.u.data[:,:-1])
+        v_c = 0.5*(self.grid.state.v.data[1:] 
+            + self.grid.state.v.data[:-1])
+        self.writer.write_step(i, i, {
+            'u': [u_c*(1-self.grid.state.mask.data),v_c*(1-self.grid.state.mask.data)],
+            'beta': self.grid.sliding.beta.data}
+        )
+        self.writer.write_pvd()
+

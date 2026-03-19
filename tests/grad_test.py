@@ -1,47 +1,19 @@
-"""
-Greenland forward simulation example.
-
-Run interactively or execute as a script. Modify the paths and parameters
-below to match your setup.
-"""
-
 import cupy as cp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from glide import IcePhysics
-from glide.io import VTIWriter, write_vti
+from glide.grid import Grid
+from glide.multigrid import Multigrid, FASCDSolver, FASAdjointSolver
 
-from glide.solver import restrict_frozen_fields_to_hierarchy
+L = 20000.0
+dt = cp.float32(1.0)
 
-# =============================================================================
-# Configuration - modify these paths and parameters
-# =============================================================================
-
-N_LEVELS = 6       # Multigrid levels
-N_VCYCLES = 20
-L = 40000
-EXP = 'C'
-
-# Physical constants
-RHO_ICE = 917.0
-G = 9.81
-N_GLEN = 3.0
-
-# =============================================================================
-# Configure Domain
-# =============================================================================
-
-base_res = 128
-
-y_factr = 3
-x_factr = 3
+base_res = 64
+y_factr = 7
+x_factr = 7
 
 ny = base_res*y_factr
 nx = base_res*x_factr
-
-y_slice = int((y_factr//2  +  1./4) * base_res)
-x_slice = slice(x_factr//2*base_res,(x_factr//2 + 1)*base_res,1)
 
 x = cp.linspace(0,x_factr*L,nx,dtype=cp.float32)
 y = cp.linspace(0,y_factr*L,ny,dtype=cp.float32)
@@ -49,65 +21,80 @@ dx = (x[1] - x[0]).item()
 
 X,Y = cp.meshgrid(x,y)
 
-srf = 1000.0 * cp.ones((ny,nx),dtype=cp.float32) - cp.tan(cp.deg2rad(0.1))*X + 1000
+srf = 1000.0 * cp.ones((ny,nx),dtype=cp.float32) - cp.tan(cp.deg2rad(0.1))*X + 10000
 bed = srf - 1000 
 thk = srf - bed
 
-if EXP == 'C':
-    beta = (1000*cp.sin(2*cp.pi*X/L)*cp.sin(2*cp.pi*Y/L) + 1000)/(RHO_ICE*G)
-elif EXP == 'D':
-    beta = (1000*cp.sin(2*cp.pi*X/L) + 1000)/(RHO_ICE*G)
-else:
-    raise NotImplementedError('Only support ISMIP-HOM C and D for now')
+rho_i = cp.float32(917.0)
+g = cp.float32(9.81)
+beta = (1000*cp.sin(2*cp.pi*X/L)*cp.sin(2*cp.pi*Y/L) + 1000)/(rho_i * g)
 
-smb = cp.zeros_like(thk)
-beta*=5
+B = cp.ones((ny,nx),dtype=cp.float32)
+B.fill((1e-16 ** -(1./3))/(rho_i * g))
 
-# Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
-B_scalar = cp.float32(1e-16 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
-B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
+mg = Multigrid(6,ny=ny,nx=nx,dx=dx)
+grid = mg.levels[0]
 
-# =============================================================================
-# Initialize physics
-# =============================================================================
+mg.geometry.bed.set(bed)
+mg.rheology.B.set(B)
+mg.sliding.beta.set(beta)
+mg.sliding.m.set(1.0)
+mg.sliding.u_reg.set(1.0)
+mg.state.H.set(thk)
+mg.state.H_prev.set(thk)
 
-print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS,m=1./3.)
-physics.set_geometry(bed, thk)
-physics.set_parameters(B=B, beta=beta, smb=smb)
 
-#physics.set_grid_level(2)
-# Access the grid hierarchy
-grid = physics.grid
+### Initialize solver
+solver = FASCDSolver(mg)
 
-# Forward solve
-u, v, H = physics.forward(dt=0.01, n_vcycles=N_VCYCLES, verbose=True,update_geometry=False)
+solver.vanka_options.omega.set(0.5)
+solver.vanka_options.newton_options.relaxation.set(0.5)
+solver.vanka_options.newton_options.steps.set(30)
 
-u_obs = cp.array(u)
-v_obs = cp.array(v)
+solver.fas_options.coarsest_steps.set(200)
+solver.fas_options.pre_steps.set(10)
+solver.fas_options.post_steps.set(50)
+solver.fas_options.finest_steps.set(150)
+solver.fas_options.maximum_vcycles.set(10)
+solver.fas_options.relative_tolerance.set(1e-3)
+solver.fas_options.absolute_tolerance.set(0.1)
 
-beta = cp.ones_like(grid.beta)*grid.beta.mean()
+solver.solve(dt)
 
-u_init = cp.array(u)
-v_init = cp.array(v)
-H_init = cp.array(H)
+u_obs = cp.array(grid.state.u.data)
+v_obs = cp.array(grid.state.v.data)
 
-physics.set_parameters(beta=beta)
-u, v, H = physics.forward(dt=0.01, n_vcycles=N_VCYCLES, verbose=True,update_geometry=False)
+mg.sliding.beta.set(cp.ones_like(beta)*beta.mean())
+solver.solve(dt)
 
-#J_0 = 0.5*((u - u_obs)**2).sum() + 0.5*((v - v_obs)**2).sum()
+u = cp.array(grid.state.u.data)
+v = cp.array(grid.state.v.data)
+H = cp.array(grid.state.H.data)
+
 J_0 = (abs(u - u_obs)).sum() + (abs(v - v_obs)).sum()
 
 dJdu = cp.sign(u - u_obs)
 dJdv = cp.sign(v - v_obs)
-dJdH = cp.zeros_like(H)
-physics.adjoint(dJdu,dJdv,dJdH,n_vcycles=10)
-grad_beta = grid.compute_grad_beta()
 
-v = cp.random.randn(*grad_beta.shape,dtype=cp.float32)
+grid.adjoint_operators.f_u[:,:] = -dJdu
+grid.adjoint_operators.f_v[:,:] = -dJdv
+
+adjoint_solver = FASAdjointSolver(mg)
+adjoint_solver.fas_options.coarsest_steps.set(200)
+adjoint_solver.fas_options.pre_steps.set(10)
+adjoint_solver.fas_options.post_steps.set(50)
+adjoint_solver.fas_options.finest_steps.set(150)
+adjoint_solver.fas_options.maximum_vcycles.set(10)
+adjoint_solver.fas_options.absolute_tolerance.set(cp.float32(0.1))
+adjoint_solver.fas_options.relative_tolerance.set(cp.float32(1e-3))
+adjoint_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(0.1))
+adjoint_solver.vanka_options.omega.set(cp.float32(0.5))
+adjoint_solver.solve(dt)
+
+grid.adjoint_operators.compute_gradient_beta()
+
+beta_pert = cp.random.randn(*grid.sliding.beta.data.shape,dtype=cp.float32)
 """
-#v = cp.zeros_like(grad_beta, dtype=cp.float32)
-
 n_comp = 5
 kmin, kmax = 1, 3  # integer modes in [1,3]
 
@@ -122,33 +109,33 @@ for _ in range(n_comp):
 v /= cp.sqrt(cp.float32(n_comp))
 v -= v.mean()
 v /= cp.sqrt((v*v).mean() + 1e-30).astype(cp.float32)
-"""        
 #v = cp.zeros(grad_beta.shape,dtype=cp.float32)
 #v[24,18] = 1.0
-eps = cp.float32(1e-2)
-grid.beta[:] += v*eps
+"""
+eps = cp.float32(1e-3)
+beta_0 = cp.array(grid.sliding.beta.data)
+grid.sliding.beta.data[:,:] = beta_0 + eps*beta_pert
 
-grid.u[:] = u_init
-grid.v[:] = v_init
-grid.H[:] = H_init
+grid.state.u.data[:,:] = u
+grid.state.v.data[:,:] = v
+grid.state.H.data[:,:] = H
 
-u1, v1, H1 = physics.forward(dt=0.01, n_vcycles=N_VCYCLES, verbose=True,update_geometry=False)
-#J_1 = 0.5*((u1 - u_obs)**2).sum() + 0.5*((v1 - v_obs)**2).sum()
-J_1 = (abs(u1 - u_obs)).sum() + (abs(v1 - v_obs)).sum()
+solver.solve(dt)
+J_1 = (abs(grid.state.u.data[:,:] - u_obs)).sum() + (abs(grid.state.v.data[:,:] - v_obs)).sum()
 
-grid.beta[:] -= 2*v*eps
+grid.sliding.beta.data[:,:] = beta_0 - eps*beta_pert
 
-grid.u[:] = u_init
-grid.v[:] = v_init
-grid.H[:] = H_init
+grid.state.u.data[:,:] = u
+grid.state.v.data[:,:] = v
+grid.state.H.data[:,:] = H
 
-u0, v0, H0 = physics.forward(dt=0.01, n_vcycles=N_VCYCLES, verbose=True,update_geometry=False)
-#J_1 = 0.5*((u1 - u_obs)**2).sum() + 0.5*((v1 - v_obs)**2).sum()
-J_0 = (abs(u0 - u_obs)).sum() + (abs(v0 - v_obs)).sum()
+solver.solve(dt)
+J_0 = (abs(grid.state.u.data[:,:] - u_obs)).sum() + (abs(grid.state.v.data[:,:] - v_obs)).sum()
 
 gvp_fd = (J_1 - J_0)/(2*eps)
-gvp_ad = (grad_beta*v).sum()
+gvp_ad = (grid.sliding.beta.grad*beta_pert).sum()
 
 rel_err = abs(gvp_fd - gvp_ad)/abs(gvp_ad)
+print(f"FD: {gvp_fd}, Adj: {gvp_ad}, Rel. Err.: {rel_err}")
 assert rel_err < 5e-2
 

@@ -65,7 +65,7 @@ mg.calving.calving_rate.set(2000.0)
 
 ### Initialize forcing
 smb = dataset.smb.values
-smb += -1.0
+#smb += -1.0
 mg.forcing.smb.set(smb)
 
 ### Set multigrid solver parameters ###
@@ -110,3 +110,8 @@ while t < t_end:
     zarr_writer.append(mg[0],time=t)
 
 zarr_writer.consolidate_metadata()
+
+# If you want a netcdf of the simulation, do this:
+import xarray as xr
+sim_ds = xr.load_dataset('forward/example_run.zarr')
+sim_ds.to_netcdf('forward/example_run.nc')

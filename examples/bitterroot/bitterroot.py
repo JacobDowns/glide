@@ -89,7 +89,7 @@ model.forward_solver.fas_options.set(
 
 
 # Examples of different writing utilities - First writes to vti/pvd
-vti_writer = VTIWriter('forward/vti/', base='greenland', dx=mg[0].dx,
+vti_writer = VTIWriter('forward/vti/', base='bitterroot', dx=mg[0].dx,
         static_fields={'bed':mg[0].geometry.bed,
                        'beta':mg[0].sliding.beta,},
         dynamic_fields={'H':mg[0].state.H,

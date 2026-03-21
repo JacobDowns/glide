@@ -8,11 +8,10 @@ import cupy as cp
 import numpy as np
 import pyproj
 
-from glide.io import VTIWriter, write_vti
-from glide.data import load_greenland_preprocessed
+from scipy.ndimage import gaussian_filter
 
 from glide.model import IceDynamics
-from scipy.ndimage import gaussian_filter
+from glide.data import load_greenland_preprocessed
 from glide.io import ZarrWriter, VTIWriter
 
 ### Load a dataset (here a preprocessed greenland dataset)
@@ -84,6 +83,7 @@ vti_writer = VTIWriter('forward/vti/', base='greenland', dx=mg[0].dx,
                         'U':[mg[0].state.u, mg[0].state.v],
                         'mask':mg[0].state.mask,}
         )
+vti_writer.initialize(mg[0])
 
 # Second writes to zarr archive, which can be converted to netcdf via xarray
 zarr_writer = ZarrWriter('forward/example_run.zarr',
@@ -96,7 +96,8 @@ zarr_writer = ZarrWriter('forward/example_run.zarr',
         )
            
 zarr_writer.initialize(mg[0],overwrite=True)
-vti_writer.initialize(mg[0])
+
+# Run simulation
 t = cp.float32(0.0)
 t_end = cp.float32(1000.0)
 dt = cp.float32(25.0)
@@ -105,13 +106,15 @@ while t < t_end:
     model.forward(t,dt)
     t += dt
 
+    # Write
     vti_writer.append(mg[0],time=t)
     vti_writer.write_pvd()
     zarr_writer.append(mg[0],time=t)
 
+# Finalize zarr for fast xarray reading
 zarr_writer.consolidate_metadata()
 
-# If you want a netcdf of the simulation, do this:
-import xarray as xr
-sim_ds = xr.load_dataset('forward/example_run.zarr')
-sim_ds.to_netcdf('forward/example_run.nc')
+# If you want a netcdf of the simulation, uncomment:
+#import xarray as xr
+#sim_ds = xr.load_dataset('forward/example_run.zarr')
+#sim_ds.to_netcdf('forward/example_run.nc')

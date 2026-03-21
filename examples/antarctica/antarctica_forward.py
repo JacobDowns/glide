@@ -1,144 +1,132 @@
 """
-Greenland forward simulation example.
+Antarctica forward simulation example.
 
 Run interactively or execute as a script. Modify the paths and parameters
 below to match your setup.
 """
-import xarray as xr
-import pickle
 import cupy as cp
 import numpy as np
+import pyproj
 
-from glide import IcePhysics
-from glide.io import VTIWriter, write_vti
-from glide.data import (
-    load_bedmachine,
-    load_smb_racmo,
-    prepare_grid,
-    interpolate_to_grid,
-    load_antarctica_preprocessed
-)
+from scipy.ndimage import gaussian_filter
 
-# =============================================================================
-# Configuration - modify these paths and parameters
-# =============================================================================
+from glide.model import IceDynamics
+from glide.data import load_antarctica_preprocessed
+from glide.io import ZarrWriter, VTIWriter
 
-OUTPUT_DIR = "./output"
-
-SKIP = 4           # Geometry downsampling factor
-DT = 20.0          # Time step (years)
-N_STEPS = 20     # Number of time steps
-N_LEVELS = 5       # Multigrid levels
-N_VCYCLES = 10      # V-cycles per time step
-
-# Physical constants
-RHO_ICE = 917.0
-G = 9.81
-N_GLEN = 3.0
-
-# =============================================================================
-# Load data - From source files
-# =============================================================================
-
-"""
-GEOMETRY_PATH = "./data/BedMachineAntarctica-v3.nc"
-SMB_PATH = "./data/smbgl_monthlyS_ANT11_RACMO2.4p1_ERA5_197901_202312.nc"
-BETA_PATH = "./inverse_output/beta_level_0.p"
-
-print("Loading geometry...")
-geometry = load_bedmachine(GEOMETRY_PATH, skip=SKIP, thklim=0.1,bbox_pad=[1100,1000,1600,1600])
-geometry = prepare_grid(geometry, n_levels=N_LEVELS)
-
-bed = geometry['bed']
-thickness = geometry['thickness']
-surface = geometry['surface']
-ny, nx = geometry['ny'], geometry['nx']
-dx = geometry['dx']
-x, y = geometry['x'], geometry['y']
-
-print(f"Grid: {ny} x {nx}, dx = {dx:.1f} m")
-
-print("Loading SMB...")
-smb = load_smb_racmo(SMB_PATH,x,y)
-
-print("Loading beta...")
-beta = cp.array(pickle.load(open(BETA_PATH, 'rb')))
-"""
-# =============================================================================
-# Load data - From prepackaged
-# =============================================================================
-
+### Load a dataset (here a preprocessed greenland dataset)
 dataset = load_antarctica_preprocessed()
-ny,nx = dataset.ny,dataset.nx
-dx = dataset.dx
-bed = dataset.bed.values
-surface = dataset.surface.values
-thickness = dataset.thickness.values
-beta = dataset.beta.values
+
+### Initialize grid
+# ny and nx must both divide by 2^(n_levels - 1) cleanly!
+ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
+model = IceDynamics(n_levels=6,ny=ny,nx=nx,dx=dx,
+        x0=dataset.x[0].item(),y0=dataset.y[0].item(),
+        crs=pyproj.CRS("EPSG:3031"))
+mg = model.mg
+
+### Initialize state
+thk = gaussian_filter(dataset.thickness.values,1)
+mg.state.H.set(thk)
+mg.state.H_prev.set(thk)
+
+### Initialize geometry
+bed = gaussian_filter(dataset.bed.values,1)
+mg.geometry.bed.set(bed)
+mg.geometry.flotation_reg_driving.set(0.1)
+
+### Initialize rheology
+# Compute B (rate factor - we measure driving stress in units of head, 
+# so the rho g factor gets subsumed into definitions of beta and B!)
+B = cp.zeros((ny,nx), dtype=cp.float32)
+B.fill(1e-17 ** (-1.0 / 3.0) / (917 * 9.81)) 
+mg.rheology.B.set(B)
+mg.rheology.eps_reg.set(1e-6)
+mg.rheology.n.set(3.0)
+
+### Initialize sliding
+#BETA_PATH = None
+BETA_PATH = "./inverse/level_0/beta_opt.nc"
+if BETA_PATH:
+    import xarray as xr
+    beta = cp.array(xr.load_dataarray(BETA_PATH))
+else:
+    beta = cp.zeros((ny,nx), dtype=cp.float32)
+    beta.fill(2.5)
+
+mg.sliding.beta.set(beta)
+mg.sliding.m.set(1./3.)
+mg.sliding.u_reg.set(1.0)
+mg.sliding.water_drag.set(1e-5)
+
+### Initialize calving
+# Specifies calving velocity for a non-conservative
+# calving flux over facets between adjacent floating cells
+mg.calving.calving_rate.set(0.0) 
+
+### Initialize forcing
 smb = dataset.smb.values
 
-BETA_PATH = "./inverse_output/beta_level_0.p"
-beta = cp.array(pickle.load(open(BETA_PATH, 'rb')))
-# =============================================================================
-# Initialize physics
-# =============================================================================
+# We specify the calving front by imposing a strong melt rate on open water.
+smb[dataset.surface.values==0] = -50.0
 
-# Emulate fixed calving front
-smb[surface == 0] = -50.0
-#beta[beta>2.5] = 2.5
-#beta.fill(2.5)
+# Subshelf melting - fixed over areas that are floating at t=0 (phi < 0.5)
+mg[0].forward_operators.compute_phi()
+smb[mg[0].state.phi.data.get()<0.5] -= 0.5
 
+mg.forcing.smb.set(smb)
 
-# Compute B (rate factor - we measure driving stress in units of head, so the rho g factor gets subsumed into definitions of beta and B!)
-B_scalar = cp.float32(1e-17 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
-B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
+### Set multigrid solver parameters ###
+model.forward_solver.fas_options.set(
+        coarsest_steps=200, pre_steps=10, 
+        post_steps=150, finest_steps=0,
+        relative_tolerance=1e-2, absolute_tolerance=10.0,
+        report_norms=True)
 
-print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
-        thklim=0.1,
-        n=3.0,eps_reg=1e-5,
-        m=1.0/3.,u_reg=10.0**2,
-        water_drag=1e-5,
-        calving_rate=0.0,sigmoid_c=0.1)
-physics.set_geometry(bed, thickness)
-physics.set_parameters(B=B, beta=beta, smb=smb)
+# Antarctica likes it if we damp the transition between floating and grounded
+model.forward_solver.vanka_options.relax_phi.set(cp.float32(0.5))
 
-# Access the grid hierarchy
-grid = physics.grid
-grid.compute_grounded()
-smb[grid.grounded.get()<0.1] -= 0.25
-physics.set_parameters(smb=smb)
+# Examples of different writing utilities - First writes to vti/pvd
+vti_writer = VTIWriter('forward/vti/', base='antarctica', dx=mg[0].dx,
+        static_fields={'bed':mg[0].geometry.bed,
+                       'beta':mg[0].sliding.beta,},
+        dynamic_fields={'H':mg[0].state.H,
+                        'U':[mg[0].state.u, mg[0].state.v],
+                        'mask':mg[0].state.mask,
+                        'phi':mg[0].state.phi}
+        )
+vti_writer.initialize(mg[0])
 
-# =============================================================================
-# Set up output
-# =============================================================================
+# Second writes to zarr archive, which can be converted to netcdf via xarray
+zarr_writer = ZarrWriter('forward/example_run.zarr',
+        static_fields={'bed':mg[0].geometry.bed,
+                       'beta':mg[0].sliding.beta,},
+        dynamic_fields={'H':mg[0].state.H,
+                        'u':mg[0].state.u,
+                        'v':mg[0].state.v,
+                        'mask':mg[0].state.mask,}
+        )
+           
+zarr_writer.initialize(mg[0],overwrite=True)
 
-writer = VTIWriter(OUTPUT_DIR, base="antarctica", dx=grid.dx)
-write_vti(f"{OUTPUT_DIR}/bed.vti", {'bed': grid.bed}, grid.dx)
+# Run simulation
+t = cp.float32(0.0)
+t_end = cp.float32(1000.0)
+dt = cp.float32(20.0)
+while t < t_end:
+    print(f"Solving forward problem at t={t} with dt={dt:.2f}")
+    model.forward(t,dt)
+    t += dt
 
-# =============================================================================
-# Time stepping
-# =============================================================================
+    # Write
+    vti_writer.append(mg[0],time=t)
+    vti_writer.write_pvd()
+    zarr_writer.append(mg[0],time=t)
 
-print(f"Running {N_STEPS} time steps of {DT} years...")
-t = 0.0
+# Finalize zarr for fast xarray reading
+zarr_writer.consolidate_metadata()
 
-for step in range(N_STEPS):
-    print(f"Step {step}: t = {t:.1f} yr, H_mean = {float(grid.H.mean()):.1f} m")
-
-    # Forward solve
-    u, v, H = physics.forward(dt=DT, n_vcycles=N_VCYCLES, verbose=True, rtol=1e-3,atol=10.0)
-    t += DT
-
-    # Output
-    u_c, v_c = physics.get_velocities_cell_centered()
-    surface = physics.get_surface()
-
-    writer.write_step(step, t, {
-        'thk': H,
-        'srf': surface,
-        'vel': [u_c*(1-grid.mask), v_c*(1-grid.mask)]
-    })
-    writer.write_pvd()
-
-print("Done!")
+# If you want a netcdf of the simulation, uncomment:
+#import xarray as xr
+#sim_ds = xr.load_dataset('forward/example_run.zarr')
+#sim_ds.to_netcdf('forward/example_run.nc')

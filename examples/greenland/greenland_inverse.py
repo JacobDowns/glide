@@ -10,14 +10,12 @@ import numpy as np
 import torch
 import pyproj
 
-#from glide import IcePhysics
-from glide.io import VTIWriter, write_vti
-from glide.data import load_greenland_preprocessed
+from scipy.ndimage import gaussian_filter
 
 from glide.model import IceDynamics
-from scipy.ndimage import gaussian_filter
-from glide.hooks import InverseLogger
+from glide.data import load_greenland_preprocessed
 from glide.torch import GlideStep
+from glide.io import VTIWriter
 
 ### Load a dataset (here a preprocessed greenland dataset)
 dataset = load_greenland_preprocessed()
@@ -91,7 +89,6 @@ model.adjoint_solver.fas_options.set(
         report_norms=False)                               # adjoint var is small 
                                                           # in magnitude
 
-
 # Thin Pytorch wrapper of a single glide time step
 glide_step = GlideStep.apply
 
@@ -122,6 +119,7 @@ for level in range(coarsest_level,-1,-1):
     # Standard torch optimization loop (RMSprop works very well here)
     optimizer = torch.optim.RMSprop([log_beta],lr=1e-2)
     
+    # Initialize writer
     vti_writer = VTIWriter(f'inverse/level_{level}/vti', base='greenland', dx=mg[level].dx,
             static_fields={'U_obs':[u_obs,v_obs]},
             dynamic_fields={'beta':mg[level].sliding.beta,

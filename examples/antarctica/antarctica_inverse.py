@@ -5,225 +5,183 @@ Infers basal friction (beta) from observed surface velocities using
 adjoint-based optimization. Run interactively or as a script.
 """
 
-import pickle
 import cupy as cp
 import numpy as np
-from scipy.optimize import fmin_l_bfgs_b
+import torch
+import pyproj
 
-from glide import IcePhysics
-from glide.io import VTIWriter, write_vti
-from glide.physics import abs_loss, huber_loss, tikhonov_regularization
-from glide.data import (
-    load_bedmachine,
-    load_velocity_mosaic,
-    load_smb_racmo,
-    prepare_grid,
-    interpolate_to_grid,
-    load_antarctic_velocity,
-    load_antarctica_preprocessed
-)
-from glide.kernels import restrict_vfacet, restrict_hfacet, prolongate_cell_centered, get_kernels
-from glide.solver import restrict_parameters_to_hierarchy,restrict_solution_to_hierarchy
-#from glide.kernels import prolongate_cell_centered
+from scipy.ndimage import gaussian_filter
 
-# =============================================================================
-# Configuration - modify these paths and parameters
-# =============================================================================
+from glide.model import IceDynamics
+from glide.data import load_antarctica_preprocessed
+from glide.torch import GlideStep
+from glide.io import VTIWriter
 
-OUTPUT_DIR = "./inverse_output"
-
-SKIP = 4              # Geometry downsampling factor
-DT = 1.0             # Time step (years)
-N_LEVELS = 5          # Multigrid levels
-
-# Physical constants
-RHO_ICE = 917.0
-G = 9.81
-N_GLEN = 3.0
-
-
-REG_WEIGHT = 1e-4     # Tikhonov regularization weight
-# =============================================================================
-# Load data
-# =============================================================================
-
-"""
-GEOMETRY_PATH = "./data/BedMachineAntarctica-v3.nc"
-SMB_PATH = "./data/smbgl_monthlyS_ANT11_RACMO2.4p1_ERA5_197901_202312.nc"
-U_OBS_PATH = "./data/antarctica_ice_velocity_450m_v2.nc"
-
-print("Loading geometry...")
-geometry = load_bedmachine(GEOMETRY_PATH, skip=SKIP, thklim=0.1,bbox_pad=[1100,1000,1600,1600])
-geometry = prepare_grid(geometry, n_levels=N_LEVELS)
-
-ny, nx = geometry['ny'], geometry['nx']
-dx = geometry['dx']
-x, y = geometry['x'], geometry['y']
-
-print(f"Grid: {ny} x {nx}, dx = {dx:.1f} m")
-
-print("Loading observed velocities...")
-x_vel,y_vel,vx,vy = load_antarctic_velocity(U_OBS_PATH)
-
-u_obs_cell = interpolate_to_grid(vx, x_vel, y_vel, x, y)
-v_obs_cell = interpolate_to_grid(vy, x_vel, y_vel, x, y)
-
-
-# Interpolate to faces
-u_obs = cp.zeros((ny, nx + 1), dtype=cp.float32)
-u_obs[:, 1:-1] = (u_obs_cell[:, 1:] + u_obs_cell[:, :-1]) / 2.0
-v_obs = cp.zeros((ny + 1, nx), dtype=cp.float32)
-v_obs[1:-1] = (v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0
-
-smb = load_smb_racmo(SMB_PATH,x,y)
-"""
-# =============================================================================
-# Load data - From prepackaged
-# =============================================================================
-
+### Load a dataset (here a preprocessed greenland dataset)
 dataset = load_antarctica_preprocessed()
-ny,nx = dataset.ny,dataset.nx
-dx = dataset.dx
-bed = dataset.bed.values
-beta = dataset.beta.values
+
+### Initialize grid
+# ny and nx must both divide by 2^(n_levels - 1) cleanly!
+n_levels = 6
+ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
+model = IceDynamics(n_levels=n_levels,ny=ny,nx=nx,dx=dx,
+        x0=dataset.x[0].item(),y0=dataset.y[0].item(),
+        crs=pyproj.CRS("EPSG:3031"))
+mg = model.mg
+
+grid = mg.levels[0]
+dt = cp.float32(10.0)
+
+### Initialize state
+thk = gaussian_filter(dataset.thickness.values,1)
+mg.state.H.set(thk)
+mg.state.H_prev.set(thk)
+
+### Initialize geometry
+bed = gaussian_filter(dataset.bed.values,1)
+mg.geometry.bed.set(bed)
+mg.geometry.flotation_reg_driving.set(0.1)
+
+### Initialize rheology
+B = cp.zeros((ny,nx), dtype=cp.float32)
+B.fill(1e-17 ** (-1.0 / 3.0) / (917 * 9.81)) 
+mg.rheology.B.set(B)
+mg.rheology.eps_reg.set(1e-6)
+mg.rheology.n.set(3.0)
+
+### Initialize sliding
+beta = cp.zeros((ny,nx), dtype=cp.float32)
 beta.fill(1.0)
-surface = dataset.surface.values
-thickness = dataset.thickness.values
+
+mg.sliding.beta.set(beta)
+mg.sliding.m.set(1./3.)
+mg.sliding.water_drag.set(1e-5)
+
+### Initialize calving
+mg.calving.calving_rate.set(0.0)
+
+### Initialize forcing
 smb = dataset.smb.values
-smb[surface == 0] = -40.0
+smb[dataset.surface.values==0] = -20.0
+mg.forcing.smb.set(smb)
 
-u_obs_cell = dataset.vx.values
-v_obs_cell = dataset.vy.values
-
-# Interpolate to faces
-u_obs = cp.zeros((ny, nx + 1), dtype=cp.float32)
-u_obs[:, 1:-1] = cp.array((u_obs_cell[:, 1:] + u_obs_cell[:, :-1]) / 2.0)
+### Load velocity data ###
+u_obs = cp.array(dataset.vx.values,dtype=cp.float32)
 u_obs[cp.isnan(u_obs)] = 0.0
-v_obs = cp.zeros((ny + 1, nx), dtype=cp.float32)
-v_obs[1:-1] = cp.array((v_obs_cell[1:] + v_obs_cell[:-1]) / 2.0)
+v_obs = cp.array(dataset.vy.values,dtype=cp.float32)
 v_obs[cp.isnan(v_obs)] = 0.0
 
-# =============================================================================
-# Initialize physics
-# =============================================================================
+# Build hierarchy of observations
+observation_levels = [(u_obs,v_obs)]
+for j in range(1,n_levels):
+    u_obs_coarse = mg.restrict_cell(observation_levels[-1][0])
+    v_obs_coarse = mg.restrict_cell(observation_levels[-1][1])
+    observation_levels.append((u_obs_coarse,v_obs_coarse))
 
-# Compute B (rate factor)
-B_scalar = cp.float32(1e-17 ** (-1.0 / N_GLEN) / (RHO_ICE * G))
-B = B_scalar * cp.ones((ny, nx), dtype=cp.float32)
+### Set multigrid solver parameters ###
+model.forward_solver.fas_options.set(
+        coarsest_steps=200, pre_steps=10, 
+        post_steps=150, finest_steps=0,
+        relative_tolerance=1e-2, absolute_tolerance=10.0,
+        report_norms=True)
 
-print("Initializing physics...")
-physics = IcePhysics(ny, nx, dx, n_levels=N_LEVELS, 
-        thklim=0.1,
-        n=3.0,eps_reg=1e-5,
-        m=1./3.,u_reg=10.0**2,
-        water_drag=1e-5,
-        calving_rate=0.0,sigmoid_c=0.1)
-
-physics.set_geometry(bed, thickness)
-physics.set_parameters(B=B, beta=beta, smb=smb)
-
-grid = physics.grid
-kernels = get_kernels()
-
-# =============================================================================
-# Build observation hierarchy for multi-resolution optimization
-# =============================================================================
-
-    # Forward solve
-
-restrict_solution_to_hierarchy(grid)
-
-obs_hierarchy = [(u_obs, v_obs)]
-current_u, current_v = u_obs, v_obs
-g = grid
-while g.child is not None:
-    current_u = restrict_vfacet(current_u, kernels)
-    current_v = restrict_hfacet(current_v, kernels)
-    obs_hierarchy.append((current_u, current_v))
-    g = g.child
+model.forward_solver.vanka_options.newton_options.ssa_damping.set(cp.float32(0.001))
 
 
-for level_idx in [4,4,3,2,1,0]:
-    physics.set_grid_level(level_idx)
-    current_grid = physics.grid
-    u_obs_level, v_obs_level = obs_hierarchy[level_idx]
+model.adjoint_solver.fas_options.set(
+        coarsest_steps=200, pre_steps=10,
+        post_steps=150, finest_steps=0,
+        relative_tolerance=1e-2, absolute_tolerance=1e-5, # Note that adjoint var
+        report_norms=True)                               # adjoint var is small 
+                                                          # in magnitude
 
-    writer = VTIWriter(
-        f"{OUTPUT_DIR}/level_{level_idx}",
-        base="inverse",
-        dx=float(current_grid.dx)
-    )
+# Thin Pytorch wrapper of a single glide time step
+glide_step = GlideStep.apply
 
-    # Write observations
-    u_obs_c = 0.5 * (u_obs_level[:, 1:] + u_obs_level[:, :-1])
-    v_obs_c = 0.5 * (v_obs_level[1:] + v_obs_level[:-1])
-    write_vti(
-        f"{OUTPUT_DIR}/level_{level_idx}/u_obs.vti",
-        {'vel': [u_obs_c, v_obs_c]},
-        float(current_grid.dx)
-    )
+t = cp.float32(0.0) # Dummy time, which we don't use here
+n_level_epochs = 100
 
-    counter = [0]
-    H0 = cp.array(current_grid.H_prev)
-    for i in range(5):
-        u, v, H = physics.forward(dt=5.0, n_vcycles=10, verbose=True, rtol=1e-4)
-    uref = cp.array(u)
-    vref = cp.array(v)
-    Href = cp.array(H)
+# Index of coarsest grid to start solving inverse problem at
+coarsest_level = 5
+log_beta = torch.log(torch.tensor(mg[coarsest_level].sliding.beta.data,device='cuda'))
 
-    def objective(log_beta):
+# Solve the inverse problem at progressively coarser levels
+for level in range(coarsest_level,-1,-1):
+    # Examples of different writing utilities - First writes to vti/pvd
 
-        current_grid.beta[:] = cp.exp(log_beta)
-        restrict_parameters_to_hierarchy(current_grid)
+    # This is what we're optimizing - Convert from the initial guess, 
+    # either defined above or by prolongation from the coarser state
+    log_beta.requires_grad_()
 
-        current_grid.u.fill(0)
-        current_grid.v.fill(0)
-        current_grid.H[:] = Href
-        u, v, H = physics.forward(dt=1.0, n_vcycles=10, verbose=False,update_geometry=False,rtol=1e-3,atol=10.0)
+    # These can be differentiated wrt - but we don't in this simple problem
+    H_prev = torch.tensor(mg[level].state.H_prev.data,device='cuda')
+    bed = torch.tensor(mg[level].geometry.bed.data,device='cuda')
+    smb = torch.tensor(mg[level].forcing.smb.data,device='cuda')
 
-        # Compute loss
-        J_data, dJdu, dJdv = abs_loss(current_grid.u, current_grid.v, u_obs_level, v_obs_level,mask_threshold=0.1)
-        dJdH = cp.zeros_like(H)
+    u_obs,v_obs = (torch.as_tensor(t) for t in observation_levels[level])
+    u_mask = abs(u_obs) > 0.01
+    v_mask = abs(v_obs) > 0.01
+
+    # Standard torch optimization loop (RMSprop works very well here)
+    optimizer = torch.optim.RMSprop([log_beta],lr=1e-2)
     
-        physics.adjoint(dJdu,dJdv,dJdH,n_vcycles=1,verbose=False)
-        grad_log_beta = current_grid.beta*current_grid.grad_beta
+    # Initialize writer
+    vti_writer = VTIWriter(f'inverse/level_{level}/vti', base='antarctica', dx=mg[level].dx,
+            static_fields={'U_obs':[u_obs,v_obs]},
+            dynamic_fields={'beta':mg[level].sliding.beta,
+                            'U':[mg[level].state.u, mg[level].state.v]}
+        )
 
-        J_tikh,tikh_grad = tikhonov_regularization(log_beta,weight=cp.float32(REG_WEIGHT))
-        J = J_data + J_tikh
-        grad_log_beta += tikh_grad
+    vti_writer.initialize(mg[level])
+    for j in range(n_level_epochs):
+        optimizer.zero_grad()
 
-        print(f"Level: {level_idx} {counter},  Loss: {J:.4f}, Loss Data: {J_data:.4f}, Loss Tikh: {J_tikh:.4f}")
+        # Convert log(beta) to beta
+        beta = torch.exp(log_beta)
 
-        return float(J),grad_log_beta
+        # Predict the velocity and thickness at t + dt
+        mg.sliding.water_drag.set(1e-5)
+        u,v,H = glide_step(t,dt,model,level,H_prev,bed,beta,smb)
 
-    def callback(log_beta):
-        """Callback for visualization."""
-        counter[0] += 1
+        # Interpolation from facets (where the model predicts)
+        # to cells (where the observations are)
+        u_cell = 0.5*(u[:,1:] + u[:,:-1])
+        v_cell = 0.5*(v[1:] + v[:-1])
+        
+        # L1 Objective function, masked by valid data
+        J_data = (abs(u_cell - u_obs)*u_mask).mean() + (abs(v_cell - v_obs)*v_mask).mean()
 
-        u_c = 0.5 * (current_grid.u[:, 1:] + current_grid.u[:, :-1])
-        v_c = 0.5 * (current_grid.v[1:] + current_grid.v[:-1])
+        # Compute first differences
+        dx = mg[level].dx
+        gy = torch.diff(log_beta,dim=0)/dx
+        gx = torch.diff(log_beta,dim=1)/dx
+        
+        # Tikhonov Regularization
+        J_L2 = 1e-5*((gy**2).sum() + (gx**2).sum())*dx**2
+        
+        # TV Regularization
+        gy_ = gy[:,:-1]
+        gx_ = gx[:-1]
+        eps = 1e-6
+        J_L1 = 1e-8*(torch.sqrt(gy_**2 + gx_**2 + eps**2).sum())*dx**2
+        
+        # Combined objective - elastic net regularization
+        J = J_data + J_L1 + J_L2
 
-        writer.write_step(counter[0], counter[0], {
-            'log_beta': log_beta,
-            'vel': [u_c*(1-current_grid.mask), v_c*(1-current_grid.mask)]
-        })
-        writer.write_pvd()
+        # Backpropagate
+        mg.sliding.water_drag.set(1e-4)
+        J.backward()
 
-    log_beta = cp.log(current_grid.beta)
+        # Update parameter
+        optimizer.step()
+        
+        print(f"Level {level}, Iter. {j}/{n_level_epochs} | J: {J.item():.2f}, J_data: {J_data.item():.2f}, J_L1: {J_L1.item():.2f}, J_L2: {J_L2.item():.2f}")
+        vti_writer.append(mg[level],time=j)
+        vti_writer.write_pvd()
 
-    for i in range(50):
-        J,grad_log_beta = objective(log_beta)
-        log_beta -= 0.02*np.sign(grad_log_beta)
-        callback(log_beta)
+    if level>0:
+        log_beta = torch.tensor(mg.prolongate_cell(cp.asarray(log_beta.detach()),method='bilinear'))
 
-    current_grid.beta[:] = cp.exp(log_beta)
-    # Save result
-    pickle.dump(
-        current_grid.beta.get(),
-        open(f"{OUTPUT_DIR}/beta_level_{level_idx}.p", 'wb')
-    )
+    beta_xr = mg[level].sliding.beta.to_dataarray()
+    beta_xr.to_netcdf(f'./inverse/level_{level}/beta_opt.nc')
 
-    if level_idx > 0:
-        parent = physics.grids[level_idx - 1]
-        prolongate_cell_centered(current_grid.beta, kernels, H_fine=parent.beta,smooth=True)  
-            

@@ -46,6 +46,9 @@ inverse_results/
 *.nc
 *.tif
 *.tiff
+*.vti
+*.npz
+*.png
 data/
 
 # Pickled files

@@ -2,7 +2,10 @@ import cupy as cp
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from .closure import eval_grounded_fraction_kernel
+try:
+    from .closure import eval_grounded_fraction_kernel
+except ImportError:
+    eval_grounded_fraction_kernel = None
 
 class ForwardOperators:
     def __init__(self,grid,

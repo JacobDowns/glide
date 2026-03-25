@@ -35,6 +35,9 @@ T_REF = 223.15       # Reference temperature (K)
 T_MELT = 273.15      # Melting point at standard pressure (K)
 BETA_CC = 7.9e-8     # Clausius-Clapeyron constant (K/Pa)
 GRAVITY = 9.81       # Gravitational acceleration (m/s^2)
+K_COLD = K_I / C_I   # Diffusivity for cold ice (m^2/s)
+K_TEMP_FACTOR = 1e-5 # Temperate diffusivity reduction factor
+K_TEMP = K_COLD * K_TEMP_FACTOR
 
 
 def enthalpy_from_temperature(T, depth=0.0):
@@ -388,9 +391,25 @@ class EnthalpyOperators:
             sigma_k = float(self.sigma[k])
             depth = (1.0 - sigma_k) * H
             T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth
-            E_pmp = C_I * (T_pmp - T_REF)
             T[:, :, k] = cp.minimum(E[:, :, k] / C_I + T_REF, T_pmp)
         return T
+
+    def get_water_content(self):
+        """
+        Extract water content from enthalpy.
+
+        Returns
+        -------
+        omega : cp.ndarray, shape (ny, nx, nz)
+        """
+        E = self.enthalpy_state.E
+        H = self.grid.state.H.data
+        omega = cp.zeros_like(E)
+        for k in range(self.nz):
+            sigma_k = float(self.sigma[k])
+            depth = (1.0 - sigma_k) * H
+            omega[:, :, k] = water_content_from_enthalpy(E[:, :, k], depth)
+        return omega
 
     def get_arrhenius_factor(self):
         """

@@ -41,9 +41,7 @@ $$D_w(\omega) = r_d \cdot \omega, \qquad \omega = \frac{E - E_{\text{pmp}}}{L} \
 
 where $r_d$ is a constant drainage rate (units: s$^{-1}$) passed as the `drain_rate` kernel parameter. The full source contribution to the residual is $\rho_w L \, D_w(\omega)$, and its Jacobian $\partial/\partial E(\rho_w L \, r_d \, \omega) = \rho_w \, r_d$ is nonzero only in temperate ice.
 
-This is a placeholder model. Physically motivated alternatives include:
-- Threshold drainage: $D_w = r_d \cdot \max(\omega - \omega_{\max}, 0)$, draining only excess water above a maximum porosity
-- Coupling to a basal hydrology model where drained water feeds till water storage $W_{\text{till}}$, which in turn affects basal sliding and the bed boundary condition switch
+This is a placeholder model. Physically motivated alternatives include: - Threshold drainage: $D_w = r_d \cdot \max(\omega - \omega_{\max}, 0)$, draining only excess water above a maximum porosity - Coupling to a basal hydrology model where drained water feeds till water storage $W_{\text{till}}$, which in turn affects basal sliding and the bed boundary condition switch
 
 ### Boundary conditions
 
@@ -245,13 +243,17 @@ Horizontal advection enters only in $d_k$ (frozen neighbors), preserving the tri
 
 **Surface** ($k = N_z{-}1$): $b_{N_z-1} = 1$, $a_{N_z-1} = c_{N_z-1} = 0$, $d_{N_z-1} = E_s$
 
-**Bed** ($k = 0$, cold/dry Neumann):
+**Bed** ($k = 0$, Neumann):
+
+The bed node sits at $\sigma = 0$; its control volume extends to the midpoint with the first interior node, giving a half-cell width $\Delta\sigma_{\text{half}} = \Delta\sigma_0^+/2$. The flux divergence is divided by this width to stay consistent with interior cells (which divide by $\Delta\sigma_{\text{avg}}$):
 
 $$
-b_0 = \frac{\rho_i}{\Delta t} + \frac{K_c}{h\,\Delta\sigma_0^+}, \quad c_0 = -\frac{K_c}{h\,\Delta\sigma_0^+}, \quad d_0 = \frac{\rho_i E_0^n}{\Delta t} - \rho_i[\nabla_H\cdot(\mathbf{u}E)]_0 + \phi_0 + \frac{Q_{\text{geo}} + Q_{\text{fh}}}{h}
+b_0 = \frac{\rho_i}{\Delta t} + \frac{K_{1/2}}{h^2\,\Delta\sigma_0^+\,\Delta\sigma_{\text{half}}}, \quad c_0 = -\frac{K_{1/2}}{h^2\,\Delta\sigma_0^+\,\Delta\sigma_{\text{half}}}
 $$
 
-**Bed** ($k = 0$, temperate/Dirichlet): $b_0 = 1$, $c_0 = 0$, $d_0 = E_{\text{pmp}}$
+$$
+d_0 = \frac{\rho_i E_0^n}{\Delta t} - \rho_i[\nabla_H\cdot(\mathbf{u}E)]_0 + \phi_0 + \frac{Q_{\text{geo}} + Q_{\text{fh}}}{h\,\Delta\sigma_{\text{half}}}
+$$
 
 ------------------------------------------------------------------------
 
@@ -293,7 +295,7 @@ Both `enthalpy_compute_residual` and `enthalpy_column_smooth` call the same `get
 #### Enthalpy Jacobian structs
 
 | Struct | Term | Derivatives | Momentum analogue |
-|-----------------|-----------------|-----------------|:------------------:|
+|------------------|------------------|------------------|:------------------:|
 | `ColumnDiffusionJacobian` | $-(1/h^2)\,\partial_\sigma(K\,\partial_\sigma E)$ (interior) | `d_E_km1`, `d_E_k`, `d_E_kp1` | `SigmaNormalJacobian` |
 | `BedDiffusionJacobian` | Same, Neumann BC at $k=0$ | `d_E_k`, `d_E_kp1` | — |
 | `SigmaAdvectionJacobian` | $\rho_i\,\dot\sigma\,\partial_\sigma E$ (upwind, interior) | `d_E_km1`, `d_E_k`, `d_E_kp1` | `HorizontalFluxJacobian` |
@@ -329,7 +331,7 @@ Every Jacobian struct has a corresponding `*StencilDual` and `get_*_dual()` wrap
 
 **Pattern** (identical to `flux.cu` / `stress.cu`):
 
-```
+```         
 struct ColumnDiffusionStencilDual {
     DualFloat E_km1, E_k, E_kp1;         // differentiated variables
     float E_pmp_km1, E_pmp_k, E_pmp_kp1; // frozen parameters
@@ -349,19 +351,16 @@ DualFloat get_column_diffusion_dual(ColumnDiffusionStencilDual s) {
 
 **Available dual functions:**
 
-| Function | Term |
-|---|---|
-| `get_column_diffusion_dual` | Interior vertical diffusion |
-| `get_bed_diffusion_dual` | Bed Neumann BC diffusion |
-| `get_sigma_advection_dual` | Interior upwind sigma advection |
-| `get_bed_sigma_advection_dual` | One-sided bed sigma advection |
+| Function                       | Term                             |
+|--------------------------------|----------------------------------|
+| `get_column_diffusion_dual`    | Interior vertical diffusion      |
+| `get_bed_diffusion_dual`       | Bed Neumann BC diffusion         |
+| `get_sigma_advection_dual`     | Interior upwind sigma advection  |
+| `get_bed_sigma_advection_dual` | One-sided bed sigma advection    |
 | `get_horiz_enthalpy_flux_dual` | Per-facet horizontal upwind flux |
-| `get_drainage_dual` | Water drainage source |
+| `get_drainage_dual`            | Water drainage source            |
 
-**Use cases:**
-- Matrix-free Jacobian-vector products for Krylov-accelerated smoothing or defect correction
-- Sensitivity analysis (e.g., $\partial E / \partial Q_{\text{geo}}$ by seeding through parameters)
-- Verification: compare `get_*_dual()` output against finite differences to validate the hand-coded Jacobian entries
+**Use cases:** - Matrix-free Jacobian-vector products for Krylov-accelerated smoothing or defect correction - Sensitivity analysis (e.g., $\partial E / \partial Q_{\text{geo}}$ by seeding through parameters) - Verification: compare `get_*_dual()` output against finite differences to validate the hand-coded Jacobian entries
 
 ### Python interface
 
@@ -398,44 +397,117 @@ Within each time step: 1. Solve SSA (momentum + mass conservation) via existing 
 
 ## 6. Verification Tests
 
-Tests live in `tests/` and can be run with `python tests/test_enthalpy_*.py`.
+Tests live in `tests/` and can be run with `python tests/test_enthalpy_*.py`. Corresponding plotting examples are in `examples/thermal/`.
 
-### Cold column (`test_enthalpy_cold_column.py`)
+### Cold column (`test_enthalpy_cold_column.py`, `examples/thermal/cold_column.py`)
 
-Static ice slab ($H = 1000$ m), no velocity, geothermal flux $Q_{\text{geo}} = 0.04$ W/m$^2$ at the base, surface temperature $T_s = -30°$C. The base stays cold ($T_{\text{bed}} < T_{\text{pmp}}$).
+| Parameter        | Value                 |
+|------------------|-----------------------|
+| $H$              | 1000 m                |
+| $T_s$            | 243.15 K ($-30°$C)    |
+| $Q_{\text{geo}}$ | 0.04 W/m$^2$          |
+| $N_z$            | 21 (uniform $\sigma$) |
+
+A static ice slab, no velocity, geothermal flux at the base. The base stays cold ($T_{\text{bed}} < T_{\text{pmp}}$).
 
 **Analytical steady state:** With constant diffusivity $K_c = k_i/c_i$ and no advection, the enthalpy equation reduces to $\partial_\sigma(K_c\,\partial_\sigma E) = 0$. The solution is a linear profile:
 
 $$T(\sigma) = T_s + \frac{Q_{\text{geo}} H}{k_i}(1 - \sigma)$$
 
-**What it tests:**
-- Neumann basal BC via `get_bed_diffusion_jac`
-- Vertical diffusion via `get_column_diffusion_jac`
-- Column smoother convergence (residual drops ~4 orders in one sweep)
-- Time-stepping to steady state (200 kyr, well past the ~28 kyr diffusion timescale)
+**What it tests:** - Neumann basal BC via `get_bed_diffusion_jac` (including half-cell control volume correction) - Interior vertical diffusion via `get_column_diffusion_jac` - Column smoother convergence (residual drops $\sim 10^4\times$ in one sweep) - Time-stepping to steady state (200 kyr, well past the $\sim 2.8$ kyr cold-zone diffusion timescale $\tau = H^2/(\kappa\pi^2)$ where $\kappa = k_i/(\rho_i c_i)$)
 
-**Tolerance:** $< 0.5\%$ relative error (limited by temporal convergence, not spatial discretization — the linear profile is exact on any grid).
+**Tolerance:** Relative error $< 0.5\%$. In practice achieves $\sim 10^{-7}$ because the linear profile is exact on any grid.
 
-### Stefan problem (`test_enthalpy_stefan.py`)
+### Polythermal Stefan problem (`test_enthalpy_stefan.py`, `examples/thermal/stefan.py`)
 
-Same static slab, but with $Q_{\text{geo}} = 0.50$ W/m$^2$ — high enough that the steady-state Neumann bed temperature would far exceed $T_{\text{pmp}}$. The solver must detect this and switch to the temperate-base Dirichlet BC ($E_b = E_{\text{pmp}}$).
+| Parameter        | Value                                      |
+|------------------|--------------------------------------------|
+| $H$              | 1000 m                                     |
+| $T_s$            | 223.15 K ($-50°$C)                         |
+| $Q_{\text{geo}}$ | 0.5 W/m$^2$                                |
+| $N_z$            | 41 (test) / 64 (example), uniform $\sigma$ |
+| Drainage         | $r_d = 0$ (disabled)                       |
 
-**Analytical steady state:** The bed clamps to $T_{\text{pmp}}(z=b) = T_0 - \beta\rho_i g H \approx 272.4$ K. With no drainage and no temperate layer above the bed, the cold profile is linear from $T_{\text{pmp}}$ at $\sigma = 0$ to $T_s$ at $\sigma = 1$:
+Same static slab geometry, but with $Q_{\text{geo}} \gg Q_{\text{crit}} = k_i(T_{\text{pmp,bed}} - T_s)/H \approx 0.104$ W/m$^2$. The excess geothermal flux drives a temperate basal layer where enthalpy exceeds the pressure melting point.
 
-$$T(\sigma) = T_{\text{pmp,bed}} + (T_s - T_{\text{pmp,bed}})\,\sigma$$
+**Semi-analytical steady state:** The column splits into two zones separated by a cold-temperate surface (CTS) at $\sigma^*$:
 
-**What it tests:**
-- Cold-to-temperate transition: the BC switch at $E = E_{\text{pmp}}$
-- Dirichlet basal BC enforcement
-- Correct pressure-dependent melting point $T_{\text{pmp}}(z)$
+-   **Cold zone** ($\sigma^* < \sigma < 1$): Heat flux $Q_{\text{geo}}$ is carried upward by cold diffusivity $K_c = k_i/c_i$. The enthalpy profile is linear:
 
-**Tolerance:** $< 0.5\%$ relative error. In practice converges to $\sim 10^{-7}$ because both BCs are effectively Dirichlet and the profile is linear.
+$$E(\sigma) = c_i(T_s - T_{\text{ref}}) + \frac{Q_{\text{geo}} H}{K_c}(1 - \sigma)$$
+
+-   **Temperate zone** ($0 \leq \sigma < \sigma^*$): Temperature is locked to $T_{\text{pmp}}(\sigma)$; excess energy is stored as water content. The enthalpy profile is linear with the much steeper temperate slope:
+
+$$E(\sigma) = E_{\text{cts}} + \frac{Q_{\text{geo}} H}{K_t}(\sigma^* - \sigma)$$
+
+where $K_t = \epsilon\, K_c$ ($\epsilon = 10^{-5}$). The CTS location $\sigma^*$ is where the cold profile first reaches $E_{\text{pmp}}(\sigma)$:
+
+$$\frac{Q_{\text{geo}} H (1 - \sigma^*)}{k_i} = T_{\text{pmp}}(\sigma^*) - T_s$$
+
+which is solved by Brent's method.
+
+**Three sub-tests:**
+
+1.  **`test_temperate_bed_still_applies_geothermal_flux`** — Sets $E$ uniformly above $E_{\text{pmp}}$ (no gradients), computes one residual, and checks that the bed residual equals $-Q_{\text{geo}}/(h \cdot \Delta\sigma_{\text{half}})$. Confirms the Neumann heat flux is not disabled for temperate ice.
+
+2.  **`test_temperate_bed_is_not_clamped_to_pmp`** — From a uniform temperate initial state, runs a few column sweeps and asserts $E_{\text{bed}} > E_{\text{pmp}}$. Confirms enthalpy is not hard-clamped to the pressure melting point.
+
+3.  **`test_steady_state_polythermal_profile`** — Runs the solver to steady state with adaptive time stepping (dt ramps from 100 kyr to $10^6$ kyr when converging) and verifies the final profile against the semi-analytical reference.
+
+**Tolerances:**
+
+| Metric                        | Tolerance | Typical result            |
+|-------------------------------|-----------|---------------------------|
+| Temperature error             | $< 0.1$ K | $\sim 4 \times 10^{-4}$ K |
+| Enthalpy relative error       | $< 2\%$   | $\sim 1.2\%$              |
+| Basal $\omega$ relative error | $< 2\%$   | $\sim 1.2\%$              |
+
+**Convergence note:** The temperate zone has a diffusion timescale $\tau_{\text{temp}} = (\sigma^* H)^2 / (\kappa_{\text{temp}} \pi^2)$ that is $1/\epsilon = 10^5\times$ longer than the cold zone. With fixed time stepping this would require $\sim 10^5$ steps; adaptive dt collapses this to $\sim 300$ steps by ramping toward pseudo-steady-state ($\Delta t \to \infty$).
+
+### Advection-diffusion (`test_enthalpy_advection.py`)
+
+| Parameter | Value |
+|-----------|-------|
+| $H$ | 1000 m |
+| $T_s$ | 243.15 K ($-30°$C) |
+| $Q_{\text{geo}}$ | 0.04 W/m$^2$ |
+| $N_z$ | 41 (uniform $\sigma$) |
+
+Same cold slab as the cold column test, but with prescribed vertical advection ($\dot\sigma \neq 0$). No horizontal velocity. The base stays cold so $K = K_c$ throughout.
+
+#### Constant $\dot\sigma$ (exponential solution)
+
+A spatially uniform $\dot\sigma = w < 0$ (downward) gives the steady-state ODE:
+
+$$\rho_i w \frac{dE}{d\sigma} = \frac{K_c}{h^2}\frac{d^2 E}{d\sigma^2}$$
+
+with Peclet number $\text{Pe} = \rho_i w h^2 / K_c$. The general solution is $E = A + B\exp(\text{Pe}\,\sigma)$ with constants fixed by the surface Dirichlet and bed Neumann BCs:
+
+$$B = \frac{-h\,Q_{\text{geo}}}{K_c\,\text{Pe}}, \quad A = E_s - B\exp(\text{Pe})$$
+
+The test uses $\text{Pe} = -5$. Downward advection compresses the thermal boundary layer toward the bed, reducing $T_{\text{bed}}$ from 262 K (pure diffusion) to $\sim 247$ K.
+
+#### Linear $\dot\sigma$ — Robin problem (error-function solution)
+
+Accumulation-driven flow gives $\dot\sigma(\sigma) = -(\text{SMB}/h)\,\sigma$ (zero at the bed, maximum downward at the surface). The Robin Peclet number is $\text{Pe}_R = \rho_i\,\text{SMB}\,h / K_c$. The solution involves the error function:
+
+$$E(\sigma) = E_s + \frac{h\,Q_{\text{geo}}}{K_c}\sqrt{\frac{\pi}{2\,\text{Pe}_R}} \left[\text{erf}\!\left(\sqrt{\tfrac{\text{Pe}_R}{2}}\right) - \text{erf}\!\left(\sigma\sqrt{\tfrac{\text{Pe}_R}{2}}\right)\right]$$
+
+The test uses $\text{Pe}_R = 10$ ($\text{SMB} \approx 0.36$ m/yr). This case also tests the `BedSigmaAdvection` stencil at $k=0$ where $\dot\sigma = 0$: the one-sided upwind correctly contributes nothing when there is no flow through the bed.
+
+**What they test:**
+- Sigma advection stencils (`get_sigma_advection_jac`, `get_bed_sigma_advection_jac`)
+- Advection-diffusion coupling in the column tridiagonal system
+- Correct upwind direction: downward $\dot\sigma$ upwinds from above
+- Convergence to analytical solution for both constant and depth-varying $\dot\sigma$
+
+**Tolerance:** Enthalpy relative error $< 2\%$ ($\sim 0.9\%$ constant, $\sim 0.6\%$ Robin). The discretization error is $O(\Delta\sigma)$ from the upwind scheme.
 
 ### Planned benchmarks
 
-- **Kleiner et al. (2015) Column A:** Pure diffusion in a 200 m ice column with prescribed surface temperature and geothermal flux. Tests cold/temperate transition with known analytical solution.
-- **Kleiner et al. (2015) Column B:** Same geometry with Robin-type surface BC and an imposed vertical velocity profile ($\dot\sigma$ from accumulation). Tests advection-diffusion steady state.
-- **IGM enthalpy benchmark (Jouvet et al. 2024):** 3D dome geometry with coupled velocity-enthalpy evolution.
+-   **Kleiner et al. (2015) Column A:** Pure diffusion in a 200 m ice column with prescribed surface temperature and geothermal flux. Tests cold/temperate transition with known analytical solution.
+-   **Kleiner et al. (2015) Column B:** Same geometry with Robin-type surface BC and an imposed vertical velocity profile ($\dot\sigma$ from accumulation). Tests advection-diffusion steady state.
+-   **IGM enthalpy benchmark (Jouvet et al. 2024):** 3D dome geometry with coupled velocity-enthalpy evolution.
 
 ------------------------------------------------------------------------
 

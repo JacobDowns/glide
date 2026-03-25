@@ -256,12 +256,19 @@ BedDiffusionJacobian get_bed_diffusion_jac(BedDiffusionStencil s) {
     float K_half = get_K(0.5f * (s.E_k + s.E_kp1),
                          0.5f * (s.E_pmp_k + s.E_pmp_kp1));
 
-    // Residual
-    jac.res = -s.h2_inv * K_half * (s.E_kp1 - s.E_k) / s.dsig_p
-              - (s.Q_geo + s.Q_fh) * s.h_inv;
+    // Half-cell control volume width at the bed boundary.
+    // The boundary node sits at sigma=0; the control volume extends to
+    // the midpoint with the first interior node, dsig_p/2.  Dividing
+    // the flux divergence by dsig_half keeps the bed cell consistent
+    // with the interior cells (which divide by dsig_avg).
+    float dsig_half = 0.5f * s.dsig_p;
+
+    // Residual: -(1/h^2)[K_{1/2}(E_1-E_0)/dsig_p + h(Q_geo+Q_fh)] / dsig_half
+    jac.res = (-s.h2_inv * K_half * (s.E_kp1 - s.E_k) / s.dsig_p
+               - (s.Q_geo + s.Q_fh) * s.h_inv) / dsig_half;
 
     // Jacobian (freeze K)
-    float coeff = s.h2_inv * K_half / s.dsig_p;
+    float coeff = s.h2_inv * K_half / (s.dsig_p * dsig_half);
     jac.d_E_k   =  coeff;
     jac.d_E_kp1 = -coeff;
 

@@ -58,7 +58,8 @@ def test_temperate_bed_still_applies_geothermal_flux():
 
     ops.compute_residual(dt)
     bed_residual = float(cp.asnumpy(ops.r_E[ny // 2, nx // 2, 0]))
-    expected = -Q_geo / H_ice
+    dsig_half = 0.5 * float(ops.sigma[1] - ops.sigma[0])
+    expected = -Q_geo / (H_ice * dsig_half)
 
     print("Temperate bed geothermal-flux test:")
     print(f"  Bed residual: {bed_residual:.6e}")

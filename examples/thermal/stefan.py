@@ -26,7 +26,7 @@ from scipy.optimize import brentq
 from glide.grid import Grid
 from glide.enthalpy import (
     EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC,
-    L_HEAT, K_COLD, K_TEMP
+    L_HEAT, K_COLD, K_TEMP, K_TEMP_FACTOR
 )
 
 # ========================================================
@@ -36,11 +36,16 @@ ny, nx = 4, 4
 dx = 1000.0
 H_ice = 1000.0
 T_surface = 223.15     # K (-50 C)
-Q_geo = 1.0         # W/m^2 (high — triggers temperate base)
+Q_geo = 0.5            # W/m^2 (high — triggers temperate base)
 nz = 64
-dt = 1000.0 * 365.25 * 86400.0
 n_smooth = 20
-snapshot_times_kyr = [0, 2, 10, 30, 100, 200]
+
+# Convergence parameters
+conv_tol = 1e-6         # relative enthalpy change for steady-state
+max_steps = 50000       # upper bound on total steps
+log_interval = 500      # print every N steps
+
+SEC_PER_KYR = 1000.0 * 365.25 * 86400.0
 
 # ========================================================
 # Grid and operator setup
@@ -114,169 +119,159 @@ else:
 omega_analytical[:] = np.maximum(E_analytical - E_pmp_profile, 0.0) / L_HEAT
 T_analytical[:] = np.minimum(E_analytical / C_I + T_REF, T_pmp_profile)
 
+# ========================================================
+# Print header with equilibration time estimates
+# ========================================================
+kappa_cold = K_I / (RHO_I * C_I)
+kappa_temp = kappa_cold * K_TEMP_FACTOR
+
 print(f"  Regime:           {regime}")
 print(f"  T_pmp at bed:     {T_pmp_bed:.2f} K")
 print(f"  T_surface:        {T_surface:.2f} K")
 print(f"  Q_geo:            {Q_geo:.3f} W/m^2")
 print(f"  Q_crit:           {Q_crit:.3f} W/m^2")
-print(f"  K_cold:           {K_COLD:.3e} m^2/s")
-print(f"  K_temp:           {K_TEMP:.3e} m^2/s")
+print(f"  K_cold (k/c):     {K_COLD:.3e} kg/(m*s)")
+print(f"  K_temp:           {K_TEMP:.3e} kg/(m*s)")
+print(f"  kappa_cold:       {kappa_cold:.3e} m^2/s")
+print(f"  kappa_temp:       {kappa_temp:.3e} m^2/s")
+
+tau_cold = H_ice**2 / (kappa_cold * np.pi**2)
+print(f"  Cold zone tau:    {tau_cold / SEC_PER_KYR:.1f} kyr")
 if sigma_star is not None:
+    L_temp = sigma_star * H_ice
+    tau_temp = L_temp**2 / (kappa_temp * np.pi**2)
+    print(f"  Temperate tau:    {tau_temp / (1e6 * SEC_PER_KYR):.1f} Myr")
     print(f"  Reference CTS:    sigma* = {sigma_star:.4f}")
     print(f"  Reference omega_bed: {omega_analytical[0]:.3e}")
 
 # ========================================================
-# Time stepping with snapshots
+# Time stepping with adaptive dt and convergence check
+#
+# Strategy: start with a moderate dt for the transient phase,
+# then ramp dt toward pseudo-steady-state to accelerate
+# convergence of the slow temperate zone.
 # ========================================================
 i_col, j_col = ny // 2, nx // 2
-dt_kyr = dt / (1000.0 * 365.25 * 86400.0)
 
+dt = 100.0 * SEC_PER_KYR        # initial time step
+dt_max = 1e6 * SEC_PER_KYR      # cap for pseudo-steady-state
+dt_growth = 1.5                  # dt multiplier when converging
+
+# Snapshot times (kyr) for plotting
+snapshot_times_kyr = [0, 1, 5, 20, 100]
 snapshots_E = {}
 snapshots_T = {}
 snapshots_omega = {}
 step = 0
 time_kyr = 0.0
+converged = False
 
-E_init = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
-T_init = cp.asnumpy(ops.get_temperature()[i_col, j_col, :])
-omega_init = cp.asnumpy(ops.get_water_content()[i_col, j_col, :])
-snapshots_E[0.0] = E_init.copy()
-snapshots_T[0.0] = T_init.copy()
-snapshots_omega[0.0] = omega_init.copy()
+E_col = lambda: cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
+T_col = lambda: cp.asnumpy(ops.get_temperature()[i_col, j_col, :])
+W_col = lambda: cp.asnumpy(ops.get_water_content()[i_col, j_col, :])
 
-for target_kyr in snapshot_times_kyr[1:]:
-    while time_kyr < target_kyr:
-        ops.set_rhs(dt)
-        ops.column_sweep(dt, n_smooth)
-        step += 1
-        time_kyr += dt_kyr
-    E_snap = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
-    T_snap = cp.asnumpy(ops.get_temperature()[i_col, j_col, :])
-    omega_snap = cp.asnumpy(ops.get_water_content()[i_col, j_col, :])
-    snapshots_E[target_kyr] = E_snap.copy()
-    snapshots_T[target_kyr] = T_snap.copy()
-    snapshots_omega[target_kyr] = omega_snap.copy()
-    print(f"  t = {target_kyr:6.0f} kyr, T_bed = {snapshots_T[target_kyr][0]:.2f} K")
+# Store initial snapshot
+snapshots_E[0.0] = E_col().copy()
+snapshots_T[0.0] = T_col().copy()
+snapshots_omega[0.0] = W_col().copy()
+
+next_snap_idx = 1  # index into snapshot_times_kyr
+
+print(f"\n  {'step':>6s}  {'time (kyr)':>12s}  {'dt (kyr)':>10s}  "
+      f"{'max|dE|':>12s}  {'rel change':>12s}  {'T_bed (K)':>10s}  {'omega_bed':>12s}")
+print(f"  {'-'*82}")
+
+for step in range(1, max_steps + 1):
+    E_old = ops.enthalpy_state.E[i_col, j_col, :].copy()
+
+    ops.set_rhs(dt)
+    ops.column_sweep(dt, n_smooth)
+
+    E_new = ops.enthalpy_state.E[i_col, j_col, :]
+    dE = E_new - E_old
+    max_dE = float(cp.max(cp.abs(dE)))
+    E_scale = float(cp.max(cp.abs(E_new))) + 1.0
+    rel_change = max_dE / E_scale
+
+    dt_kyr = dt / SEC_PER_KYR
+    time_kyr += dt_kyr
+
+    # Check if we should capture a snapshot
+    while (next_snap_idx < len(snapshot_times_kyr)
+           and time_kyr >= snapshot_times_kyr[next_snap_idx]):
+        t_snap = snapshot_times_kyr[next_snap_idx]
+        snapshots_E[t_snap] = E_col().copy()
+        snapshots_T[t_snap] = T_col().copy()
+        snapshots_omega[t_snap] = W_col().copy()
+        next_snap_idx += 1
+
+    # Log periodically
+    if step % log_interval == 0 or step <= 5 or rel_change < conv_tol:
+        T_bed = float(cp.asnumpy(ops.get_temperature()[i_col, j_col, 0]))
+        omega_bed = float(cp.asnumpy(ops.get_water_content()[i_col, j_col, 0]))
+        print(f"  {step:6d}  {time_kyr:12.1f}  {dt_kyr:10.1f}  "
+              f"{max_dE:12.3e}  {rel_change:12.3e}  {T_bed:10.2f}  {omega_bed:12.3e}")
+
+    # Convergence check
+    if rel_change < conv_tol:
+        print(f"\n  Converged at step {step}, t = {time_kyr:.1f} kyr (rel change = {rel_change:.2e})")
+        converged = True
+        break
+
+    # Adaptive dt: grow when converging, to accelerate approach to steady state
+    if rel_change < 1e-2:
+        dt = min(dt * dt_growth, dt_max)
+
+# Store final state as the last snapshot
+final_kyr = time_kyr
+snapshots_E[final_kyr] = E_col().copy()
+snapshots_T[final_kyr] = T_col().copy()
+snapshots_omega[final_kyr] = W_col().copy()
+
+if not converged:
+    print(f"\n  Did not converge in {max_steps} steps (t = {time_kyr:.1f} kyr, rel = {rel_change:.2e})")
 
 # ========================================================
-# Plot: 3x2 (temperature / enthalpy / water content) x (profiles / error)
-# sigma on y-axis: 0 = bed (bottom), 1 = surface (top)
+# Plot: steady-state model vs semi-analytical reference
+# 2x1: temperature and enthalpy
 # ========================================================
-fig, axs = plt.subplots(3, 2, figsize=(12, 14), sharey=True)
-(ax_T, ax_T_err), (ax_E, ax_E_err), (ax_W, ax_W_err) = axs
+T_final = T_col()
+E_final = E_col()
+omega_final = W_col()
 
-cmap = plt.cm.coolwarm
-colors = cmap(np.linspace(0.1, 0.9, len(snapshots_T)))
+fig, (ax_T, ax_E) = plt.subplots(1, 2, figsize=(12, 6), sharey=True)
 
-# --- Temperature profiles ---
-for (t_kyr, T_profile), color in zip(snapshots_T.items(), colors):
-    ax_T.plot(T_profile, sigma, color=color, linewidth=1.5,
-              label=f't = {t_kyr:.0f} kyr')
-ax_T.plot(T_analytical, sigma, 'k--', linewidth=2, label='Stefan reference')
+# --- Temperature ---
+ax_T.plot(T_final, sigma, 'b-', linewidth=2, label='Model (steady state)')
+ax_T.plot(T_analytical, sigma, 'k--', linewidth=2, label='Semi-analytical')
 ax_T.plot(T_pmp_profile, sigma, 'r:', linewidth=1.5, alpha=0.7,
           label=r'$T_{\mathrm{pmp}}(\sigma)$')
 if sigma_star is not None:
-    ax_T.axhline(sigma_star, color='green', linestyle='--', linewidth=1.5, alpha=0.7,
-                 label=rf'Reference CTS $\sigma^*$ = {sigma_star:.3f}')
+    ax_T.axhline(sigma_star, color='green', linestyle='--', linewidth=1,
+                 alpha=0.6, label=rf'CTS $\sigma^*={sigma_star:.3f}$')
 ax_T.set_xlabel('Temperature (K)')
 ax_T.set_ylabel(r'$\sigma$ (0 = bed, 1 = surface)')
 ax_T.set_title('Temperature')
-ax_T.set_xlim(T_surface - 5, T_pmp_bed + 5)
-ax_T.legend(fontsize=7, loc='upper right')
+ax_T.legend(fontsize=9)
 ax_T.grid(True, alpha=0.3)
 
-# --- Temperature error ---
-T_final = snapshots_T[snapshot_times_kyr[-1]]
-T_err = T_final - T_analytical
-ax_T_err.plot(T_err, sigma, 'b-', linewidth=2)
-if sigma_star is not None:
-    ax_T_err.axhline(sigma_star, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
-ax_T_err.set_xlabel('Temperature Error (K)')
-ax_T_err.set_title(f'Temperature Error at t = {snapshot_times_kyr[-1]} kyr')
-ax_T_err.axvline(0, color='k', linestyle='-', alpha=0.3)
-ax_T_err.grid(True, alpha=0.3)
-max_T_err = np.max(np.abs(T_err[:-1]))
-ax_T_err.text(0.95, 0.05,
-              f'Max error: {max_T_err:.2e} K\n'
-              f'T_bed = {T_final[0]:.2f} K\n'
-              f'T_pmp = {T_pmp_bed:.2f} K\n'
-              f'Q_crit = {Q_crit:.3f} W/m^2',
-              transform=ax_T_err.transAxes, ha='right', fontsize=10,
-              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-# --- Enthalpy profiles ---
-for (t_kyr, E_profile), color in zip(snapshots_E.items(), colors):
-    ax_E.plot(E_profile / 1e3, sigma, color=color, linewidth=1.5,
-              label=f't = {t_kyr:.0f} kyr')
-ax_E.plot(E_analytical / 1e3, sigma, 'k--', linewidth=2,
-          label='Semi-analytical reference')
+# --- Enthalpy ---
+ax_E.plot(E_final / 1e3, sigma, 'b-', linewidth=2, label='Model (steady state)')
+ax_E.plot(E_analytical / 1e3, sigma, 'k--', linewidth=2, label='Semi-analytical')
 ax_E.plot(E_pmp_profile / 1e3, sigma, 'r:', linewidth=1.5, alpha=0.7,
           label=r'$E_{\mathrm{pmp}}(\sigma)$')
 if sigma_star is not None:
-    ax_E.axhline(sigma_star, color='green', linestyle='--', linewidth=1.5, alpha=0.7,
-                 label=rf'Reference CTS $\sigma^*$ = {sigma_star:.3f}')
+    ax_E.axhline(sigma_star, color='green', linestyle='--', linewidth=1, alpha=0.6)
 ax_E.set_xlabel('Enthalpy (kJ/kg)')
-ax_E.set_ylabel(r'$\sigma$ (0 = bed, 1 = surface)')
 ax_E.set_title('Enthalpy')
-ax_E.set_xscale('symlog', linthresh=10.0)
-ax_E.legend(fontsize=7, loc='upper right')
+ax_E.legend(fontsize=9)
 ax_E.grid(True, alpha=0.3)
 
-# --- Enthalpy error ---
-E_final = snapshots_E[snapshot_times_kyr[-1]]
-E_err = E_final - E_analytical
-ax_E_err.plot(E_err, sigma, 'b-', linewidth=2)
-if sigma_star is not None:
-    ax_E_err.axhline(sigma_star, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
-ax_E_err.set_xlabel('Enthalpy Error (J/kg)')
-ax_E_err.set_title(f'Enthalpy Error at t = {snapshot_times_kyr[-1]} kyr')
-ax_E_err.set_xscale('symlog', linthresh=1e3)
-ax_E_err.axvline(0, color='k', linestyle='-', alpha=0.3)
-ax_E_err.grid(True, alpha=0.3)
-max_E_err = np.max(np.abs(E_err[:-1]))
-ax_E_err.text(0.95, 0.05,
-              f'Max error: {max_E_err:.2f} J/kg\n'
-              f'E_bed = {E_final[0]/1e3:.2f} kJ/kg\n'
-              f'E_pmp = {E_pmp_bed/1e3:.2f} kJ/kg',
-              transform=ax_E_err.transAxes, ha='right', fontsize=10,
-              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-# --- Water-content profiles ---
-for (t_kyr, omega_profile), color in zip(snapshots_omega.items(), colors):
-    ax_W.plot(omega_profile, sigma, color=color, linewidth=1.5,
-              label=f't = {t_kyr:.0f} kyr')
-ax_W.plot(omega_analytical, sigma, 'k--', linewidth=2,
-          label='Semi-analytical reference')
-if sigma_star is not None:
-    ax_W.axhline(sigma_star, color='green', linestyle='--', linewidth=1.5, alpha=0.7,
-                 label=rf'Reference CTS $\sigma^*$ = {sigma_star:.3f}')
-ax_W.set_xlabel('Water Content (mass fraction)')
-ax_W.set_ylabel(r'$\sigma$ (0 = bed, 1 = surface)')
-ax_W.set_title('Water Content')
-ax_W.set_xscale('symlog', linthresh=1e-6)
-ax_W.legend(fontsize=7, loc='upper right')
-ax_W.grid(True, alpha=0.3)
-
-# --- Water-content error ---
-omega_final = snapshots_omega[snapshot_times_kyr[-1]]
-omega_err = omega_final - omega_analytical
-ax_W_err.plot(omega_err, sigma, 'b-', linewidth=2)
-if sigma_star is not None:
-    ax_W_err.axhline(sigma_star, color='green', linestyle='--', linewidth=1.5, alpha=0.7)
-ax_W_err.set_xlabel('Water Content Error')
-ax_W_err.set_title(f'Water Content Error at t = {snapshot_times_kyr[-1]} kyr')
-ax_W_err.set_xscale('symlog', linthresh=1e-6)
-ax_W_err.axvline(0, color='k', linestyle='-', alpha=0.3)
-ax_W_err.grid(True, alpha=0.3)
-max_omega_err = np.max(np.abs(omega_err[:-1]))
-ax_W_err.text(0.95, 0.05,
-              f'Max error: {max_omega_err:.2e}\n'
-              f'omega_bed = {omega_final[0]:.3e}\n'
-              f'omega_ref = {omega_analytical[0]:.3e}',
-              transform=ax_W_err.transAxes, ha='right', fontsize=10,
-              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-
-fig.suptitle('Polythermal Column: Enthalpy Reference Comparison', fontsize=14, fontweight='bold')
+max_T_err = np.max(np.abs(T_final[:-1] - T_analytical[:-1]))
+max_E_rel = np.max(np.abs(E_final[:-1] - E_analytical[:-1])) / np.max(np.abs(E_analytical[:-1]))
+fig.suptitle(f'Polythermal Column: Steady State  |  '
+             f'max T err = {max_T_err:.2e} K, max E rel err = {max_E_rel:.2e}',
+             fontsize=12)
 plt.tight_layout()
 plt.savefig('examples/thermal/stefan.png', dpi=150)
 plt.show()

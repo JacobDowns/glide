@@ -35,7 +35,7 @@ T_REF = 223.15       # Reference temperature (K)
 T_MELT = 273.15      # Melting point at standard pressure (K)
 BETA_CC = 7.9e-8     # Clausius-Clapeyron constant (K/Pa)
 GRAVITY = 9.81       # Gravitational acceleration (m/s^2)
-K_COLD = K_I / C_I   # Diffusivity for cold ice (m^2/s)
+K_COLD = K_I / C_I   # Enthalpy diffusion coeff k_i/c_i (kg/(m*s)), not thermal diffusivity
 K_TEMP_FACTOR = 1e-5 # Temperate diffusivity reduction factor
 K_TEMP = K_COLD * K_TEMP_FACTOR
 

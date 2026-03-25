@@ -603,6 +603,7 @@ void enthalpy_compute_residual(
     float* __restrict__ r_E,            // (ny, nx, nz) residual output
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
     const float* __restrict__ E_prev,   // (ny, nx, nz) previous time step
+    const float* __restrict__ f_E,      // (ny, nx, nz) FAS tau correction (0 on finest)
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity per layer
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity per layer
     const float* __restrict__ sigma_dot,// (ny, nx, nz) sigma velocity
@@ -612,7 +613,7 @@ void enthalpy_compute_residual(
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
     const float* __restrict__ Q_fh,     // (ny, nx) frictional heating
     const float* __restrict__ sigma,    // (nz,) sigma node positions
-    float dx, float dt, float drain_rate,
+    float dx, float dt, float drain_rate, float h_thin,
     int ny, int nx, int nz)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -623,17 +624,27 @@ void enthalpy_compute_residual(
     int j = idx % nx;
 
     float h = H[i * nx + j];
-    float h_inv = (h > 1e-3f) ? 1.0f / h : 0.0f;
+
+    // Thin-ice bypass: clamp entire column to surface enthalpy
+    // Thin-ice and surface Dirichlet cells are not solver unknowns.
+    // Their residual is zero so they don't pollute the convergence norm.
+    if (h < h_thin) {
+        for (int k = 0; k < nz; k++) {
+            r_E[(i * nx + j) * nz + k] = 0.0f;
+        }
+        return;
+    }
+
+    float h_inv = 1.0f / h;
     float h2_inv = h_inv * h_inv;
     float dx_inv = 1.0f / dx;
 
     for (int k = 0; k < nz; k++) {
         int ijk = (i * nx + j) * nz + k;
 
-        // --- Surface Dirichlet BC ---
+        // Surface Dirichlet BC: not a solver unknown, zero residual.
         if (k == nz - 1) {
-            float E_s = E_surface[i * nx + j];
-            r_E[ijk] = E[ijk] - E_s;
+            r_E[ijk] = 0.0f;
             continue;
         }
 
@@ -642,7 +653,7 @@ void enthalpy_compute_residual(
         float E_pmp_k = get_E_pmp(sigma_k, h);
 
         // --- Time derivative ---
-        float r = RHO_I * (E_k - E_prev[ijk]) / dt;
+        float r = RHO_I * (E_k - E_prev[ijk]) / dt - f_E[ijk];
 
         // --- Horizontal advection ---
         HorizAdvectionResult h_adv = get_horiz_advection(
@@ -721,6 +732,7 @@ void enthalpy_column_smooth(
     float* __restrict__ delta_E,        // (ny, nx, nz) correction output
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
     const float* __restrict__ E_prev,   // (ny, nx, nz) previous time step
+    const float* __restrict__ f_E,      // (ny, nx, nz) FAS tau correction
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity
     const float* __restrict__ sigma_dot,// (ny, nx, nz) sigma velocity
@@ -730,7 +742,7 @@ void enthalpy_column_smooth(
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
     const float* __restrict__ Q_fh,     // (ny, nx) frictional heating
     const float* __restrict__ sigma,    // (nz,) sigma positions
-    float dx, float dt, float drain_rate,
+    float dx, float dt, float drain_rate, float h_thin,
     int ny, int nx, int nz,
     int n_newton, float relaxation)
 {
@@ -742,7 +754,17 @@ void enthalpy_column_smooth(
     int j = idx % nx;
 
     float h = H[i * nx + j];
-    float h_inv = (h > 1e-3f) ? 1.0f / h : 0.0f;
+
+    // Thin-ice bypass: correction drives entire column toward E_surface
+    if (h < h_thin) {
+        float E_s = E_surface[i * nx + j];
+        for (int k = 0; k < nz; k++) {
+            delta_E[(i * nx + j) * nz + k] = E_s - E[(i * nx + j) * nz + k];
+        }
+        return;
+    }
+
+    float h_inv = 1.0f / h;
     float h2_inv = h_inv * h_inv;
     float dx_inv = 1.0f / dx;
 
@@ -796,7 +818,7 @@ void enthalpy_column_smooth(
             float E_pmp_1 = get_E_pmp(sigma[1], h);
 
             // Residual
-            float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz]) / dt;
+            float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz]) / dt - f_E[(i*nx+j)*nz];
             r += horiz_adv_res[0];
 
             // Vertical advection at bed
@@ -845,7 +867,7 @@ void enthalpy_column_smooth(
             float E_pmp_kp1 = get_E_pmp(sigma[min(k+1,nz-1)], h);
 
             // --- Residual and Jacobian via struct functions ---
-            float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz + k]) / dt;
+            float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz + k]) / dt - f_E[(i*nx+j)*nz + k];
             r += horiz_adv_res[k];
 
             SigmaAdvectionJacobian adv_jac = get_sigma_advection_jac(

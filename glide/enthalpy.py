@@ -111,6 +111,15 @@ class EnthalpyForcing:
             attrs={'long_name': 'Water drainage rate in temperate ice'})
     )
 
+    h_thin: Constant = field(
+        default_factory=lambda: Constant(
+            value=cp.float32(100.0),
+            name='h_thin',
+            units='m',
+            attrs={'long_name': 'Thickness below which the column is clamped '
+                                'to the surface enthalpy (Dirichlet)'})
+    )
+
     def __repr__(self):
         shapes = []
         if self.E_surface is not None:
@@ -137,10 +146,21 @@ class EnthalpyVelocity:
 
 @dataclass
 class ColumnSmootherConfig:
-    """Configuration for the column-wise Newton/Thomas smoother."""
+    """Configuration for the column-wise Newton/Thomas smoother.
+
+    Convergence is checked after each sweep in column_sweep().
+    Iteration stops when any of these conditions is met:
+      - relative residual < relative_tolerance
+      - absolute residual < absolute_tolerance
+      - iteration count reaches n_iter (passed to column_sweep)
+    This mirrors FASCDSolver.solve() in the momentum solver.
+    """
     omega: cp.float32 = cp.float32(1.0)
     n_newton: int = 3
     relaxation: cp.float32 = cp.float32(1.0)
+    relative_tolerance: cp.float32 = cp.float32(1e-3)
+    absolute_tolerance: cp.float32 = cp.float32(50.0)
+    report_norms: bool = False
     hook_func: Callable[[int], None] = field(
         default_factory=lambda: lambda i: None)
 
@@ -201,6 +221,7 @@ class EnthalpyOperators:
         )
 
         # Work arrays
+        self.f_E = cp.zeros((ny, nx, nz), dtype=cp.float32)  # FAS tau correction (0 on finest)
         self.r_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
         self.delta_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
         self.Q_fh = cp.zeros((ny, nx), dtype=cp.float32)
@@ -281,6 +302,7 @@ class EnthalpyOperators:
         kernel(grid_size, block_size,
                (self.r_E,
                 state.E, state.E_prev,
+                self.f_E,
                 vel.u3d, vel.v3d, vel.sigma_dot,
                 grid.state.H.data,
                 forcing.phi_strain,
@@ -290,6 +312,7 @@ class EnthalpyOperators:
                 self.sigma,
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
+                forcing.h_thin.value,
                 grid.ny, grid.nx, self.nz))
 
         return cp.linalg.norm(self.r_E)
@@ -314,6 +337,7 @@ class EnthalpyOperators:
         kernel(grid_size, block_size,
                (self.delta_E,
                 state.E, state.E_prev,
+                self.f_E,
                 vel.u3d, vel.v3d, vel.sigma_dot,
                 grid.state.H.data,
                 forcing.phi_strain,
@@ -323,29 +347,58 @@ class EnthalpyOperators:
                 self.sigma,
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
+                forcing.h_thin.value,
                 grid.ny, grid.nx, self.nz,
                 cfg.n_newton, cfg.relaxation))
 
     def column_sweep(self, dt, n_iter):
         """
-        Repeated column smoothing with solution update.
+        Repeated column smoothing with convergence checking.
+
+        Mirrors the FASCDSolver.solve() pattern: compute the initial
+        residual, iterate, and stop when the relative or absolute
+        residual tolerance is met (or n_iter sweeps are exhausted).
+
+        Without multigrid coarse-grid correction the residual may
+        plateau when horizontal coupling dominates. The n_iter cap
+        and absolute_tolerance act as safety nets — the solver does
+        its best and moves on, exactly as the momentum solver does
+        when maximum_vcycles is reached.
 
         Parameters
         ----------
         dt : float
             Time step size.
         n_iter : int
-            Number of smoothing sweeps.
+            Maximum number of smoothing sweeps.
         """
+        cfg = self.smoother_config
+
+        # Initial residual
+        r0 = float(self.compute_residual(dt))
+        if cfg.report_norms:
+            print(f"  Enthalpy initial: |r0| = {r0:.2e}")
+
         for iteration in range(n_iter):
             self.column_smooth(dt)
-            self.enthalpy_state.E[:] += (
-                self.smoother_config.omega * self.delta_E)
-            self.smoother_config.hook_func(iteration)
+            self.enthalpy_state.E[:] += cfg.omega * self.delta_E
+            cfg.hook_func(iteration)
+
+            # Convergence check (same metric as FASCDSolver.solve)
+            r = float(self.compute_residual(dt))
+            rel = r / r0 if r0 > 0 else 0.0
+
+            if cfg.report_norms:
+                print(f"  Enthalpy sweep {iteration}: "
+                      f"|r|/|r0| = {rel:.2e}, |r| = {r:.2e}")
+
+            if rel < cfg.relative_tolerance or r < cfg.absolute_tolerance:
+                break
 
     def set_rhs(self, dt):
         """Store previous time step enthalpy and update forcing."""
         self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
+        self.f_E.fill(0)  # FAS correction is zero on finest level
 
     def set_surface_enthalpy_from_temperature(self, T_surface):
         """

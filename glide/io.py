@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import numpy as np
 import cupy as cp
-import xarray as xr
-import zarr
 import xml.etree.ElementTree as ET
 import shutil
 
@@ -376,6 +374,7 @@ class ZarrWriter:
     _dynamic_initialized: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        import xarray as xr  # noqa: F401 — validate availability early
         self.store = str(self.store)
 
     # -------------------------------------------------------------------------
@@ -551,7 +550,8 @@ class ZarrWriter:
         fields: Mapping[str, Any],
         *,
         attrs: Mapping[str, Any] | None = None,
-    ) -> xr.Dataset:
+    ):
+        import xarray as xr  # noqa: F811
         ds = grid.to_dataset(fields=fields)
 
         if attrs:
@@ -560,13 +560,13 @@ class ZarrWriter:
 
         return ds
 
-    def _validate_has_time(self, ds: xr.Dataset) -> None:
+    def _validate_has_time(self, ds) -> None:
         if self.time_dim not in ds.dims:
             raise ValueError(
                 f"Dataset does not contain required time dimension '{self.time_dim}'."
             )
 
-    def _validate_dataset_names(self, ds: xr.Dataset) -> None:
+    def _validate_dataset_names(self, ds) -> None:
         if self.time_dim in ds.data_vars:
             raise ValueError(
                 f"Dataset contains a data variable named '{self.time_dim}', which is reserved "
@@ -574,4 +574,5 @@ class ZarrWriter:
             )
 
     def consolidate_metadata(self) -> None:
+        import zarr
         zarr.consolidate_metadata(self.store)

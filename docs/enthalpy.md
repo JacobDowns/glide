@@ -174,13 +174,11 @@ The column-wise solve is effective because the dominant coupling is vertical (di
 
 ### Vertical sigma grid
 
-Non-uniform sigma levels bunched toward the bed:
+Uniform sigma levels from bed to surface:
 
 $$
-\sigma_k = \left(\frac{k}{N_z - 1}\right)^q, \quad k = 0, \ldots, N_z{-}1
+\sigma_k = \frac{k}{N_z - 1}, \quad k = 0, \ldots, N_z{-}1
 $$
-
-with $q > 1$ (default $q = 2$). This gives finer resolution near $\sigma = 0$ where the steepest enthalpy gradients occur.
 
 ### Horizontal discretization: finite volume with upwind fluxes
 
@@ -201,10 +199,10 @@ $$
 
 ### Vertical discretization: finite differences
 
-**Vertical diffusion** (centered, non-uniform spacing):
+**Vertical diffusion** (centered, uniform spacing $\Delta\sigma = 1/(N_z - 1)$):
 
 $$
-\frac{1}{h^2}\frac{\partial}{\partial\sigma}\!\left(K\frac{\partial E}{\partial\sigma}\right)_k \approx \frac{1}{h^2} \cdot \frac{2}{\Delta\sigma_k^- + \Delta\sigma_k^+}\left[\frac{K_{k+\frac{1}{2}}(E_{k+1} - E_k)}{\Delta\sigma_k^+} - \frac{K_{k-\frac{1}{2}}(E_k - E_{k-1})}{\Delta\sigma_k^-}\right]
+\frac{1}{h^2}\frac{\partial}{\partial\sigma}\!\left(K\frac{\partial E}{\partial\sigma}\right)_k \approx \frac{1}{h^2 \Delta\sigma^2}\left[K_{k+\frac{1}{2}}(E_{k+1} - E_k) - K_{k-\frac{1}{2}}(E_k - E_{k-1})\right]
 $$
 
 where $\Delta\sigma_k^+ = \sigma_{k+1} - \sigma_k$, $\Delta\sigma_k^- = \sigma_k - \sigma_{k-1}$, and $K_{k+\frac{1}{2}}$ is evaluated at the midpoint between nodes $k$ and $k+1$.
@@ -335,7 +333,7 @@ Every Jacobian struct has a corresponding `*StencilDual` and `get_*_dual()` wrap
 struct ColumnDiffusionStencilDual {
     DualFloat E_km1, E_k, E_kp1;         // differentiated variables
     float E_pmp_km1, E_pmp_k, E_pmp_kp1; // frozen parameters
-    float dsig_m, dsig_p, h2_inv;
+    float dsig, h2_inv;
 
     ColumnDiffusionStencil get_primals() const;  // extract .v fields
     ColumnDiffusionStencil get_diffs() const;    // extract .d fields

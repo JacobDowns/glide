@@ -35,7 +35,7 @@ def _make_ops(nx=4, ny=4, nz=21):
     grid.sliding.m.set(1.0)
     grid.sliding.u_reg.set(1.0)
 
-    ops = EnthalpyOperators(grid, nz=nz, sigma_q=1.0)
+    ops = EnthalpyOperators(grid, nz=nz)
     ops.initialize_from_temperature(T_SURFACE)
     ops.set_surface_enthalpy_from_temperature(
         cp.full((ny, nx), T_SURFACE, dtype=cp.float32))
@@ -45,7 +45,7 @@ def _make_ops(nx=4, ny=4, nz=21):
     ops.enthalpy_velocity.u3d.fill(0)
     ops.enthalpy_velocity.v3d.fill(0)
     ops.enthalpy_velocity.sigma_dot.fill(0)
-    ops.Q_fh.fill(0)
+    ops.enthalpy_forcing.Q_fh.fill(0)
     return ops
 
 

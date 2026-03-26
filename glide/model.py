@@ -109,23 +109,25 @@ class ThermalModel:
         The finest-level grid (shared with IceDynamics).
     nz : int
         Number of sigma levels.
-    sigma_q : float
-        Bunching exponent for sigma levels (q=1 uniform, q>1 bunches toward bed).
     n_smooth : int
         Maximum number of column smoothing sweeps per time step.
     update_rheology : bool
         If True, update grid.rheology.B after each step from the Arrhenius factor.
+    frictional_heating : bool
+        If True, compute Q_fh = beta * |u_b|^(m+1) each step.
     rho_i : float
         Ice density for the B unit conversion (default 917 kg/m^3).
     """
 
     SEC_PER_YR = 365.25 * 86400.0
 
-    def __init__(self, grid, nz=21, sigma_q=2.0, n_smooth=10,
-                 update_rheology=True, rho_i=917.0):
-        self.ops = EnthalpyOperators(grid, nz=nz, sigma_q=sigma_q)
+    def __init__(self, grid, nz=21, n_smooth=10,
+                 update_rheology=True, frictional_heating=True,
+                 rho_i=917.0):
+        self.ops = EnthalpyOperators(grid, nz=nz)
         self.n_smooth = n_smooth
         self.update_rheology = update_rheology
+        self.frictional_heating = frictional_heating
         self.rho_i = rho_i
         self.g = 9.81
 
@@ -173,8 +175,11 @@ class ThermalModel:
         ops.enthalpy_velocity.u3d /= sec_per_yr
         ops.enthalpy_velocity.v3d /= sec_per_yr
 
-        ops.compute_sigma_dot()
-        ops.compute_frictional_heating()
+        # SMB is in m/yr (GLIDE convention); convert to m/s to match velocities.
+        smb_si = ops.grid.forcing.smb.data / sec_per_yr
+        ops.compute_sigma_dot(smb=smb_si)
+        if self.frictional_heating:
+            self._compute_frictional_heating()
 
         # Enthalpy solve
         ops.set_rhs(dt)
@@ -189,6 +194,21 @@ class ThermalModel:
             scale = cp.float32(
                 self.rho_i * self.g * self.SEC_PER_YR ** (1.0 / n))
             ops.grid.rheology.B.data[:] = ops.get_arrhenius_factor() / scale
+
+    def _compute_frictional_heating(self):
+        """Compute Q_fh = beta * |u_b|^(m+1) from the sliding law."""
+        grid = self.ops.grid
+        sliding = grid.sliding
+        vel = self.ops.enthalpy_velocity
+        u_bed = vel.u3d[0, :, :]  # (ny, nx+1)
+        v_bed = vel.v3d[0, :, :]  # (ny+1, nx)
+
+        u_cell = 0.5 * (u_bed[:, 1:] + u_bed[:, :-1])
+        v_cell = 0.5 * (v_bed[1:, :] + v_bed[:-1, :])
+        speed = cp.sqrt(u_cell**2 + v_cell**2 + sliding.u_reg.value**2)
+
+        m = sliding.m.value
+        self.ops.enthalpy_forcing.Q_fh[:] = sliding.beta.data * speed ** (m + 1.0)
 
     @property
     def B_scale(self):

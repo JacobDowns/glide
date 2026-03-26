@@ -12,11 +12,10 @@ The enthalpy equation (Aschwanden et al. 2012):
 
 is discretized with:
     - Horizontal: finite volume, upwind fluxes on MAC grid
-    - Vertical: finite differences on non-uniform sigma nodes
+    - Vertical: finite differences on uniform sigma nodes
     - Column-wise Newton/Thomas solve as multigrid smoother
 """
 import cupy as cp
-import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -60,25 +59,21 @@ def water_content_from_enthalpy(E, depth=0.0):
     return cp.maximum(E - E_pmp, 0.0) / L_HEAT
 
 
-def make_sigma(nz, q=2.0):
+def make_sigma(nz):
     """
-    Generate non-uniform sigma levels bunched toward the bed.
+    Generate uniform sigma levels from bed (0) to surface (1).
 
     Parameters
     ----------
     nz : int
         Number of sigma levels.
-    q : float
-        Bunching exponent. q=1 is uniform, q>1 bunches toward bed (sigma=0).
 
     Returns
     -------
     sigma : cp.ndarray, shape (nz,)
         Sigma node positions in [0, 1].
     """
-    zeta = np.linspace(0.0, 1.0, nz)
-    sigma = zeta ** q
-    return cp.array(sigma, dtype=cp.float32)
+    return cp.linspace(0.0, 1.0, nz, dtype=cp.float32)
 
 
 # ========================================================
@@ -101,6 +96,7 @@ class EnthalpyForcing:
     """Boundary conditions and forcing for the enthalpy equation."""
     E_surface: cp.ndarray | None = None  # (ny, nx) surface enthalpy BC
     Q_geo: cp.ndarray | None = None      # (ny, nx) geothermal heat flux
+    Q_fh: cp.ndarray | None = None       # (ny, nx) basal frictional heating
     phi_strain: cp.ndarray | None = None # (ny, nx, nz) strain heating
 
     drain_rate: Constant = field(
@@ -126,6 +122,8 @@ class EnthalpyForcing:
             shapes.append(f'E_surface {self.E_surface.shape}')
         if self.Q_geo is not None:
             shapes.append(f'Q_geo {self.Q_geo.shape}')
+        if self.Q_fh is not None:
+            shapes.append(f'Q_fh {self.Q_fh.shape}')
         if self.phi_strain is not None:
             shapes.append(f'phi_strain {self.phi_strain.shape}')
         return f'EnthalpyForcing: {", ".join(shapes)}'
@@ -158,8 +156,8 @@ class ColumnSmootherConfig:
     omega: cp.float32 = cp.float32(1.0)
     n_newton: int = 3
     relaxation: cp.float32 = cp.float32(1.0)
-    relative_tolerance: cp.float32 = cp.float32(1e-3)
-    absolute_tolerance: cp.float32 = cp.float32(50.0)
+    relative_tolerance: cp.float32 = cp.float32(1e-5)
+    absolute_tolerance: cp.float32 = cp.float32(1e-2)
     report_norms: bool = False
     hook_func: Callable[[int], None] = field(
         default_factory=lambda: lambda i: None)
@@ -182,12 +180,12 @@ class EnthalpyOperators:
     Parallels the ForwardOperators class for the SSA solver.
     """
 
-    def __init__(self, grid, nz=11, sigma_q=2.0, use_fast_math=True):
+    def __init__(self, grid, nz=11, use_fast_math=True):
         self.grid = grid
         self.nz = nz
 
-        # Sigma levels
-        self.sigma = make_sigma(nz, q=sigma_q)
+        # Sigma levels (uniform spacing)
+        self.sigma = make_sigma(nz)
 
         # Compile CUDA kernels
         cuda_dir = Path(__file__).parent / "cuda"
@@ -217,6 +215,7 @@ class EnthalpyOperators:
         self.enthalpy_forcing = EnthalpyForcing(
             E_surface=cp.zeros((ny, nx), dtype=cp.float32),
             Q_geo=cp.zeros((ny, nx), dtype=cp.float32),
+            Q_fh=cp.zeros((ny, nx), dtype=cp.float32),
             phi_strain=cp.zeros((ny, nx, nz), dtype=cp.float32),
         )
 
@@ -224,7 +223,6 @@ class EnthalpyOperators:
         self.f_E = cp.zeros((ny, nx, nz), dtype=cp.float32)  # FAS tau correction (0 on finest)
         self.r_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
         self.delta_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
-        self.Q_fh = cp.zeros((ny, nx), dtype=cp.float32)
 
         self.smoother_config = ColumnSmootherConfig()
 
@@ -250,43 +248,33 @@ class EnthalpyOperators:
             self.enthalpy_velocity.u3d[k, :, :] = u2d
             self.enthalpy_velocity.v3d[k, :, :] = v2d
 
-    def compute_sigma_dot(self):
-        """Compute sigma velocity from 3D velocity field."""
+    def compute_sigma_dot(self, smb=None):
+        """Compute sigma velocity from 3D velocity field.
+
+        Parameters
+        ----------
+        smb : cp.ndarray, optional
+            Surface mass balance in the same time units as u3d/v3d.
+            If None, reads from grid.forcing.smb (which is in GLIDE's
+            year-based units — only correct when velocities are also
+            in m/yr).
+        """
         kernel = self.kernels.get_function('compute_sigma_dot')
         grid_size, block_size = self._column_launch_config
 
         grid = self.grid
         vel = self.enthalpy_velocity
+        smb_data = smb if smb is not None else grid.forcing.smb.data
 
         kernel(grid_size, block_size,
                (vel.sigma_dot,
                 vel.u3d, vel.v3d,
                 grid.state.H.data,
                 grid.geometry.bed.data,
-                grid.forcing.smb.data,
-                self.sigma,
-                grid.dx, cp.float32(0.0),  # dt not needed for sigma_dot
+                smb_data,
+                grid.dx, cp.float32(0.0),
                 grid.ny, grid.nx, self.nz))
-
-    def compute_frictional_heating(self):
-        """
-        Compute basal frictional heating Q_fh = beta * |u_b|^(m+1).
-
-        Uses the bed-level (k=0) velocities.
-        """
-        grid = self.grid
-        sliding = grid.sliding
-        u_bed = self.enthalpy_velocity.u3d[0, :, :]  # (ny, nx+1)
-        v_bed = self.enthalpy_velocity.v3d[0, :, :]  # (ny+1, nx)
-
-        # Interpolate to cell centers
-        u_cell = 0.5 * (u_bed[:, 1:] + u_bed[:, :-1])
-        v_cell = 0.5 * (v_bed[1:, :] + v_bed[:-1, :])
-        speed_sq = u_cell**2 + v_cell**2 + sliding.u_reg.value**2
-        speed = cp.sqrt(speed_sq)
-
-        m = sliding.m.value
-        self.Q_fh[:, :] = sliding.beta.data * speed ** (m + 1.0)
+        
 
     def compute_residual(self, dt):
         """Compute the enthalpy residual at all grid points."""
@@ -308,8 +296,7 @@ class EnthalpyOperators:
                 forcing.phi_strain,
                 forcing.E_surface,
                 forcing.Q_geo,
-                self.Q_fh,
-                self.sigma,
+                forcing.Q_fh,
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
                 forcing.h_thin.value,
@@ -343,8 +330,7 @@ class EnthalpyOperators:
                 forcing.phi_strain,
                 forcing.E_surface,
                 forcing.Q_geo,
-                self.Q_fh,
-                self.sigma,
+                forcing.Q_fh,
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
                 forcing.h_thin.value,
@@ -419,13 +405,16 @@ class EnthalpyOperators:
 
         Parameters
         ----------
-        T_field : array-like, shape (ny, nx, nz) or scalar
-            Temperature in Kelvin.
+        T_field : array-like, shape (ny, nx, nz), (ny, nx), or scalar
+            Temperature in Kelvin. 2D arrays are broadcast to all sigma levels.
         """
         T = cp.asarray(T_field, dtype=cp.float32)
         if T.ndim == 0:
             T = cp.full((self.grid.ny, self.grid.nx, self.nz),
                         T.item(), dtype=cp.float32)
+        elif T.ndim == 2:
+            T = cp.broadcast_to(T[:, :, None],
+                                (self.grid.ny, self.grid.nx, self.nz)).copy()
         self.enthalpy_state.E[:] = C_I * (T - T_REF)
         self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
 

@@ -59,7 +59,7 @@ grid.sliding.beta.set(cp.ones((ny, nx), dtype=cp.float32))
 grid.sliding.m.set(1.0)
 grid.sliding.u_reg.set(1.0)
 
-ops = EnthalpyOperators(grid, nz=nz, sigma_q=1.0)
+ops = EnthalpyOperators(grid, nz=nz)
 ops.initialize_from_temperature(T_surface)
 ops.set_surface_enthalpy_from_temperature(
     cp.full((ny, nx), T_surface, dtype=cp.float32))
@@ -69,7 +69,7 @@ ops.enthalpy_forcing.drain_rate.set(0.0)
 ops.enthalpy_velocity.u3d.fill(0)
 ops.enthalpy_velocity.v3d.fill(0)
 ops.enthalpy_velocity.sigma_dot.fill(0)
-ops.Q_fh.fill(0)
+ops.enthalpy_forcing.Q_fh.fill(0)
 
 # ========================================================
 # Semi-analytical enthalpy reference profile

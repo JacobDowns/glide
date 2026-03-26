@@ -72,7 +72,7 @@ def test_cold_column():
     grid.sliding.u_reg.set(1.0)
 
     # ---- Enthalpy operator ----
-    ops = EnthalpyOperators(grid, nz=nz, sigma_q=1.0)  # uniform sigma for clean comparison
+    ops = EnthalpyOperators(grid, nz=nz)  # uniform sigma for clean comparison
 
     # Initialize with surface temperature everywhere
     ops.initialize_from_temperature(T_surface)
@@ -87,7 +87,7 @@ def test_cold_column():
     ops.enthalpy_velocity.u3d.fill(0)
     ops.enthalpy_velocity.v3d.fill(0)
     ops.enthalpy_velocity.sigma_dot.fill(0)
-    ops.Q_fh.fill(0)
+    ops.enthalpy_forcing.Q_fh.fill(0)
 
     # ---- Time stepping ----
     for step in range(n_steps):
@@ -154,7 +154,7 @@ def test_cold_column_residual_convergence():
     grid.sliding.m.set(1.0)
     grid.sliding.u_reg.set(1.0)
 
-    ops = EnthalpyOperators(grid, nz=nz, sigma_q=1.0)
+    ops = EnthalpyOperators(grid, nz=nz)
     ops.initialize_from_temperature(T_surface)
     ops.set_surface_enthalpy_from_temperature(
         cp.full((ny, nx), T_surface, dtype=cp.float32))
@@ -163,7 +163,7 @@ def test_cold_column_residual_convergence():
     ops.enthalpy_velocity.u3d.fill(0)
     ops.enthalpy_velocity.v3d.fill(0)
     ops.enthalpy_velocity.sigma_dot.fill(0)
-    ops.Q_fh.fill(0)
+    ops.enthalpy_forcing.Q_fh.fill(0)
 
     ops.set_rhs(dt)
 

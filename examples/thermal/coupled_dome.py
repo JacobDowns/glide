@@ -44,9 +44,10 @@ DOME_HEIGHT = 3000.0   # m
 
 # Forcing
 SMB_CENTER = 5.       # m/yr ice equivalent (accumulation at center)
-SMB_EDGE = -5.0        # m/yr ice equivalent (ablation at margin)
+SMB_EDGE = -2.0        # m/yr ice equivalent (ablation at margin)
 Q_GEO = 0.0           # W/m^2 (geothermal heat flux)
-T_SURFACE = 248.15     # K (-25 C)
+T_SEA_LEVEL = 268.15   # K (-5 C, temperature at z=0)
+LAPSE_RATE = -6.5e-3   # K/m (typical free-atmosphere lapse rate)
 
 # Rheology
 # GLIDE works in "head" units: B_head = B_SI / (rho_i * g)
@@ -55,15 +56,14 @@ G = 9.81
 N_GLEN = 3.0
 
 # Sliding (head units, comparable to Greenland example values)
-BETA_SLIDING = 1.0
+BETA_SLIDING = 10.0
 
 # Thermal
-NZ = 21                # sigma levels
-SIGMA_Q = 2.0          # bunching toward bed
+NZ = 9                # sigma levels
 N_SMOOTH = 10          # enthalpy smoothing sweeps
 
 # Time stepping
-DT_YR = 10.0           # years
+DT_YR = 5.0           # years
 N_STEPS = 100
 SEC_PER_YR = 365.25 * 86400.0
 
@@ -84,6 +84,12 @@ thickness = DOME_HEIGHT * hemisphere
 bed = cp.zeros((ny, nx), dtype=cp.float32)
 smb = (cp.float32(SMB_EDGE)
        + cp.float32(SMB_CENTER - SMB_EDGE) * hemisphere)
+
+
+def surface_temperature(H, bed):
+    """Elevation-dependent surface temperature from lapse rate."""
+    surface_elev = bed + H
+    return cp.float32(T_SEA_LEVEL) + cp.float32(LAPSE_RATE) * surface_elev
 
 # ========================================================
 # Initialize momentum solver
@@ -113,8 +119,8 @@ model.forward_solver.fas_options.set(
     pre_steps=5,
     post_steps=20,
     finest_steps=0,
-    relative_tolerance=5e-3,
-    absolute_tolerance=1.0,
+    relative_tolerance=5e-5,
+    absolute_tolerance=1e-3,
     report_norms=False,
 )
 
@@ -122,16 +128,23 @@ model.forward_solver.fas_options.set(
 # Initialize thermal solver
 # ========================================================
 grid = mg.levels[0]
-thermal = ThermalModel(grid, nz=NZ, sigma_q=SIGMA_Q,
-                       n_smooth=N_SMOOTH, update_rheology=True)
+thermal = ThermalModel(grid, nz=NZ,
+                       n_smooth=N_SMOOTH, update_rheology=True,
+                       frictional_heating=False)
 
 thermal.ops.smoother_config.report_norms = True
-thermal.initialize(T_surface=T_SURFACE, Q_geo=Q_GEO)
+T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
+thermal.initialize(T_surface=T_surf_init, Q_geo=Q_GEO)
+thermal.ops.enthalpy_forcing.h_thin.set(50.0)
 
 # Set initial B from the Paterson-Budd law at the initial temperature,
 # so there is no discontinuity when the thermal model starts updating B.
 B_init = thermal.ops.get_arrhenius_factor() / thermal.B_scale
 mg.rheology.B.set(B_init)
+T_summit = float(T_surf_init[ny//2, nx//2])
+T_margin = float(T_SEA_LEVEL)
+print(f"  Surface T: summit = {T_summit:.2f} K ({T_summit-273.15:.1f} C), "
+      f"margin = {T_margin:.2f} K ({T_margin-273.15:.1f} C)")
 print(f"  Initial B (GLIDE units): {float(B_init[ny//2, nx//2]):.4e}")
 
 # ========================================================
@@ -170,13 +183,15 @@ for _ in range(N_SPINUP):
 print(f"    done (t = {t_yr:.0f} yr)")
 
 # Re-initialize thermal state from the relaxed geometry
-thermal.initialize(T_surface=T_SURFACE, Q_geo=Q_GEO)
+T_surf_relaxed = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
+thermal.initialize(T_surface=T_surf_relaxed, Q_geo=Q_GEO)
 B_init = thermal.ops.get_arrhenius_factor() / thermal.B_scale
 mg.rheology.B.set(B_init)
+thermal.update_rheology = False
 
 # Storage for time-series plot
 times = [t_yr]
-vol = [float(cp.sum(grid.state.H.data) * dx**2)]
+vol = [float(cp.sum(grid.state.H.data) * dx**2 / 1e9)]
 T_bed_center = [float(cp.asnumpy(thermal.temperature[ny//2, nx//2, 0]))]
 B_center = [float(cp.asnumpy(grid.rheology.B.data[ny//2, nx//2]))]
 max_speed = [0.0]
@@ -192,6 +207,10 @@ print(f"  {'-'*68}")
 for step in range(N_STEPS):
     # --- Momentum solve (dt in years) ---
     model.forward(cp.float32(t_yr), dt_yr)
+
+    # --- Update surface temperature from current geometry ---
+    T_surf = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
+    thermal.ops.set_surface_enthalpy_from_temperature(T_surf)
 
     # --- Thermal solve (dt in seconds) ---
     thermal.step(dt_sec)
@@ -217,21 +236,33 @@ for step in range(N_STEPS):
     B_center.append(B_val)
     max_speed.append(max_spd)
 
+    # Symmetry diagnostics: compare field with its 180-degree rotation
+    H_rot = H_np[::-1, ::-1]
+    H_asym = np.max(np.abs(H_np - H_rot))
+    T_3d_diag = cp.asnumpy(thermal.temperature)
+    T_mid = T_3d_diag[:, :, NZ // 2]
+    T_rot = T_mid[::-1, ::-1]
+    T_asym = np.max(np.abs(T_mid - T_rot))
+
     if (step + 1) % 10 == 0 or step == 0:
         print(f"  {step+1:5d}  {t_yr:8.1f}  {volume_km3:10.1f}  "
-              f"{T_bed:10.2f}  {B_val:12.4e}  {max_spd:14.2f}")
+              f"{T_bed:10.2f}  {B_val:12.4e}  {max_spd:14.2f}  "
+              f"H_asym={H_asym:.2e}  T_asym={T_asym:.2e}")
 
     # --- Store spatial snapshot ---
     if (step + 1) in snapshot_steps:
         T_3d = cp.asnumpy(thermal.temperature)
         # Thin marginal ice has unreliable thermal state — clamp it
         thin = H_np < 100.0
-        T_bed = np.clip(T_3d[:, :, 0], T_SURFACE - 5.0, T_MELT)
-        T_avg = np.clip(np.mean(T_3d, axis=2), T_SURFACE - 5.0, T_MELT)
-        T_bed[thin] = T_SURFACE
-        T_avg[thin] = T_SURFACE
+        T_bed = np.clip(T_3d[:, :, 0], T_SEA_LEVEL - 5.0, T_MELT)
+        T_avg = np.clip(np.mean(T_3d, axis=2), T_SEA_LEVEL - 5.0, T_MELT)
+        T_bed[thin] = T_SEA_LEVEL
+        T_avg[thin] = T_SEA_LEVEL
+        T_surf_np = T_3d[:, :, -1].copy()  # modeled temperature at top sigma level
+        T_surf_np[thin] = np.nan
         snapshots_map[step + 1] = {
             't_yr': t_yr,
+            'T_surf': T_surf_np,
             'T_bed': T_bed,
             'T_avg': T_avg,
             'B': cp.asnumpy(grid.rheology.B.data).copy(),
@@ -306,15 +337,22 @@ snap_keys = sorted(snapshots_map.keys())
 n_snaps = len(snap_keys)
 
 # Compute global color ranges from ice-covered cells across all snapshots
-all_T_bed, all_T_avg, all_B, all_spd = [], [], [], []
+all_H, all_T_surf, all_T_bed, all_T_avg, all_B, all_spd = [], [], [], [], [], []
 for snap in snapshots_map.values():
     ice = snap['H'] >= 100.0
+    all_H.append(snap['H'][ice])
+    T_s = snap['T_surf']
+    all_T_surf.append(T_s[ice & ~np.isnan(T_s)])
     all_T_bed.append(snap['T_bed'][ice])
     all_T_avg.append(snap['T_avg'][ice])
     all_B.append(snap['B'][ice])
     all_spd.append(snap['speed'][ice])
 
 field_specs = [
+    ('H',      'Thickness (m)',                   'cividis',
+     0.0,                               np.max(np.concatenate(all_H))),
+    ('T_surf', 'Surface Temperature (K)',         'coolwarm',
+     np.min(np.concatenate(all_T_surf)), np.max(np.concatenate(all_T_surf))),
     ('T_bed',  'Basal Temperature (K)',          'coolwarm',
      np.min(np.concatenate(all_T_bed)), np.max(np.concatenate(all_T_bed))),
     ('T_avg',  'Column-Avg Temperature (K)',     'coolwarm',

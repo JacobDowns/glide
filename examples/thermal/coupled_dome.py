@@ -35,19 +35,19 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
 # ========================================================
 # Grid
 n_levels = 4
-ny, nx = 128, 128
-dx = 2500.0           # m
+ny, nx = 512, 512
+dx = 500.0           # m
 
 # Dome geometry
 DOME_RADIUS = 100000.0 # m
 DOME_HEIGHT = 3000.0   # m
 
 # Forcing
-SMB_CENTER = 5.       # m/yr ice equivalent (accumulation at center)
-SMB_EDGE = -2.0        # m/yr ice equivalent (ablation at margin)
+SMB_CENTER = 2.       # m/yr ice equivalent (accumulation at center)
+SMB_EDGE = -5.0        # m/yr ice equivalent (ablation at margin)
 Q_GEO = 0.0           # W/m^2 (geothermal heat flux)
 T_SEA_LEVEL = 268.15   # K (-5 C, temperature at z=0)
-LAPSE_RATE = -6.5e-3   # K/m (typical free-atmosphere lapse rate)
+LAPSE_RATE = -5e-3   # K/m (typical free-atmosphere lapse rate)
 
 # Rheology
 # GLIDE works in "head" units: B_head = B_SI / (rho_i * g)
@@ -59,12 +59,12 @@ N_GLEN = 3.0
 BETA_SLIDING = 10.0
 
 # Thermal
-NZ = 9                # sigma levels
+NZ = 10                # sigma levels
 N_SMOOTH = 10          # enthalpy smoothing sweeps
 
 # Time stepping
-DT_YR = 5.0           # years
-N_STEPS = 100
+DT_YR = 10.0           # years
+N_STEPS = 1000
 SEC_PER_YR = 365.25 * 86400.0
 
 # Output
@@ -135,7 +135,7 @@ thermal = ThermalModel(grid, nz=NZ,
 thermal.ops.smoother_config.report_norms = True
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_init, Q_geo=Q_GEO)
-thermal.ops.enthalpy_forcing.h_thin.set(50.0)
+thermal.ops.enthalpy_forcing.h_thin.set(25.0)
 
 # Set initial B from the Paterson-Budd law at the initial temperature,
 # so there is no discontinuity when the thermal model starts updating B.
@@ -187,7 +187,7 @@ T_surf_relaxed = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_relaxed, Q_geo=Q_GEO)
 B_init = thermal.ops.get_arrhenius_factor() / thermal.B_scale
 mg.rheology.B.set(B_init)
-thermal.update_rheology = False
+#thermal.update_rheology = False
 
 # Storage for time-series plot
 times = [t_yr]

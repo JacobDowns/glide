@@ -45,9 +45,10 @@ DOME_HEIGHT = 3000.0   # m
 # Forcing
 SMB_CENTER = 2.       # m/yr ice equivalent (accumulation at center)
 SMB_EDGE = -5.0        # m/yr ice equivalent (ablation at margin)
-Q_GEO = 0.0           # W/m^2 (geothermal heat flux)
-T_SEA_LEVEL = 268.15   # K (-5 C, temperature at z=0)
-LAPSE_RATE = -5e-3   # K/m (typical free-atmosphere lapse rate)
+Q_GEO = 0.05          # W/m^2 (modest geothermal heat flux)
+T_SEA_LEVEL = 273.15   # K (+5 C at sea level — margins reach melting)
+LAPSE_RATE = -6.5e-3   # K/m (standard atmospheric lapse rate)
+T_INIT = 263.15        # K (-10 C, uniform initial ice temperature)
 
 # Rheology
 # GLIDE works in "head" units: B_head = B_SI / (rho_i * g)
@@ -63,8 +64,8 @@ NZ = 10                # sigma levels
 N_SMOOTH = 10          # enthalpy smoothing sweeps
 
 # Time stepping
-DT_YR = 10.0           # years
-N_STEPS = 1000
+DT_YR = 2.5          # years
+N_STEPS = 100
 SEC_PER_YR = 365.25 * 86400.0
 
 # Output
@@ -132,9 +133,14 @@ thermal = ThermalModel(grid, nz=NZ,
                        n_smooth=N_SMOOTH, update_rheology=True,
                        frictional_heating=False)
 
+# All terms enabled (horizontal advection, sigma_dot, strain heating, drainage)
+
 thermal.ops.smoother_config.report_norms = True
+thermal.ops.smoother_config.omega = cp.float32(1.0)
+thermal.ops.smoother_config.n_newton = 5
+thermal.ops.smoother_config.relaxation = cp.float32(1.0)
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
-thermal.initialize(T_surface=T_surf_init, Q_geo=Q_GEO)
+thermal.initialize(T_surface=T_surf_init, T_field=T_INIT, Q_geo=Q_GEO)
 thermal.ops.enthalpy_forcing.h_thin.set(25.0)
 
 # Set initial B from the Paterson-Budd law at the initial temperature,
@@ -146,6 +152,10 @@ T_margin = float(T_SEA_LEVEL)
 print(f"  Surface T: summit = {T_summit:.2f} K ({T_summit-273.15:.1f} C), "
       f"margin = {T_margin:.2f} K ({T_margin-273.15:.1f} C)")
 print(f"  Initial B (GLIDE units): {float(B_init[ny//2, nx//2]):.4e}")
+tf = thermal.ops.term_flags
+print(f"  Term flags: bitmask=0x{tf.bitmask:x} "
+      f"(h_adv={tf.horizontal_advection}, sigma_dot={tf.sigma_dot}, "
+      f"strain={tf.strain_heating}, drain={tf.drainage})")
 
 # ========================================================
 # Output setup
@@ -184,7 +194,7 @@ print(f"    done (t = {t_yr:.0f} yr)")
 
 # Re-initialize thermal state from the relaxed geometry
 T_surf_relaxed = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
-thermal.initialize(T_surface=T_surf_relaxed, Q_geo=Q_GEO)
+thermal.initialize(T_surface=T_surf_relaxed, T_field=T_INIT, Q_geo=Q_GEO)
 B_init = thermal.ops.get_arrhenius_factor() / thermal.B_scale
 mg.rheology.B.set(B_init)
 #thermal.update_rheology = False
@@ -213,7 +223,23 @@ for step in range(N_STEPS):
     thermal.ops.set_surface_enthalpy_from_temperature(T_surf)
 
     # --- Thermal solve (dt in seconds) ---
-    thermal.step(dt_sec)
+    # All terms enabled: horizontal advection uses the SSA velocities,
+    # sigma_dot provides vertical transport, strain heating term is
+    # active (phi_strain field is zero until a viscous dissipation
+    # computation is wired up — the flag enables the kernel path).
+    ops = thermal.ops
+    ops.broadcast_velocity()
+    sec_per_yr = cp.float32(thermal.SEC_PER_YR)
+    ops.enthalpy_velocity.u3d /= sec_per_yr
+    ops.enthalpy_velocity.v3d /= sec_per_yr
+    smb_si = ops.grid.forcing.smb.data / sec_per_yr
+    ops.compute_sigma_dot(smb=smb_si)
+    ops.set_rhs(dt_sec)
+    ops.column_sweep(dt_sec, thermal.n_smooth)
+    if thermal.update_rheology:
+        n = float(ops.grid.rheology.n.value)
+        scale = cp.float32(thermal.rho_i * thermal.g * thermal.SEC_PER_YR ** (1.0 / n))
+        ops.grid.rheology.B.data[:] = ops.get_arrhenius_factor() / scale
 
     t_yr += DT_YR
 
@@ -265,6 +291,7 @@ for step in range(N_STEPS):
             'T_surf': T_surf_np,
             'T_bed': T_bed,
             'T_avg': T_avg,
+            'T_3d': T_3d.copy(),
             'B': cp.asnumpy(grid.rheology.B.data).copy(),
             'H': H_np.copy(),
             'speed': speed.copy(),
@@ -396,3 +423,56 @@ plt.tight_layout()
 plt.savefig(OUT_DIR / 'coupled_dome_maps.png', dpi=150)
 plt.show()
 print(f"  Saved: {OUT_DIR / 'coupled_dome_maps.png'}")
+
+# ========================================================
+# Cross-section plots: temperature through the dome center (y=0)
+# One subplot per snapshot time, showing T(x, sigma) as a heatmap
+# with the ice geometry overlaid.
+# ========================================================
+sigma = cp.asnumpy(thermal.ops.sigma)
+i_mid = ny // 2
+
+# Global T range across all cross-sections (ice-covered cells only)
+T_all = []
+for snap in snapshots_map.values():
+    T_row = snap['T_3d'][i_mid, :, :]
+    H_row = snap['H'][i_mid, :]
+    for j in range(nx):
+        if H_row[j] >= 50.0:
+            T_all.extend(T_row[j, :].tolist())
+T_vmin, T_vmax = min(T_all), max(T_all)
+
+fig3, axes3 = plt.subplots(len(snap_keys), 1,
+                            figsize=(12, 3.5 * len(snap_keys)),
+                            sharex=True)
+if len(snap_keys) == 1:
+    axes3 = [axes3]
+
+for idx, step_key in enumerate(snap_keys):
+    ax = axes3[idx]
+    snap = snapshots_map[step_key]
+
+    T_row = snap['T_3d'][i_mid, :, :]  # (nx, nz)
+    H_row = snap['H'][i_mid, :]         # (nx,)
+
+    # Mask where no ice
+    T_masked = T_row.copy()
+    for j in range(nx):
+        if H_row[j] < 50.0:
+            T_masked[j, :] = np.nan
+
+    im = ax.pcolormesh(x_km, sigma, T_masked.T,
+                       cmap='RdYlBu_r', shading='auto',
+                       vmin=T_vmin, vmax=T_vmax)
+    cb = fig3.colorbar(im, ax=ax, label='T (K)')
+    cb.ax.yaxis.get_major_formatter().set_useOffset(False)
+
+    ax.set_ylabel(r'$\sigma$ (bed=0, sfc=1)')
+    ax.set_title(f't = {snap["t_yr"]:.0f} yr')
+
+axes3[-1].set_xlabel('x (km)')
+fig3.suptitle('Temperature Cross-Section (y = 0)', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.savefig(OUT_DIR / 'coupled_dome_cross_sections.png', dpi=150)
+plt.show()
+print(f"  Saved: {OUT_DIR / 'coupled_dome_cross_sections.png'}")

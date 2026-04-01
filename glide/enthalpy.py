@@ -35,7 +35,7 @@ T_MELT = 273.15      # Melting point at standard pressure (K)
 BETA_CC = 7.9e-8     # Clausius-Clapeyron constant (K/Pa)
 GRAVITY = 9.81       # Gravitational acceleration (m/s^2)
 K_COLD = K_I / C_I   # Enthalpy diffusion coeff k_i/c_i (kg/(m*s)), not thermal diffusivity
-K_TEMP_FACTOR = 1e-5 # Temperate diffusivity reduction factor
+K_TEMP_FACTOR = 1e-1 # Temperate diffusivity reduction factor (Aschwanden et al. 2012)
 K_TEMP = K_COLD * K_TEMP_FACTOR
 
 
@@ -143,6 +143,27 @@ class EnthalpyVelocity:
 
 
 @dataclass
+class EnthalpyTermFlags:
+    """Flags controlling which physics terms are active in the enthalpy solver.
+
+    All terms are enabled by default. Disabling terms is useful for
+    debugging convergence and isolating the effect of individual physics.
+    """
+    horizontal_advection: bool = True
+    sigma_dot: bool = True
+    strain_heating: bool = True
+    drainage: bool = True
+
+    @property
+    def bitmask(self) -> int:
+        """Pack flags into the integer bitmask expected by CUDA kernels."""
+        return ((1 if self.horizontal_advection else 0)
+              | ((1 if self.sigma_dot else 0) << 1)
+              | ((1 if self.strain_heating else 0) << 2)
+              | ((1 if self.drainage else 0) << 3))
+
+
+@dataclass
 class ColumnSmootherConfig:
     """Configuration for the column-wise Newton/Thomas smoother.
 
@@ -225,6 +246,7 @@ class EnthalpyOperators:
         self.delta_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
 
         self.smoother_config = ColumnSmootherConfig()
+        self.term_flags = EnthalpyTermFlags()
 
     @property
     def _column_launch_config(self):
@@ -300,6 +322,7 @@ class EnthalpyOperators:
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
                 forcing.h_thin.value,
+                cp.int32(self.term_flags.bitmask),
                 grid.ny, grid.nx, self.nz))
 
         return cp.linalg.norm(self.r_E)
@@ -334,6 +357,7 @@ class EnthalpyOperators:
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
                 forcing.h_thin.value,
+                cp.int32(self.term_flags.bitmask),
                 grid.ny, grid.nx, self.nz,
                 cfg.n_newton, cfg.relaxation))
 
@@ -415,6 +439,17 @@ class EnthalpyOperators:
         elif T.ndim == 2:
             T = cp.broadcast_to(T[:, :, None],
                                 (self.grid.ny, self.grid.nx, self.nz)).copy()
+
+        # Cap temperature at the local pressure melting point.
+        # Ice cannot exceed T_pmp; excess energy would be latent heat
+        # (water content), which should be set explicitly if needed.
+        H = self.grid.state.H.data
+        for k in range(self.nz):
+            sigma_k = float(self.sigma[k])
+            depth = (1.0 - sigma_k) * H
+            T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth
+            T[:, :, k] = cp.minimum(T[:, :, k], T_pmp)
+
         self.enthalpy_state.E[:] = C_I * (T - T_REF)
         self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
 

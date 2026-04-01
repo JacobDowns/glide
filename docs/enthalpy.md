@@ -293,7 +293,7 @@ Both `enthalpy_compute_residual` and `enthalpy_column_smooth` call the same `get
 #### Enthalpy Jacobian structs
 
 | Struct | Term | Derivatives | Momentum analogue |
-|------------------|------------------|------------------|:------------------:|
+|------------------|------------------|------------------|:-----------------:|
 | `ColumnDiffusionJacobian` | $-(1/h^2)\,\partial_\sigma(K\,\partial_\sigma E)$ (interior) | `d_E_km1`, `d_E_k`, `d_E_kp1` | `SigmaNormalJacobian` |
 | `BedDiffusionJacobian` | Same, Neumann BC at $k=0$ | `d_E_k`, `d_E_kp1` | — |
 | `SigmaAdvectionJacobian` | $\rho_i\,\dot\sigma\,\partial_\sigma E$ (upwind, interior) | `d_E_km1`, `d_E_k`, `d_E_kp1` | `HorizontalFluxJacobian` |
@@ -464,12 +464,12 @@ which is solved by Brent's method.
 
 ### Advection-diffusion (`test_enthalpy_advection.py`)
 
-| Parameter | Value |
-|-----------|-------|
-| $H$ | 1000 m |
-| $T_s$ | 243.15 K ($-30°$C) |
-| $Q_{\text{geo}}$ | 0.04 W/m$^2$ |
-| $N_z$ | 41 (uniform $\sigma$) |
+| Parameter        | Value                 |
+|------------------|-----------------------|
+| $H$              | 1000 m                |
+| $T_s$            | 243.15 K ($-30°$C)    |
+| $Q_{\text{geo}}$ | 0.04 W/m$^2$          |
+| $N_z$            | 41 (uniform $\sigma$) |
 
 Same cold slab as the cold column test, but with prescribed vertical advection ($\dot\sigma \neq 0$). No horizontal velocity. The base stays cold so $K = K_c$ throughout.
 
@@ -493,11 +493,7 @@ $$E(\sigma) = E_s + \frac{h\,Q_{\text{geo}}}{K_c}\sqrt{\frac{\pi}{2\,\text{Pe}_R
 
 The test uses $\text{Pe}_R = 10$ ($\text{SMB} \approx 0.36$ m/yr). This case also tests the `BedSigmaAdvection` stencil at $k=0$ where $\dot\sigma = 0$: the one-sided upwind correctly contributes nothing when there is no flow through the bed.
 
-**What they test:**
-- Sigma advection stencils (`get_sigma_advection_jac`, `get_bed_sigma_advection_jac`)
-- Advection-diffusion coupling in the column tridiagonal system
-- Correct upwind direction: downward $\dot\sigma$ upwinds from above
-- Convergence to analytical solution for both constant and depth-varying $\dot\sigma$
+**What they test:** - Sigma advection stencils (`get_sigma_advection_jac`, `get_bed_sigma_advection_jac`) - Advection-diffusion coupling in the column tridiagonal system - Correct upwind direction: downward $\dot\sigma$ upwinds from above - Convergence to analytical solution for both constant and depth-varying $\dot\sigma$
 
 **Tolerance:** Enthalpy relative error $< 2\%$ ($\sim 0.9\%$ constant, $\sim 0.6\%$ Robin). The discretization error is $O(\Delta\sigma)$ from the upwind scheme.
 

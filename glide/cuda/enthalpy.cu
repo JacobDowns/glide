@@ -32,10 +32,20 @@
 #define BETA_CC 7.9e-8f     // Clausius-Clapeyron constant (K/Pa)
 #define GRAVITY 9.81f       // Gravitational acceleration (m/s^2)
 #define K_COLD  (K_I/C_I)   // Diffusivity for cold ice
-#define K_TEMP_FACTOR 1e-5f // Temperate conductivity reduction factor
+#define K_TEMP_FACTOR 1e-1f // Temperate conductivity reduction factor (Aschwanden et al. 2012)
 
 // Maximum number of vertical sigma levels
 #define MAX_NZ 64
+
+// Drainage smoothing sharpness (same as K(E) sigmoid)
+#define DRAIN_SHARPNESS 0.01f
+
+// Term toggle bitmask flags
+#define TERM_HORIZ_ADV    (1 << 0)
+#define TERM_SIGMA_DOT    (1 << 1)
+#define TERM_STRAIN_HEAT  (1 << 2)
+#define TERM_DRAINAGE     (1 << 3)
+#define TERM_ALL          (0xF)
 
 
 // ---- Helper: enthalpy at pressure melting point ----
@@ -68,13 +78,24 @@ float get_dK_dE(float E, float E_pmp) {
     return K_COLD * (K_TEMP_FACTOR - 1.0f) * ds_dE;
 }
 
-// ---- Helper: water content from enthalpy ----
+// ---- Helper: water content from enthalpy (smoothed) ----
 __device__ __forceinline__
 float get_omega(float E, float E_pmp) {
-    if (E > E_pmp) {
-        return (E - E_pmp) / L_HEAT;
-    }
-    return 0.0f;
+    // Softplus approximation of max(E - E_pmp, 0) / L_HEAT
+    float x = E - E_pmp;
+    float ax = DRAIN_SHARPNESS * x;
+    ax = fminf(fmaxf(ax, -20.0f), 20.0f);
+    float sp = (ax > 10.0f) ? x : __logf(1.0f + __expf(ax)) / DRAIN_SHARPNESS;
+    return sp / L_HEAT;
+}
+
+// ---- Helper: d(omega_smooth)/dE — sigmoid ----
+__device__ __forceinline__
+float get_domega_dE(float E, float E_pmp) {
+    float z = DRAIN_SHARPNESS * (E - E_pmp);
+    z = fminf(fmaxf(z, -20.0f), 20.0f);
+    float s = 1.0f / (1.0f + __expf(-z));
+    return s / L_HEAT;
 }
 
 // ---- Helper: drainage function Dw(omega) ----
@@ -185,13 +206,19 @@ ColumnDiffusionJacobian get_column_diffusion_jac(ColumnDiffusionStencil s) {
     // Uniform spacing: dsig_avg = dsig_m = dsig_p = dsig
     float dsig2_inv = 1.0f / (s.dsig * s.dsig);
 
-    // Residual: -(1/h^2) * [K_upper*(E_kp1-E_k) - K_lower*(E_k-E_km1)] / dsig^2
-    jac.res = -s.h2_inv * dsig2_inv * (K_upper * (s.E_kp1 - s.E_k)
-                                      - K_lower * (s.E_k - s.E_km1));
+    float dE_upper = s.E_kp1 - s.E_k;
+    float dE_lower = s.E_k - s.E_km1;
 
-    // Jacobian entries (linearized: freeze K at current state)
-    float diff_lower = s.h2_inv * K_lower * dsig2_inv;
-    float diff_upper = s.h2_inv * K_upper * dsig2_inv;
+    // Residual: -(1/h^2) * [K_upper*(E_kp1-E_k) - K_lower*(E_k-E_km1)] / dsig^2
+    jac.res = -s.h2_inv * dsig2_inv * (K_upper * dE_upper - K_lower * dE_lower);
+
+    // Jacobian entries: freeze K at current state.
+    // Including dK/dE chain-rule terms is exact for small perturbations
+    // but catastrophic when dE across a layer is large (e.g., warm surface
+    // BC on cold ice), as the chain term overwhelms the diagonal.
+    // The frozen-K Jacobian is always positive-definite and stable.
+    float diff_lower = s.h2_inv * dsig2_inv * K_lower;
+    float diff_upper = s.h2_inv * dsig2_inv * K_upper;
 
     jac.d_E_km1 = -diff_lower;
     jac.d_E_kp1 = -diff_upper;
@@ -268,7 +295,7 @@ BedDiffusionJacobian get_bed_diffusion_jac(BedDiffusionStencil s) {
     jac.res = (-s.h2_inv * K_half * (s.E_kp1 - s.E_k) / s.dsig
                - (s.Q_geo + s.Q_fh) * s.h_inv) / dsig_half;
 
-    // Jacobian (freeze K)
+    // Jacobian: freeze K at current state (see interior comment)
     float coeff = s.h2_inv * K_half / (s.dsig * dsig_half);
     jac.d_E_k   =  coeff;
     jac.d_E_kp1 = -coeff;
@@ -518,10 +545,10 @@ DrainageJacobian get_drainage_jac(DrainageStencil s) {
     float omega = get_omega(s.E_k, s.E_pmp_k);
     jac.res = RHO_W * L_HEAT * get_drainage(omega, s.drain_rate);
 
-    // d/dE(rho_w * L * drain_rate * omega) = rho_w * drain_rate when E > E_pmp
-    if (s.E_k > s.E_pmp_k) {
-        jac.d_E_k = RHO_W * s.drain_rate;
-    }
+    // Smoothed Jacobian: d/dE(rho_w * L * drain_rate * omega_smooth)
+    //                   = rho_w * L * drain_rate * sigmoid(alpha*(E - E_pmp)) / L
+    //                   = rho_w * drain_rate * sigmoid(alpha*(E - E_pmp))
+    jac.d_E_k = RHO_W * L_HEAT * s.drain_rate * get_domega_dE(s.E_k, s.E_pmp_k);
 
     return jac;
 }
@@ -636,6 +663,7 @@ void enthalpy_compute_residual(
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
     const float* __restrict__ Q_fh,     // (ny, nx) frictional heating
     float dx, float dt, float drain_rate, float h_thin,
+    int term_flags,
     int ny, int nx, int nz)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -647,9 +675,7 @@ void enthalpy_compute_residual(
 
     float h = H[i * nx + j];
 
-    // Thin-ice bypass: clamp entire column to surface enthalpy
-    // Thin-ice and surface Dirichlet cells are not solver unknowns.
-    // Their residual is zero so they don't pollute the convergence norm.
+    // Thin-ice bypass: not a solver unknown, zero residual.
     if (h < h_thin) {
         for (int k = 0; k < nz; k++) {
             r_E[(i * nx + j) * nz + k] = 0.0f;
@@ -679,33 +705,37 @@ void enthalpy_compute_residual(
         float r = RHO_I * (E_k - E_prev[ijk]) / dt - f_E[ijk];
 
         // --- Horizontal advection ---
-        HorizAdvectionResult h_adv = get_horiz_advection(
-            E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv);
-        r += h_adv.res;
+        if (term_flags & TERM_HORIZ_ADV) {
+            HorizAdvectionResult h_adv = get_horiz_advection(
+                E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv);
+            r += h_adv.res;
+        }
 
         // --- Vertical advection + diffusion ---
         if (k == 0) {
             // Bed boundary
             float E_pmp_bed = get_E_pmp(0.0f, h);
-
             float E_kp1 = get_E(E, i, j, 1, ny, nx, nz);
 
-            BedSigmaAdvectionJacobian adv_jac = get_bed_sigma_advection_jac(
-                {E_k, E_kp1, sigma_dot[ijk], dsig});
-            r += adv_jac.res;
+            if (term_flags & TERM_SIGMA_DOT) {
+                BedSigmaAdvectionJacobian adv_jac = get_bed_sigma_advection_jac(
+                    {E_k, E_kp1, sigma_dot[ijk], dsig});
+                r += adv_jac.res;
+            }
 
             BedDiffusionJacobian diff_jac = get_bed_diffusion_jac(
                 {E_k, E_kp1, E_pmp_bed, get_E_pmp(dsig, h),
                  dsig, h2_inv, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
             r += diff_jac.res;
 
-            // Geothermal and frictional heat continue to enter the column
-            // after the bed reaches pressure melting. Excess enthalpy is
-            // carried as latent heat and may be removed only by drainage.
-            float phi_k = phi_strain[ijk];
-            DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
-            r -= phi_k;
-            r += drain_jac.res;
+            if (term_flags & TERM_STRAIN_HEAT) {
+                r -= phi_strain[ijk];
+            }
+
+            if (term_flags & TERM_DRAINAGE) {
+                DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
+                r += drain_jac.res;
+            }
         } else {
             // Interior layers (k = 1 .. nz-2)
             float E_km1 = get_E(E, i, j, k-1, ny, nx, nz);
@@ -715,20 +745,25 @@ void enthalpy_compute_residual(
             float E_pmp_km1 = get_E_pmp(max(k-1, 0) * dsig, h);
             float E_pmp_kp1 = get_E_pmp(min(k+1, nz-1) * dsig, h);
 
-            SigmaAdvectionJacobian adv_jac = get_sigma_advection_jac(
-                {E_km1, E_k, E_kp1, sigma_dot[ijk], dsig});
-            r += adv_jac.res;
+            if (term_flags & TERM_SIGMA_DOT) {
+                SigmaAdvectionJacobian adv_jac = get_sigma_advection_jac(
+                    {E_km1, E_k, E_kp1, sigma_dot[ijk], dsig});
+                r += adv_jac.res;
+            }
 
             ColumnDiffusionJacobian diff_jac = get_column_diffusion_jac(
                 {E_km1, E_k, E_kp1, E_pmp_km1, E_pmp_k, E_pmp_kp1,
                  dsig, h2_inv});
             r += diff_jac.res;
 
-            // Source terms
-            float phi_k = phi_strain[ijk];
-            DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
-            r -= phi_k;
-            r += drain_jac.res;
+            if (term_flags & TERM_STRAIN_HEAT) {
+                r -= phi_strain[ijk];
+            }
+
+            if (term_flags & TERM_DRAINAGE) {
+                DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
+                r += drain_jac.res;
+            }
         }
 
         r_E[ijk] = r;
@@ -762,6 +797,7 @@ void enthalpy_column_smooth(
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
     const float* __restrict__ Q_fh,     // (ny, nx) frictional heating
     float dx, float dt, float drain_rate, float h_thin,
+    int term_flags,
     int ny, int nx, int nz,
     int n_newton, float relaxation)
 {
@@ -774,11 +810,17 @@ void enthalpy_column_smooth(
 
     float h = H[i * nx + j];
 
-    // Thin-ice bypass: correction drives entire column toward E_surface
+    // Thin-ice bypass: drive column toward E_surface, capped at E_pmp
+    // at each sigma level. Without the cap, margin columns at the surface
+    // melting point would store spurious latent heat at depth, which can
+    // leak into adjacent thick columns via horizontal advection.
     if (h < h_thin) {
         float E_s = E_surface[i * nx + j];
+        float dsig_thin = 1.0f / (float)(nz - 1);
         for (int k = 0; k < nz; k++) {
-            delta_E[(i * nx + j) * nz + k] = E_s - E[(i * nx + j) * nz + k];
+            float E_pmp_k = get_E_pmp(k * dsig_thin, h);
+            float E_target = fminf(E_s, E_pmp_k);
+            delta_E[(i * nx + j) * nz + k] = E_target - E[(i * nx + j) * nz + k];
         }
         return;
     }
@@ -795,15 +837,19 @@ void enthalpy_column_smooth(
     }
 
     // Precompute horizontal advection per layer (frozen neighbors).
-    // We store both the residual and the diagonal Jacobian contribution
-    // from outflow faces where E_here is the upwind donor.
     float horiz_adv_res[MAX_NZ];
     float horiz_adv_diag[MAX_NZ];
     for (int k = 0; k < nz; k++) {
-        HorizAdvectionResult h_adv = get_horiz_advection(
-            E, u3d, v3d, E_local[k], i, j, k, ny, nx, nz, dx_inv);
-        horiz_adv_res[k]  = h_adv.res;
-        horiz_adv_diag[k] = h_adv.d_E_here;
+        horiz_adv_res[k] = 0.0f;
+        horiz_adv_diag[k] = 0.0f;
+    }
+    if (term_flags & TERM_HORIZ_ADV) {
+        for (int k = 0; k < nz; k++) {
+            HorizAdvectionResult h_adv = get_horiz_advection(
+                E, u3d, v3d, E_local[k], i, j, k, ny, nx, nz, dx_inv);
+            horiz_adv_res[k]  = h_adv.res;
+            horiz_adv_diag[k] = h_adv.d_E_here;
+        }
     }
 
     // --- Newton iteration ---
@@ -841,9 +887,12 @@ void enthalpy_column_smooth(
             r += horiz_adv_res[0] + horiz_adv_diag[0] * (E_k - E[(i*nx+j)*nz]);
 
             // Vertical advection at bed
-            BedSigmaAdvectionJacobian adv_jac = get_bed_sigma_advection_jac(
-                {E_k, E_kp1, sigma_dot[(i*nx+j)*nz], dsig});
-            r += adv_jac.res;
+            BedSigmaAdvectionJacobian adv_jac = {0};
+            if (term_flags & TERM_SIGMA_DOT) {
+                adv_jac = get_bed_sigma_advection_jac(
+                    {E_k, E_kp1, sigma_dot[(i*nx+j)*nz], dsig});
+                r += adv_jac.res;
+            }
 
             // Diffusion with persistent basal heat flux
             BedDiffusionJacobian diff_jac = get_bed_diffusion_jac(
@@ -852,11 +901,16 @@ void enthalpy_column_smooth(
                  Q_geo[i*nx+j], Q_fh[i*nx+j]});
             r += diff_jac.res;
 
-            // Source
-            float phi_k = phi_strain[(i*nx+j)*nz];
-            DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
-            r -= phi_k;
-            r += drain_jac.res;
+            // Source terms
+            if (term_flags & TERM_STRAIN_HEAT) {
+                r -= phi_strain[(i*nx+j)*nz];
+            }
+
+            DrainageJacobian drain_jac = {0};
+            if (term_flags & TERM_DRAINAGE) {
+                drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
+                r += drain_jac.res;
+            }
 
             // Jacobian: assemble from struct derivatives
             b[0] = RHO_I / dt
@@ -886,19 +940,27 @@ void enthalpy_column_smooth(
             float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz + k]) / dt - f_E[(i*nx+j)*nz + k];
             r += horiz_adv_res[k] + horiz_adv_diag[k] * (E_k - E[(i*nx+j)*nz + k]);
 
-            SigmaAdvectionJacobian adv_jac = get_sigma_advection_jac(
-                {E_km1, E_k, E_kp1, sigma_dot[(i*nx+j)*nz + k], dsig});
-            r += adv_jac.res;
+            SigmaAdvectionJacobian adv_jac = {0};
+            if (term_flags & TERM_SIGMA_DOT) {
+                adv_jac = get_sigma_advection_jac(
+                    {E_km1, E_k, E_kp1, sigma_dot[(i*nx+j)*nz + k], dsig});
+                r += adv_jac.res;
+            }
 
             ColumnDiffusionJacobian diff_jac = get_column_diffusion_jac(
                 {E_km1, E_k, E_kp1, E_pmp_km1, E_pmp_k, E_pmp_kp1,
                  dsig, h2_inv});
             r += diff_jac.res;
 
-            float phi_k = phi_strain[(i*nx+j)*nz + k];
-            DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
-            r -= phi_k;
-            r += drain_jac.res;
+            if (term_flags & TERM_STRAIN_HEAT) {
+                r -= phi_strain[(i*nx+j)*nz + k];
+            }
+
+            DrainageJacobian drain_jac = {0};
+            if (term_flags & TERM_DRAINAGE) {
+                drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
+                r += drain_jac.res;
+            }
 
             // --- Assemble tridiagonal from Jacobian structs ---
             a[k] = diff_jac.d_E_km1 + adv_jac.d_E_km1;

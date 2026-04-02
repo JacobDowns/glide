@@ -772,15 +772,28 @@ void enthalpy_compute_residual(
 
 
 /* =========================================================
-   Column-wise Newton/Thomas smoother.
+   Column-wise Newton smoother (Vanka-style).
 
-   For each column (i,j), freezes horizontal neighbors and
-   solves the vertical tridiagonal system using the Thomas
-   algorithm. Newton iteration handles the K(E) nonlinearity.
+   For each column (i,j), performs n_newton Newton steps:
+   1. Evaluate the FULL PDE residual at every node using
+      E_local (which starts as a copy of the global E)
+      for vertical neighbors, and the global E for horizontal
+      neighbors (frozen, as in the Vanka pattern).
+   2. Extract the column-local tridiagonal Jacobian (vertical
+      coupling + horizontal advection diagonal)
+   3. Solve J_col * dE = -R via the Thomas algorithm
+   4. Update E_local += relaxation * dE
 
-   Uses the same get_*_jac() functions as the residual kernel.
-   The Jacobian .d_E_* fields map directly to the tridiagonal
-   entries a[k], b[k], c[k], guaranteeing consistency.
+   The horizontal advection residual is re-evaluated each
+   Newton step using the current E_local value for the center
+   cell and the global E for horizontal neighbors. This means
+   the residual at the center cell is always the true PDE
+   residual (no linearization of horizontal terms), while
+   neighbor values remain frozen across Newton iterations.
+
+   This mirrors the Vanka smoother for the momentum balance:
+   local Newton iteration with full PDE residual, Jacobian
+   restricted to the local block.
    ========================================================= */
 extern "C" __global__
 void enthalpy_column_smooth(
@@ -811,9 +824,6 @@ void enthalpy_column_smooth(
     float h = H[i * nx + j];
 
     // Thin-ice bypass: drive column toward E_surface, capped at E_pmp
-    // at each sigma level. Without the cap, margin columns at the surface
-    // melting point would store spurious latent heat at depth, which can
-    // leak into adjacent thick columns via horizontal advection.
     if (h < h_thin) {
         float E_s = E_surface[i * nx + j];
         float dsig_thin = 1.0f / (float)(nz - 1);
@@ -829,146 +839,120 @@ void enthalpy_column_smooth(
     float h2_inv = h_inv * h_inv;
     float dx_inv = 1.0f / dx;
     float dsig = 1.0f / (float)(nz - 1);
+    float E_s = E_surface[i * nx + j];
 
-    // Local copy of column enthalpy for Newton iteration
+    // Local copy of column enthalpy for Newton iteration.
+    // Vertical neighbors come from E_local (updated each Newton step).
+    // Horizontal neighbors come from global E (frozen across Newton steps).
     float E_local[MAX_NZ];
     for (int k = 0; k < nz; k++) {
         E_local[k] = E[(i * nx + j) * nz + k];
     }
 
-    // Precompute horizontal advection per layer (frozen neighbors).
-    float horiz_adv_res[MAX_NZ];
-    float horiz_adv_diag[MAX_NZ];
-    for (int k = 0; k < nz; k++) {
-        horiz_adv_res[k] = 0.0f;
-        horiz_adv_diag[k] = 0.0f;
-    }
-    if (term_flags & TERM_HORIZ_ADV) {
-        for (int k = 0; k < nz; k++) {
-            HorizAdvectionResult h_adv = get_horiz_advection(
-                E, u3d, v3d, E_local[k], i, j, k, ny, nx, nz, dx_inv);
-            horiz_adv_res[k]  = h_adv.res;
-            horiz_adv_diag[k] = h_adv.d_E_here;
-        }
-    }
-
     // --- Newton iteration ---
     for (int newton = 0; newton < n_newton; newton++) {
 
-        // Build tridiagonal: a[k]*dE[k-1] + b[k]*dE[k] + c[k]*dE[k+1] = -r[k]
         float a[MAX_NZ], b[MAX_NZ], c_arr[MAX_NZ], rhs[MAX_NZ];
 
-        float E_s = E_surface[i * nx + j];
-
         for (int k = 0; k < nz; k++) {
-            a[k] = 0.0f;
-            b[k] = 0.0f;
-            c_arr[k] = 0.0f;
-            rhs[k] = 0.0f;
-        }
+            int ijk = (i * nx + j) * nz + k;
 
-        // Surface: Dirichlet
-        {
-            int k = nz - 1;
-            b[k] = 1.0f;
-            rhs[k] = -(E_local[k] - E_s);
-        }
-
-        // Bed: k = 0
-        {
-            float E_k = E_local[0];
-            float E_pmp_bed = get_E_pmp(0.0f, h);
-
-            float E_kp1 = E_local[1];
-            float E_pmp_1 = get_E_pmp(dsig, h);
-
-            // Residual (linearized horizontal advection at current iterate)
-            float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz]) / dt - f_E[(i*nx+j)*nz];
-            r += horiz_adv_res[0] + horiz_adv_diag[0] * (E_k - E[(i*nx+j)*nz]);
-
-            // Vertical advection at bed
-            BedSigmaAdvectionJacobian adv_jac = {0};
-            if (term_flags & TERM_SIGMA_DOT) {
-                adv_jac = get_bed_sigma_advection_jac(
-                    {E_k, E_kp1, sigma_dot[(i*nx+j)*nz], dsig});
-                r += adv_jac.res;
+            // --- Surface: Dirichlet ---
+            if (k == nz - 1) {
+                a[k] = 0.0f;
+                b[k] = 1.0f;
+                c_arr[k] = 0.0f;
+                rhs[k] = -(E_local[k] - E_s);
+                continue;
             }
 
-            // Diffusion with persistent basal heat flux
-            BedDiffusionJacobian diff_jac = get_bed_diffusion_jac(
-                {E_k, E_kp1, E_pmp_bed, E_pmp_1,
-                 dsig, h2_inv, h_inv,
-                 Q_geo[i*nx+j], Q_fh[i*nx+j]});
-            r += diff_jac.res;
-
-            // Source terms
-            if (term_flags & TERM_STRAIN_HEAT) {
-                r -= phi_strain[(i*nx+j)*nz];
-            }
-
-            DrainageJacobian drain_jac = {0};
-            if (term_flags & TERM_DRAINAGE) {
-                drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
-                r += drain_jac.res;
-            }
-
-            // Jacobian: assemble from struct derivatives
-            b[0] = RHO_I / dt
-                 + diff_jac.d_E_k
-                 + adv_jac.d_E_k
-                 + drain_jac.d_E_k
-                 + horiz_adv_diag[0];
-            c_arr[0] = diff_jac.d_E_kp1
-                     + adv_jac.d_E_kp1;
-
-            rhs[0] = -r;
-        }
-
-        // Interior layers: k = 1 .. nz-2
-        for (int k = 1; k < nz - 1; k++) {
             float E_k = E_local[k];
             float sigma_k = k * dsig;
             float E_pmp_k = get_E_pmp(sigma_k, h);
 
-            float E_km1 = E_local[k-1];
-            float E_kp1 = (k < nz - 1) ? E_local[k+1] : E_s;
+            // --- Full PDE residual ---
+            float r = RHO_I * (E_k - E_prev[ijk]) / dt - f_E[ijk];
 
-            float E_pmp_km1 = get_E_pmp((k-1) * dsig, h);
-            float E_pmp_kp1 = get_E_pmp(min(k+1, nz-1) * dsig, h);
-
-            // --- Residual and Jacobian via struct functions ---
-            float r = RHO_I * (E_k - E_prev[(i*nx+j)*nz + k]) / dt - f_E[(i*nx+j)*nz + k];
-            r += horiz_adv_res[k] + horiz_adv_diag[k] * (E_k - E[(i*nx+j)*nz + k]);
-
-            SigmaAdvectionJacobian adv_jac = {0};
-            if (term_flags & TERM_SIGMA_DOT) {
-                adv_jac = get_sigma_advection_jac(
-                    {E_km1, E_k, E_kp1, sigma_dot[(i*nx+j)*nz + k], dsig});
-                r += adv_jac.res;
+            // Horizontal advection: evaluate with E_k from E_local (current
+            // Newton iterate) and neighbors from global E (frozen).
+            // get_horiz_advection reads E_here as a parameter (we pass E_k)
+            // and neighbors via get_E() from the global E array.
+            float horiz_diag = 0.0f;
+            if (term_flags & TERM_HORIZ_ADV) {
+                HorizAdvectionResult h_adv = get_horiz_advection(
+                    E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv);
+                r += h_adv.res;
+                horiz_diag = h_adv.d_E_here;
             }
 
-            ColumnDiffusionJacobian diff_jac = get_column_diffusion_jac(
-                {E_km1, E_k, E_kp1, E_pmp_km1, E_pmp_k, E_pmp_kp1,
-                 dsig, h2_inv});
-            r += diff_jac.res;
+            // --- Vertical terms (from E_local) + Jacobian ---
+            if (k == 0) {
+                float E_pmp_bed = get_E_pmp(0.0f, h);
+                float E_kp1 = E_local[1];
 
-            if (term_flags & TERM_STRAIN_HEAT) {
-                r -= phi_strain[(i*nx+j)*nz + k];
+                BedSigmaAdvectionJacobian adv_jac = {0};
+                if (term_flags & TERM_SIGMA_DOT) {
+                    adv_jac = get_bed_sigma_advection_jac(
+                        {E_k, E_kp1, sigma_dot[ijk], dsig});
+                    r += adv_jac.res;
+                }
+
+                BedDiffusionJacobian diff_jac = get_bed_diffusion_jac(
+                    {E_k, E_kp1, E_pmp_bed, get_E_pmp(dsig, h),
+                     dsig, h2_inv, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
+                r += diff_jac.res;
+
+                if (term_flags & TERM_STRAIN_HEAT) {
+                    r -= phi_strain[ijk];
+                }
+
+                DrainageJacobian drain_jac = {0};
+                if (term_flags & TERM_DRAINAGE) {
+                    drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
+                    r += drain_jac.res;
+                }
+
+                a[0] = 0.0f;
+                b[0] = RHO_I / dt
+                     + diff_jac.d_E_k + adv_jac.d_E_k
+                     + drain_jac.d_E_k + horiz_diag;
+                c_arr[0] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
+
+            } else {
+                float E_km1 = E_local[k-1];
+                float E_kp1 = (k < nz-1) ? E_local[k+1] : E_s;
+
+                float E_pmp_km1 = get_E_pmp(max(k-1, 0) * dsig, h);
+                float E_pmp_kp1 = get_E_pmp(min(k+1, nz-1) * dsig, h);
+
+                SigmaAdvectionJacobian adv_jac = {0};
+                if (term_flags & TERM_SIGMA_DOT) {
+                    adv_jac = get_sigma_advection_jac(
+                        {E_km1, E_k, E_kp1, sigma_dot[ijk], dsig});
+                    r += adv_jac.res;
+                }
+
+                ColumnDiffusionJacobian diff_jac = get_column_diffusion_jac(
+                    {E_km1, E_k, E_kp1, E_pmp_km1, E_pmp_k, E_pmp_kp1,
+                     dsig, h2_inv});
+                r += diff_jac.res;
+
+                if (term_flags & TERM_STRAIN_HEAT) {
+                    r -= phi_strain[ijk];
+                }
+
+                DrainageJacobian drain_jac = {0};
+                if (term_flags & TERM_DRAINAGE) {
+                    drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
+                    r += drain_jac.res;
+                }
+
+                a[k] = diff_jac.d_E_km1 + adv_jac.d_E_km1;
+                b[k] = RHO_I / dt
+                     + diff_jac.d_E_k + adv_jac.d_E_k
+                     + drain_jac.d_E_k + horiz_diag;
+                c_arr[k] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
             }
-
-            DrainageJacobian drain_jac = {0};
-            if (term_flags & TERM_DRAINAGE) {
-                drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
-                r += drain_jac.res;
-            }
-
-            // --- Assemble tridiagonal from Jacobian structs ---
-            a[k] = diff_jac.d_E_km1 + adv_jac.d_E_km1;
-            c_arr[k] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
-            b[k] = RHO_I / dt
-                 + diff_jac.d_E_k + adv_jac.d_E_k
-                 + drain_jac.d_E_k
-                 + horiz_adv_diag[k];
 
             rhs[k] = -r;
         }
@@ -994,10 +978,9 @@ void enthalpy_column_smooth(
         }
     }
 
-    // Write out the total correction delta_E = E_local - E_original
+    // Write out the total correction
     for (int k = 0; k < nz; k++) {
-        int ijk = (i * nx + j) * nz + k;
-        delta_E[ijk] = E_local[k] - E[ijk];
+        delta_E[(i * nx + j) * nz + k] = E_local[k] - E[(i * nx + j) * nz + k];
     }
 }
 

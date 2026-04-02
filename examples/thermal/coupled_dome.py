@@ -45,7 +45,7 @@ DOME_HEIGHT = 3000.0   # m
 # Forcing
 SMB_CENTER = 2.       # m/yr ice equivalent (accumulation at center)
 SMB_EDGE = -5.0        # m/yr ice equivalent (ablation at margin)
-Q_GEO = 0.05          # W/m^2 (modest geothermal heat flux)
+Q_GEO = 0.0          # W/m^2 (modest geothermal heat flux)
 T_SEA_LEVEL = 273.15   # K (+5 C at sea level — margins reach melting)
 LAPSE_RATE = -6.5e-3   # K/m (standard atmospheric lapse rate)
 T_INIT = 263.15        # K (-10 C, uniform initial ice temperature)
@@ -65,7 +65,7 @@ N_SMOOTH = 10          # enthalpy smoothing sweeps
 
 # Time stepping
 DT_YR = 2.5          # years
-N_STEPS = 100
+N_STEPS = 200
 SEC_PER_YR = 365.25 * 86400.0
 
 # Output
@@ -141,7 +141,7 @@ thermal.ops.smoother_config.n_newton = 5
 thermal.ops.smoother_config.relaxation = cp.float32(1.0)
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_init, T_field=T_INIT, Q_geo=Q_GEO)
-thermal.ops.enthalpy_forcing.h_thin.set(25.0)
+thermal.ops.enthalpy_forcing.h_thin.set(10.0)
 
 # Set initial B from the Paterson-Budd law at the initial temperature,
 # so there is no discontinuity when the thermal model starts updating B.

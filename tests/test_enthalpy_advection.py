@@ -38,6 +38,7 @@ def _make_ops(nz=41):
     grid.sliding.u_reg.set(1.0)
 
     ops = EnthalpyOperators(grid, nz=nz)
+    ops.term_flags.horizontal_advection = False  # pure column test
     ops.initialize_from_temperature(T_SURFACE)
     ops.set_surface_enthalpy_from_temperature(
         cp.full((ny, nx), T_SURFACE, dtype=cp.float32))

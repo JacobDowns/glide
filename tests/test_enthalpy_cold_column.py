@@ -73,6 +73,7 @@ def test_cold_column():
 
     # ---- Enthalpy operator ----
     ops = EnthalpyOperators(grid, nz=nz)  # uniform sigma for clean comparison
+    ops.term_flags.horizontal_advection = False  # pure column test
 
     # Initialize with surface temperature everywhere
     ops.initialize_from_temperature(T_surface)
@@ -155,6 +156,7 @@ def test_cold_column_residual_convergence():
     grid.sliding.u_reg.set(1.0)
 
     ops = EnthalpyOperators(grid, nz=nz)
+    ops.term_flags.horizontal_advection = False  # pure column test
     ops.initialize_from_temperature(T_surface)
     ops.set_surface_enthalpy_from_temperature(
         cp.full((ny, nx), T_surface, dtype=cp.float32))

@@ -179,6 +179,7 @@ class ColumnSmootherConfig:
     relaxation: cp.float32 = cp.float32(1.0)
     relative_tolerance: cp.float32 = cp.float32(1e-5)
     absolute_tolerance: cp.float32 = cp.float32(1e-2)
+    lf_c: cp.float32 = cp.float32(1e-12)
     report_norms: bool = False
     hook_func: Callable[[int], None] = field(
         default_factory=lambda: lambda i: None)
@@ -322,6 +323,7 @@ class EnthalpyOperators:
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
                 forcing.h_thin.value,
+                self.smoother_config.lf_c,
                 cp.int32(self.term_flags.bitmask),
                 grid.ny, grid.nx, self.nz))
 
@@ -357,6 +359,7 @@ class EnthalpyOperators:
                 grid.dx, cp.float32(dt),
                 forcing.drain_rate.value,
                 forcing.h_thin.value,
+                cfg.lf_c,
                 cp.int32(self.term_flags.bitmask),
                 grid.ny, grid.nx, self.nz,
                 cfg.n_newton, cfg.relaxation))

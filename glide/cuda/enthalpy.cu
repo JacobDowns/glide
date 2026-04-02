@@ -438,65 +438,84 @@ DualFloat get_bed_sigma_advection_dual(BedSigmaAdvectionStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Horizontal Enthalpy Flux (per facet, upwind):
-     F = u * E_upwind
-   The "self" derivative (d_E_here) is needed for the column
-   Jacobian diagonal when E_here appears as the upwind donor.
+   Horizontal Enthalpy Flux (per facet, Lax-Friedrichs):
+     F = 0.5 * u * (E_here + E_neighbor) - 0.5 * alpha * (E_neighbor - E_here)
+   where alpha = sqrt(u^2 + LF_C) is the smoothed wave speed.
+
+   Mirrors the mass flux in flux.cu (get_horizontal_flux_jac).
+   With LF_C = 0: recovers exact upwind (non-differentiable at u=0).
+   With LF_C > 0: smooth Jacobian with baseline diffusion sqrt(LF_C).
+
+   The d_E_here derivative is always nonzero (no discontinuous
+   upwind switch), giving a more robust diagonal contribution
+   in the column smoother.
    --------------------------------------------------------- */
+
+// Default Lax-Friedrichs regularization constant (m^2/s^2).
+// Used as fallback if not passed as a kernel parameter.
+#define LF_C_DEFAULT 1e-12f
+
 struct HorizEnthalpyFluxStencil {
-    float u;          // facet velocity
-    float E_here;     // cell-center enthalpy of this column
-    float E_neighbor; // cell-center enthalpy of neighbor column
-    bool outflow;     // true if this column is the upwind donor
+    float u;          // facet velocity (positive = left-to-right)
+    float E_l;        // enthalpy on the left side of the face
+    float E_r;        // enthalpy on the right side of the face
 };
 
 struct HorizEnthalpyFluxStencilDual {
     float u;
-    DualFloat E_here;
-    DualFloat E_neighbor;
-    bool outflow;
+    DualFloat E_l;
+    DualFloat E_r;
 
     __device__ __forceinline__
     HorizEnthalpyFluxStencil get_primals() const {
-        return {u, E_here.v, E_neighbor.v, outflow};
+        return {u, E_l.v, E_r.v};
     }
 
     __device__ __forceinline__
     HorizEnthalpyFluxStencil get_diffs() const {
-        return {0.0f, E_here.d, E_neighbor.d, false};
+        return {0.0f, E_l.d, E_r.d};
     }
 };
 
 struct HorizEnthalpyFluxJacobian {
     float res;       // flux value
-    float d_E_here;  // derivative w.r.t. this column's E (for diagonal)
+    float d_E_l;     // derivative w.r.t. left cell E
+    float d_E_r;     // derivative w.r.t. right cell E
 
     __device__ __forceinline__
     float apply_jvp(const HorizEnthalpyFluxStencil& dot) const {
-        return d_E_here * dot.E_here;
+        return d_E_l * dot.E_l + d_E_r * dot.E_r;
     }
 };
 
 __device__ __forceinline__
-HorizEnthalpyFluxJacobian get_horiz_enthalpy_flux_jac(HorizEnthalpyFluxStencil s) {
+HorizEnthalpyFluxJacobian get_horiz_enthalpy_flux_jac(HorizEnthalpyFluxStencil s,
+                                                       float lf_c) {
     HorizEnthalpyFluxJacobian jac = {0};
 
-    if (s.outflow) {
-        // This column is the upwind donor: flux = u * E_here
-        jac.res = s.u * s.E_here;
-        jac.d_E_here = s.u;
-    } else {
-        // Neighbor is the upwind donor: flux = u * E_neighbor (frozen)
-        jac.res = s.u * s.E_neighbor;
-        jac.d_E_here = 0.0f;
-    }
+    // Lax-Friedrichs flux: central + dissipation
+    // Mirrors get_horizontal_flux_jac in flux.cu.
+    // alpha = |u| * sqrt(1 + lf_c) regularizes the upwind switch.
+    // Unlike sqrt(u^2 + lf_c), this produces zero dissipation when
+    // u = 0, preventing spurious cross-diffusion on quiescent faces.
+    // For nonzero u, it adds a fractional dissipation boost of
+    // sqrt(1 + lf_c) - 1 ≈ lf_c/2 relative to pure upwind.
+    float alpha = fabsf(s.u) * sqrtf(1.0f + lf_c);
+
+    // F = 0.5 * u * (E_l + E_r) - 0.5 * alpha * (E_r - E_l)
+    jac.res = 0.5f * s.u * (s.E_l + s.E_r)
+            - 0.5f * alpha * (s.E_r - s.E_l);
+
+    jac.d_E_l = 0.5f * (s.u + alpha);
+    jac.d_E_r = 0.5f * (s.u - alpha);
 
     return jac;
 }
 
 __device__ __forceinline__
-DualFloat get_horiz_enthalpy_flux_dual(HorizEnthalpyFluxStencilDual s) {
-    HorizEnthalpyFluxJacobian jac = get_horiz_enthalpy_flux_jac(s.get_primals());
+DualFloat get_horiz_enthalpy_flux_dual(HorizEnthalpyFluxStencilDual s,
+                                       float lf_c = LF_C_DEFAULT) {
+    HorizEnthalpyFluxJacobian jac = get_horiz_enthalpy_flux_jac(s.get_primals(), lf_c);
     return {jac.res, jac.apply_jvp(s.get_diffs())};
 }
 
@@ -584,7 +603,8 @@ HorizAdvectionResult get_horiz_advection(
     float E_here,
     int i, int j, int k,
     int ny, int nx, int nz,
-    float dx_inv)
+    float dx_inv,
+    float lf_c)
 {
     HorizAdvectionResult result = {0};
 
@@ -594,17 +614,22 @@ HorizAdvectionResult get_horiz_advection(
     float E_xm = get_E(E, i, j-1, k, ny, nx, nz);
     float E_xp = get_E(E, i, j+1, k, ny, nx, nz);
 
+    // x-direction faces:
+    //   left face (j-1/2):  E_l = E_xm (j-1), E_r = E_here (j)  => d_E_here = fl.d_E_r
+    //   right face (j+1/2): E_l = E_here (j),  E_r = E_xp (j+1) => d_E_here = fr.d_E_l
     HorizEnthalpyFluxJacobian fl = {0};
     HorizEnthalpyFluxJacobian fr = {0};
 
     if (j > 0) {
-        fl = get_horiz_enthalpy_flux_jac({u_left, E_here, E_xm, u_left < 0.0f});
+        fl = get_horiz_enthalpy_flux_jac({u_left, E_xm, E_here}, lf_c);
     }
     if (j < nx - 1) {
-        fr = get_horiz_enthalpy_flux_jac({u_right, E_here, E_xp, u_right > 0.0f});
+        fr = get_horiz_enthalpy_flux_jac({u_right, E_here, E_xp}, lf_c);
     }
 
-    // y-direction
+    // y-direction faces:
+    //   top face (i-1/2):    E_l = E_ym (i-1), E_r = E_here (i) => d_E_here = ft.d_E_r
+    //   bottom face (i+1/2): E_l = E_here (i), E_r = E_yp (i+1) => d_E_here = fb.d_E_l
     float v_top    = get_v3d(v3d, k, i,   j, nz, ny, nx);
     float v_bottom = get_v3d(v3d, k, i+1, j, nz, ny, nx);
     float E_ym = get_E(E, i-1, j, k, ny, nx, nz);
@@ -614,21 +639,23 @@ HorizAdvectionResult get_horiz_advection(
     HorizEnthalpyFluxJacobian fb = {0};
 
     if (i > 0) {
-        ft = get_horiz_enthalpy_flux_jac({v_top, E_here, E_ym, v_top < 0.0f});
+        ft = get_horiz_enthalpy_flux_jac({v_top, E_ym, E_here}, lf_c);
     }
     if (i < ny - 1) {
-        fb = get_horiz_enthalpy_flux_jac({v_bottom, E_here, E_yp, v_bottom > 0.0f});
+        fb = get_horiz_enthalpy_flux_jac({v_bottom, E_here, E_yp}, lf_c);
     }
 
-    // Flux divergence form: rho_i * div(u*E)
+    // Flux divergence: rho_i * div(F_LF) / dx
     result.res = RHO_I * ((fr.res - fl.res) + (fb.res - ft.res)) * dx_inv;
-    result.d_E_here = RHO_I * ((fr.d_E_here - fl.d_E_here)
-                              + (fb.d_E_here - ft.d_E_here)) * dx_inv;
+    result.d_E_here = RHO_I * ((fr.d_E_l - fl.d_E_r)
+                              + (fb.d_E_l - ft.d_E_r)) * dx_inv;
 
-    // Correct to advective form: subtract rho_i * E * div(u)
-    // div(u*E) = u*dE/dx + E*div(u)  =>  u*dE/dx = div(u*E) - E*div(u)
-    // Use only the face velocities that participate in the flux computation
-    // (boundary faces are excluded by the j>0 / j<nx-1 / i>0 / i<ny-1 guards).
+    // Correct the central flux part to advective form.
+    // The LF flux is F = F_central - F_dissipation, where:
+    //   F_central = 0.5 * u * (E_l + E_r)   => div(F_central) includes E * div(u)
+    //   F_dissipation = 0.5 * alpha * (E_r - E_l)  => pure diffusion, no div(u) issue
+    // We subtract E * div(u) to recover the advective form for the central part.
+    // The dissipation part stays in flux divergence form (conservative diffusion).
     float u_l = (j > 0)      ? u_left   : 0.0f;
     float u_r = (j < nx - 1) ? u_right  : 0.0f;
     float v_t = (i > 0)      ? v_top    : 0.0f;
@@ -662,7 +689,7 @@ void enthalpy_compute_residual(
     const float* __restrict__ E_surface,// (ny, nx) surface enthalpy BC
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
     const float* __restrict__ Q_fh,     // (ny, nx) frictional heating
-    float dx, float dt, float drain_rate, float h_thin,
+    float dx, float dt, float drain_rate, float h_thin, float lf_c,
     int term_flags,
     int ny, int nx, int nz)
 {
@@ -707,7 +734,7 @@ void enthalpy_compute_residual(
         // --- Horizontal advection ---
         if (term_flags & TERM_HORIZ_ADV) {
             HorizAdvectionResult h_adv = get_horiz_advection(
-                E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv);
+                E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv, lf_c);
             r += h_adv.res;
         }
 
@@ -809,7 +836,7 @@ void enthalpy_column_smooth(
     const float* __restrict__ E_surface,// (ny, nx) surface BC
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
     const float* __restrict__ Q_fh,     // (ny, nx) frictional heating
-    float dx, float dt, float drain_rate, float h_thin,
+    float dx, float dt, float drain_rate, float h_thin, float lf_c,
     int term_flags,
     int ny, int nx, int nz,
     int n_newton, float relaxation)
@@ -880,7 +907,7 @@ void enthalpy_column_smooth(
             float horiz_diag = 0.0f;
             if (term_flags & TERM_HORIZ_ADV) {
                 HorizAdvectionResult h_adv = get_horiz_advection(
-                    E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv);
+                    E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv, lf_c);
                 r += h_adv.res;
                 horiz_diag = h_adv.d_E_here;
             }

@@ -153,13 +153,23 @@ class ThermalModel:
             self.ops.enthalpy_forcing.Q_geo[:] = cp.asarray(
                 Q_geo, dtype=cp.float32)
 
+    def pre_momentum(self):
+        """Snapshot E and H before the momentum step.
+
+        Must be called BEFORE model.forward() so that the conservative
+        time derivative rho_i*(H*E - H_prev*E_prev)/dt uses the
+        correct pre-step thickness.
+        """
+        ops = self.ops
+        ops.enthalpy_state.E_prev[:] = ops.enthalpy_state.E
+        ops.H_prev[:] = ops.grid.state.H.data
+
     def step(self, dt):
         """
         Advance enthalpy by one time step.
 
-        Reads the current velocity (u, v) and thickness (H) from the
-        Grid, solves the column-wise enthalpy equation, and optionally
-        writes the updated Arrhenius factor B back to the Grid.
+        Call pre_momentum() before the momentum step, then step()
+        after. This ensures H_prev captures the pre-momentum thickness.
 
         Parameters
         ----------
@@ -175,14 +185,13 @@ class ThermalModel:
         ops.enthalpy_velocity.u3d /= sec_per_yr
         ops.enthalpy_velocity.v3d /= sec_per_yr
 
-        # SMB is in m/yr (GLIDE convention); convert to m/s to match velocities.
-        smb_si = ops.grid.forcing.smb.data / sec_per_yr
-        ops.compute_omega(smb=smb_si)
+        # Compute omega from the sigma-space continuity equation (SSA)
+        self._compute_omega()
+
         if self.frictional_heating:
             self._compute_frictional_heating()
 
-        # Enthalpy solve
-        ops.set_rhs(dt)
+        # Enthalpy solve (E_prev and H_prev already set by pre_momentum)
         ops.column_sweep(dt, self.n_smooth)
 
         # Feed back to momentum solver.
@@ -209,6 +218,18 @@ class ThermalModel:
 
         m = sliding.m.value
         self.ops.enthalpy_forcing.Q_fh[:] = sliding.beta.data * speed ** (m + 1.0)
+
+    def _compute_omega(self):
+        """Compute omega by integrating the sigma-space continuity equation.
+
+        Uses the actual layer-wise velocity divergence div(Hu) at each
+        sigma level, integrated upward from the bed BC (omega_b = 0).
+        The mass flux stencil matches the enthalpy horizontal flux.
+        """
+        ops = self.ops
+        sec_per_yr = cp.float32(self.SEC_PER_YR)
+        smb_si = ops.grid.forcing.smb.data / sec_per_yr
+        ops.compute_omega(smb_si)
 
     @property
     def B_scale(self):

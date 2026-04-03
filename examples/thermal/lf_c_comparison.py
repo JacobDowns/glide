@@ -111,7 +111,7 @@ for lf_c_val in lf_c_values:
         ops.enthalpy_velocity.u3d /= sec
         ops.enthalpy_velocity.v3d /= sec
         smb_si = ops.grid.forcing.smb.data / sec
-        ops.compute_omega(smb=smb_si)
+        ops.compute_omega(smb_si)
         ops.set_rhs(dt_sec)
         ops.column_sweep(dt_sec, N_SMOOTH)
         if thermal.update_rheology:

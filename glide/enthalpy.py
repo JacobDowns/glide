@@ -149,10 +149,12 @@ class EnthalpyTermFlags:
 
     All terms are enabled by default. Disabling terms is useful for
     debugging convergence and isolating the effect of individual physics.
+
+    Strain heating (phi_strain) is not toggled here — it is a forcing
+    field that defaults to zero. Set it externally if needed.
     """
     horizontal_advection: bool = True
     omega: bool = True
-    strain_heating: bool = True
     drainage: bool = True
 
     @property
@@ -160,7 +162,6 @@ class EnthalpyTermFlags:
         """Pack flags into the integer bitmask expected by CUDA kernels."""
         return ((1 if self.horizontal_advection else 0)
               | ((1 if self.omega else 0) << 1)
-              | ((1 if self.strain_heating else 0) << 2)
               | ((1 if self.drainage else 0) << 3))
 
 
@@ -197,7 +198,7 @@ class EnthalpyOperators:
     - compute_residual: full enthalpy residual at all (i,j,k)
     - column_smooth: column-wise Newton/Thomas smoother
     - column_sweep: repeated smoothing with solution update
-    - compute_omega: sigma velocity from 3D velocity field
+    - omega field: set externally by the momentum/mass solver
     - set_rhs: set forcing / previous time step data
 
     Parallels the ForwardOperators class for the SSA solver.
@@ -243,7 +244,7 @@ class EnthalpyOperators:
         )
 
         # Work arrays
-        self.f_E = cp.zeros((ny, nx, nz), dtype=cp.float32)  # FAS tau correction (0 on finest)
+        self.H_prev = cp.zeros((ny, nx), dtype=cp.float32)  # thickness before momentum step
         self.r_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
         self.delta_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
 
@@ -272,33 +273,40 @@ class EnthalpyOperators:
             self.enthalpy_velocity.u3d[k, :, :] = u2d
             self.enthalpy_velocity.v3d[k, :, :] = v2d
 
-    def compute_omega(self, smb=None):
-        """Compute sigma velocity from 3D velocity field.
+    def compute_omega(self, smb, bmb=None):
+        """
+        Compute omega = H * sigma_dot by integrating the sigma-space
+        continuity equation upward from the bed.
+
+        This ensures exact consistency between the conservative enthalpy
+        equation and mass conservation. The mass flux stencil matches
+        the horizontal enthalpy flux (H_face = average of neighbors).
 
         Parameters
         ----------
-        smb : cp.ndarray, optional
-            Surface mass balance in the same time units as u3d/v3d.
-            If None, reads from grid.forcing.smb (which is in GLIDE's
-            year-based units — only correct when velocities are also
-            in m/yr).
+        smb : cp.ndarray, shape (ny, nx)
+            Surface mass balance in m/s.
+        bmb : cp.ndarray, shape (ny, nx), optional
+            Basal mass balance in m/s. Defaults to 0.
         """
         kernel = self.kernels.get_function('compute_omega')
         grid_size, block_size = self._column_launch_config
 
         grid = self.grid
         vel = self.enthalpy_velocity
-        smb_data = smb if smb is not None else grid.forcing.smb.data
+
+        if bmb is None:
+            bmb = cp.zeros((grid.ny, grid.nx), dtype=cp.float32)
 
         kernel(grid_size, block_size,
                (vel.omega,
                 vel.u3d, vel.v3d,
                 grid.state.H.data,
-                grid.geometry.bed.data,
-                smb_data,
-                grid.dx, cp.float32(0.0),
+                smb, bmb,
+                grid.dx,
                 grid.ny, grid.nx, self.nz))
-        
+
+
 
     def compute_residual(self, dt):
         """Compute the enthalpy residual at all grid points."""
@@ -314,10 +322,9 @@ class EnthalpyOperators:
         kernel(grid_size, block_size,
                (self.r_E,
                 state.E, state.E_prev,
-                self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
                 grid.state.H.data,
-                grid.state.H_prev.data,
+                self.H_prev,
                 forcing.phi_strain,
                 forcing.E_surface,
                 forcing.Q_geo,
@@ -329,7 +336,7 @@ class EnthalpyOperators:
                 cp.int32(self.term_flags.bitmask),
                 grid.ny, grid.nx, self.nz))
 
-        return cp.linalg.norm(self.r_E)
+        return float(cp.max(cp.abs(self.r_E)))
 
     def column_smooth(self, dt):
         """
@@ -351,10 +358,9 @@ class EnthalpyOperators:
         kernel(grid_size, block_size,
                (self.delta_E,
                 state.E, state.E_prev,
-                self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
                 grid.state.H.data,
-                grid.state.H_prev.data,
+                self.H_prev,
                 forcing.phi_strain,
                 forcing.E_surface,
                 forcing.Q_geo,
@@ -412,9 +418,15 @@ class EnthalpyOperators:
                 break
 
     def set_rhs(self, dt):
-        """Store previous time step enthalpy and update forcing."""
+        """Store previous time step enthalpy and thickness.
+
+        Must be called BEFORE the momentum step so that H_prev
+        captures the thickness at the start of the time step.
+        The conservative time derivative rho_i*(H*E - H_prev*E_prev)/dt
+        then correctly accounts for the thickness change.
+        """
         self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
-        self.f_E.fill(0)  # FAS correction is zero on finest level
+        self.H_prev[:] = self.grid.state.H.data
 
     def set_surface_enthalpy_from_temperature(self, T_surface):
         """
@@ -458,6 +470,7 @@ class EnthalpyOperators:
 
         self.enthalpy_state.E[:] = C_I * (T - T_REF)
         self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
+        self.H_prev[:] = self.grid.state.H.data
 
     def get_temperature(self):
         """

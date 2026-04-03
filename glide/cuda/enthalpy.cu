@@ -2,7 +2,7 @@
    ================== Enthalpy Kernels =======================
    =========================================================
 
-   Solves the CONSERVATIVE enthalpy equation in terrain-following
+   Solves the conservative enthalpy equation in terrain-following
    (sigma) coordinates:
 
    rho_i [d(HE)/dt + d(HuE)/dx + d(HvE)/dy + d(E*omega)/dsigma]
@@ -49,9 +49,8 @@
 // Term toggle bitmask flags
 #define TERM_HORIZ_ADV    (1 << 0)
 #define TERM_SIGMA_DOT    (1 << 1)
-#define TERM_STRAIN_HEAT  (1 << 2)
+// Bit 2 unused (strain heating is always applied from phi_strain array)
 #define TERM_DRAINAGE     (1 << 3)
-#define TERM_ALL          (0xF)
 
 
 // ---- Helper: enthalpy at pressure melting point ----
@@ -217,7 +216,7 @@ ColumnDiffusionJacobian get_column_diffusion_jac(ColumnDiffusionStencil s) {
     // Residual: -(1/H) * [K_upper*(E_kp1-E_k) - K_lower*(E_k-E_km1)] / dsig^2
     jac.res = -s.h_inv * dsig2_inv * (K_upper * dE_upper - K_lower * dE_lower);
 
-    // Jacobian: freeze K at current state (see docs/column_smoother.md).
+    // Jacobian: freeze K at current state 
     float diff_lower = s.h_inv * dsig2_inv * K_lower;
     float diff_upper = s.h_inv * dsig2_inv * K_upper;
 
@@ -291,9 +290,8 @@ BedDiffusionJacobian get_bed_diffusion_jac(BedDiffusionStencil s) {
     // Half-cell control volume width at the bed boundary.
     float dsig_half = 0.5f * s.dsig;
 
-    // Residual (conservative form):
+    // Residual:
     //   -(1/H) * K_{1/2} * (E_1-E_0)/dsig / dsig_half - (Q_geo+Q_fh) / dsig_half
-    // The Q_geo+Q_fh term has no 1/H because H*source cancels the original 1/H.
     jac.res = (-s.h_inv * K_half * (s.E_kp1 - s.E_k) / s.dsig
                - (s.Q_geo + s.Q_fh)) / dsig_half;
 
@@ -313,7 +311,7 @@ DualFloat get_bed_diffusion_dual(BedDiffusionStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Sigma (Vertical) Advection — conservative form:
+   Sigma (Vertical) Advection:
      rho_i * d(E * omega) / dsigma
    where omega = H * sigma_dot is the scaled vertical velocity.
 
@@ -394,7 +392,7 @@ DualFloat get_sigma_advection_dual(SigmaAdvectionStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Bed Sigma Advection (k=0, conservative form):
+   Bed Sigma Advection (k=0):
      Uses half-cell. The bed boundary flux is F_bed = omega_bed * E_bed.
      With no basal melt, omega_bed ≈ 0 so F_bed ≈ 0.
      The upper interface flux uses upwinding on omega_{1/2}.
@@ -611,9 +609,7 @@ DualFloat get_drainage_dual(DrainageStencilDual s) {
 
    Computes rho_i * div_h(H*u*E) in flux divergence form.
    The mass flux H*u at each face is computed from the face
-   velocity and face-averaged thickness.  No advective form
-   correction is needed — the conservative equation is already
-   in divergence form.  See docs/conservation.md.
+   velocity and face-averaged thickness.
    --------------------------------------------------------- */
 struct HorizAdvectionResult {
     float res;       // rho_i * (u dE/dx + v dE/dy)  [advective form]
@@ -718,7 +714,7 @@ void enthalpy_compute_residual(
     float* __restrict__ r_E,            // (ny, nx, nz) residual output
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
     const float* __restrict__ E_prev,   // (ny, nx, nz) previous time step
-    const float* __restrict__ f_E,      // (ny, nx, nz) FAS tau correction (0 on finest)
+
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity per layer
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity per layer
     const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
@@ -767,7 +763,7 @@ void enthalpy_compute_residual(
         float E_pmp_k = get_E_pmp(sigma_k, h);
 
         // --- Conservative time derivative: rho_i * (H*E - H_prev*E_prev) / dt ---
-        float r = RHO_I * (h * E_k - hp * E_prev[ijk]) / dt - f_E[ijk];
+        float r = RHO_I * (h * E_k - hp * E_prev[ijk]) / dt;
 
         // --- Horizontal advection: rho_i * div(H*u*E) ---
         if (term_flags & TERM_HORIZ_ADV) {
@@ -794,9 +790,7 @@ void enthalpy_compute_residual(
                  dsig, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
             r += diff_jac.res;
 
-            if (term_flags & TERM_STRAIN_HEAT) {
-                r -= h * phi_strain[ijk];
-            }
+            r -= h * phi_strain[ijk];
 
             if (term_flags & TERM_DRAINAGE) {
                 DrainageJacobian drain_jac = get_drainage_jac(
@@ -825,9 +819,7 @@ void enthalpy_compute_residual(
                  dsig, h_inv});
             r += diff_jac.res;
 
-            if (term_flags & TERM_STRAIN_HEAT) {
-                r -= h * phi_strain[ijk];
-            }
+            r -= h * phi_strain[ijk];
 
             if (term_flags & TERM_DRAINAGE) {
                 DrainageJacobian drain_jac = get_drainage_jac(
@@ -870,7 +862,7 @@ void enthalpy_column_smooth(
     float* __restrict__ delta_E,        // (ny, nx, nz) correction output
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
     const float* __restrict__ E_prev,   // (ny, nx, nz) previous time step
-    const float* __restrict__ f_E,      // (ny, nx, nz) FAS tau correction
+
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity
     const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
@@ -938,7 +930,7 @@ void enthalpy_column_smooth(
             float E_pmp_k = get_E_pmp(sigma_k, h);
 
             // --- Conservative time derivative ---
-            float r = RHO_I * (h * E_k - hp * E_prev[ijk]) / dt - f_E[ijk];
+            float r = RHO_I * (h * E_k - hp * E_prev[ijk]) / dt;
 
             // --- Horizontal advection (conservative, Vanka-style) ---
             float horiz_diag = 0.0f;
@@ -968,9 +960,7 @@ void enthalpy_column_smooth(
                      dsig, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
                 r += diff_jac.res;
 
-                if (term_flags & TERM_STRAIN_HEAT) {
-                    r -= h * phi_strain[ijk];
-                }
+                r -= h * phi_strain[ijk];
 
                 DrainageJacobian drain_jac = {0};
                 if (term_flags & TERM_DRAINAGE) {
@@ -1007,9 +997,7 @@ void enthalpy_column_smooth(
                      dsig, h_inv});
                 r += diff_jac.res;
 
-                if (term_flags & TERM_STRAIN_HEAT) {
-                    r -= h * phi_strain[ijk];
-                }
+                r -= h * phi_strain[ijk];
 
                 DrainageJacobian drain_jac = {0};
                 if (term_flags & TERM_DRAINAGE) {
@@ -1057,24 +1045,32 @@ void enthalpy_column_smooth(
 
 
 /* =========================================================
-   Compute omega = H * sigma_dot from 3D velocity field.
+   Compute omega = H * sigma_dot from the sigma-space
+   continuity equation by vertical integration.
 
-   omega = h * sigma_dot = uz - ux*(db/dx + sigma*dh/dx)
-                              - uy*(db/dy + sigma*dh/dy)
-                              - sigma * dh/dt
+   The continuity equation in sigma coordinates is:
+     dH/dt + d(Hu)/dx + d(Hv)/dy + d(omega)/dsigma = 0
 
-   Stores omega directly (no division by H) for use in the
+   Rearranging: d(omega)/dsigma = -(dH/dt + div(Hu))
+
+   We integrate upward from the bed BC (omega_b = -bmb):
+     omega(k) = omega(k-1) - dsig * (dH/dt + div_Hu(k-1/2))
+
+   The mass flux stencil H_face = 0.5*(H_l+H_r)*u_face matches
+   the horizontal enthalpy flux, ensuring consistency with the
    conservative enthalpy equation.
+
+   At the surface, omega automatically equals -SMB by construction.
    ========================================================= */
 extern "C" __global__
 void compute_omega(
-    float* __restrict__ omega_out,  // (ny, nx, nz) output: omega = H*sigma_dot
-    const float* __restrict__ u3d,  // (nz, ny, nx+1)
-    const float* __restrict__ v3d,  // (nz, ny+1, nx)
-    const float* __restrict__ H,    // (ny, nx)
-    const float* __restrict__ bed,  // (ny, nx)
-    const float* __restrict__ smb,  // (ny, nx) surface mass balance
-    float dx, float dt,
+    float* __restrict__ omega,      // (ny, nx, nz) output
+    const float* __restrict__ u3d,  // (nz, ny, nx+1) layer x-velocity
+    const float* __restrict__ v3d,  // (nz, ny+1, nx) layer y-velocity
+    const float* __restrict__ H,    // (ny, nx) ice thickness
+    const float* __restrict__ smb,  // (ny, nx) surface mass balance (m/s)
+    const float* __restrict__ bmb,  // (ny, nx) basal mass balance (m/s, typically 0)
+    float dx,
     int ny, int nx, int nz)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1084,188 +1080,54 @@ void compute_omega(
     int i = idx / nx;
     int j = idx % nx;
 
-    float h = H[i * nx + j];
-    float h_inv = (h > 1e-3f) ? 1.0f / h : 0.0f;
+    float h_here = H[i * nx + j];
+    if (h_here < 1e-3f) {
+        for (int k = 0; k < nz; k++) omega[(i*nx+j)*nz + k] = 0.0f;
+        return;
+    }
+
     float dx_inv = 1.0f / dx;
     float dsig = 1.0f / (float)(nz - 1);
 
-    // Compute horizontal gradients of bed and thickness
-    float bed_c = get_cell(bed, i, j, ny, nx);
-    float bed_xp = get_cell(bed, i, j+1, ny, nx);
-    float bed_xm = get_cell(bed, i, j-1, ny, nx);
-    float bed_yp = get_cell(bed, i+1, j, ny, nx);
-    float bed_ym = get_cell(bed, i-1, j, ny, nx);
-
-    float db_dx = (bed_xp - bed_xm) * 0.5f * dx_inv;
-    float db_dy = (bed_yp - bed_ym) * 0.5f * dx_inv;
-
-    float H_xp = get_cell(H, i, j+1, ny, nx);
+    // Neighbor thicknesses for face-averaged mass flux
     float H_xm = get_cell(H, i, j-1, ny, nx);
-    float H_yp = get_cell(H, i+1, j, ny, nx);
+    float H_xp = get_cell(H, i, j+1, ny, nx);
     float H_ym = get_cell(H, i-1, j, ny, nx);
+    float H_yp = get_cell(H, i+1, j, ny, nx);
 
-    float dH_dx = (H_xp - H_xm) * 0.5f * dx_inv;
-    float dH_dy = (H_yp - H_ym) * 0.5f * dx_inv;
+    // 1. Compute layer-wise div(Hu) and column average
+    float div_Hu[MAX_NZ];
+    float div_Hu_bar = 0.0f;
 
-    // Approximate dh/dt from mass conservation:
-    // dh/dt = SMB - div(h*u_bar)
-    // Use depth-averaged velocity (average over layers)
-    // For now, use the layer 0 (bed) values as approximation
-    // of div(h*u_bar) via finite differences on the flux
-    float u_bar_left  = 0.0f;
-    float u_bar_right = 0.0f;
-    float v_bar_top   = 0.0f;
-    float v_bar_bot   = 0.0f;
-    float nz_inv = 1.0f / (float)nz;
     for (int k = 0; k < nz; k++) {
-        u_bar_left  += get_u3d(u3d, k, i, j,   nz, ny, nx);
-        u_bar_right += get_u3d(u3d, k, i, j+1, nz, ny, nx);
-        v_bar_top   += get_v3d(v3d, k, i,   j, nz, ny, nx);
-        v_bar_bot   += get_v3d(v3d, k, i+1, j, nz, ny, nx);
+        float u_l = get_u3d(u3d, k, i, j,   nz, ny, nx);
+        float u_r = get_u3d(u3d, k, i, j+1, nz, ny, nx);
+        float v_t = get_v3d(v3d, k, i,   j, nz, ny, nx);
+        float v_b = get_v3d(v3d, k, i+1, j, nz, ny, nx);
+
+        // Mass flux divergence — matches enthalpy horizontal flux stencil
+        float flux_x = 0.5f*(h_here + H_xp)*u_r - 0.5f*(H_xm + h_here)*u_l;
+        float flux_y = 0.5f*(h_here + H_yp)*v_b - 0.5f*(H_ym + h_here)*v_t;
+
+        div_Hu[k] = (flux_x + flux_y) * dx_inv;
+        div_Hu_bar += div_Hu[k];
     }
-    u_bar_left  *= nz_inv;
-    u_bar_right *= nz_inv;
-    v_bar_top   *= nz_inv;
-    v_bar_bot   *= nz_inv;
+    div_Hu_bar /= (float)nz;
 
-    // Upwind flux divergence for dh/dt estimate
-    float H_c = H[i * nx + j];
-    float flux_x = u_bar_right * ((u_bar_right > 0.0f) ? H_c : H_xp)
-                  - u_bar_left  * ((u_bar_left  > 0.0f) ? H_xm : H_c);
-    float flux_y = v_bar_bot * ((v_bar_bot > 0.0f) ? H_c : H_yp)
-                  - v_bar_top * ((v_bar_top > 0.0f) ? H_ym : H_c);
+    // 2. Column mass balance: dH/dt = SMB - BMB - div(Hu_bar)
+    float smb_val = smb[i * nx + j];
+    float bmb_val = bmb[i * nx + j];
+    float dh_dt = smb_val - bmb_val - div_Hu_bar;
 
-    float div_hU = (flux_x + flux_y) * dx_inv;
-    float dh_dt = smb[i*nx+j] - div_hU;
+    // 3. Integrate upward from bed BC: omega(0) = -bmb
+    float current_omega = -bmb_val;
+    omega[(i*nx+j)*nz + 0] = current_omega;
 
-    // Compute sigma_dot at each level by integrating incompressibility
-    // from the bed. For generality, we compute it directly from the
-    // definition rather than assuming SSA.
-    for (int k = 0; k < nz; k++) {
-        float sig_k = k * dsig;
-
-        // Interpolate velocities to cell center at this layer
-        float ux_k = 0.5f * (get_u3d(u3d, k, i, j, nz, ny, nx)
-                            + get_u3d(u3d, k, i, j+1, nz, ny, nx));
-        float uy_k = 0.5f * (get_v3d(v3d, k, i, j, nz, ny, nx)
-                            + get_v3d(v3d, k, i+1, j, nz, ny, nx));
-
-        // For uz: integrate incompressibility from bed
-        // uz(sigma) = uz(0) - h * integral_0^sigma (dux/dx + duy/dy) dsigma'
-        // For now, approximate uz from the kinematic relation:
-        // At the bed: uz(0) = ux*db/dx + uy*db/dy (+ mb, neglected initially)
-        // Then uz(sigma) = uz(0) - h*sigma*(dux/dx + duy/dy) for depth-independent u
-        // This generalizes: for varying u(sigma), integrate numerically
-
-        // Compute horizontal divergence at this layer
-        float dux_dx_k = (get_u3d(u3d, k, i, j+1, nz, ny, nx)
-                        - get_u3d(u3d, k, i, j,   nz, ny, nx)) * dx_inv;
-        float duy_dy_k = (get_v3d(v3d, k, i+1, j, nz, ny, nx)
-                        - get_v3d(v3d, k, i,   j, nz, ny, nx)) * dx_inv;
-
-        // Simple trapezoidal integration of divergence from bed to sigma_k
-        // For now, assume divergence is roughly constant with depth (SSA-like)
-        float integrated_div = sig_k * (dux_dx_k + duy_dy_k);
-
-        // uz at bed from kinematic BC (neglecting basal melt for now)
-        float ux_bed = 0.5f * (get_u3d(u3d, 0, i, j, nz, ny, nx)
-                              + get_u3d(u3d, 0, i, j+1, nz, ny, nx));
-        float uy_bed = 0.5f * (get_v3d(v3d, 0, i, j, nz, ny, nx)
-                              + get_v3d(v3d, 0, i+1, j, nz, ny, nx));
-        float uz_bed = ux_bed * db_dx + uy_bed * db_dy;
-        float uz_k = uz_bed - h * integrated_div;
-
-        // sigma_dot from definition
-        float h_sigma_dot = uz_k
-            - ux_k * (db_dx + sig_k * dH_dx)
-            - uy_k * (db_dy + sig_k * dH_dy)
-            - sig_k * dh_dt;
-
-        // Store omega = H * sigma_dot directly (conservative form).
-        // h_sigma_dot IS omega — no division by H needed.
-        omega_out[(i*nx+j)*nz + k] = h_sigma_dot;
+    for (int k = 1; k < nz; k++) {
+        // Average divergence at half-node (k-1/2)
+        float div_half = 0.5f * (div_Hu[k-1] + div_Hu[k]);
+        current_omega = current_omega - dsig * (dh_dt + div_half);
+        omega[(i*nx+j)*nz + k] = current_omega;
     }
-}
-
-
-/* =========================================================
-   Restrict enthalpy from fine to coarse grid.
-   Operates horizontally (averages 4 fine cells),
-   keeps vertical dimension unchanged.
-   ========================================================= */
-extern "C" __global__
-void restrict_enthalpy(
-    const float* __restrict__ E_fine,   // (ny_fine, nx_fine, nz)
-    float* __restrict__ E_coarse,       // (ny_coarse, nx_coarse, nz)
-    int ny_coarse, int nx_coarse, int nz)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = ny_coarse * nx_coarse * nz;
-    if (idx >= total) return;
-
-    int tmp = idx / nz;
-    int k = idx % nz;
-    int i_c = tmp / nx_coarse;
-    int j_c = tmp % nx_coarse;
-
-    int nx_fine = 2 * nx_coarse;
-
-    // Full-weighting: average 4 fine cells at each sigma level
-    int i_f = 2 * i_c;
-    int j_f = 2 * j_c;
-
-    float val = 0.25f * (
-        E_fine[(i_f     * nx_fine + j_f    ) * nz + k] +
-        E_fine[(i_f     * nx_fine + j_f + 1) * nz + k] +
-        E_fine[((i_f+1) * nx_fine + j_f    ) * nz + k] +
-        E_fine[((i_f+1) * nx_fine + j_f + 1) * nz + k]);
-
-    E_coarse[(i_c * nx_coarse + j_c) * nz + k] = val;
-}
-
-
-/* =========================================================
-   Prolongate enthalpy from coarse to fine grid.
-   Bilinear interpolation horizontally, identity vertically.
-   ========================================================= */
-extern "C" __global__
-void prolongate_enthalpy(
-    const float* __restrict__ E_coarse, // (ny_coarse, nx_coarse, nz)
-    float* __restrict__ E_fine,         // (ny_fine, nx_fine, nz)
-    int ny_fine, int nx_fine, int nz)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = ny_fine * nx_fine * nz;
-    if (idx >= total) return;
-
-    int tmp = idx / nz;
-    int k = idx % nz;
-    int i_f = tmp / nx_fine;
-    int j_f = tmp % nx_fine;
-
-    int ny_coarse = ny_fine / 2;
-    int nx_coarse = nx_fine / 2;
-
-    // Map fine cell center to coarse grid coordinates
-    float I_float = (j_f - 0.5f) * 0.5f;
-    float J_float = (i_f - 0.5f) * 0.5f;
-
-    I_float = fmaxf(0.0f, fminf(I_float, (float)(nx_coarse - 1)));
-    J_float = fmaxf(0.0f, fminf(J_float, (float)(ny_coarse - 1)));
-
-    int I_lo = (int)I_float;
-    int J_lo = (int)J_float;
-    int I_hi = min(I_lo + 1, nx_coarse - 1);
-    int J_hi = min(J_lo + 1, ny_coarse - 1);
-
-    float t_x = I_float - I_lo;
-    float t_y = J_float - J_lo;
-
-    float v00 = E_coarse[(J_lo * nx_coarse + I_lo) * nz + k];
-    float v01 = E_coarse[(J_lo * nx_coarse + I_hi) * nz + k];
-    float v10 = E_coarse[(J_hi * nx_coarse + I_lo) * nz + k];
-    float v11 = E_coarse[(J_hi * nx_coarse + I_hi) * nz + k];
-
-    E_fine[idx] = (1.0f-t_y)*((1.0f-t_x)*v00 + t_x*v01)
-                + t_y       *((1.0f-t_x)*v10 + t_x*v11);
+    // omega at surface (k=nz-1) should equal -smb_val by construction
 }

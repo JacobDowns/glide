@@ -44,7 +44,7 @@ DOME_HEIGHT = 3000.0   # m
 
 # Forcing
 SMB_CENTER = 2.       # m/yr ice equivalent (accumulation at center)
-SMB_EDGE = -5.0        # m/yr ice equivalent (ablation at margin)
+SMB_EDGE = -4.0        # m/yr ice equivalent (ablation at margin)
 Q_GEO = 0.0          # W/m^2 (modest geothermal heat flux)
 T_SEA_LEVEL = 270.15   # K (+5 C at sea level — margins reach melting)
 LAPSE_RATE = -6.5e-3   # K/m (standard atmospheric lapse rate)
@@ -60,12 +60,12 @@ N_GLEN = 3.0
 BETA_SLIDING = 10.0
 
 # Thermal
-NZ = 21               # sigma levels
+NZ = 11               # sigma levels
 N_SMOOTH = 20         # enthalpy smoothing sweeps
 
 # Time stepping
-DT_YR = 1.0           # years
-N_STEPS = 100
+DT_YR = 5.0           # years
+N_STEPS = 400
 SEC_PER_YR = 365.25 * 86400.0
 
 # Output
@@ -130,7 +130,7 @@ model.forward_solver.fas_options.set(
 # ========================================================
 grid = mg.levels[0]
 thermal = ThermalModel(grid, nz=NZ,
-                       n_smooth=N_SMOOTH, update_rheology=True,
+                       n_smooth=N_SMOOTH, update_rheology=False,
                        frictional_heating=False)
 
 # All terms enabled (horizontal advection, sigma_dot, strain heating, drainage)
@@ -144,7 +144,10 @@ thermal.ops.smoother_config.absolute_tolerance = cp.float32(1e-3)
 thermal.ops.smoother_config.relative_tolerance = cp.float32(1e-7)
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_init, T_field=T_INIT, Q_geo=Q_GEO)
-thermal.ops.enthalpy_forcing.h_thin.set(50.0)
+thermal.ops.enthalpy_forcing.h_thin.set(25.0)
+
+thermal.ops.term_flags.horizontal_advection = True 
+thermal.ops.term_flags.drainage = True
 
 # Set initial B from the Paterson-Budd law at the initial temperature,
 # so there is no discontinuity when the thermal model starts updating B.
@@ -157,8 +160,8 @@ print(f"  Surface T: summit = {T_summit:.2f} K ({T_summit-273.15:.1f} C), "
 print(f"  Initial B (GLIDE units): {float(B_init[ny//2, nx//2]):.4e}")
 tf = thermal.ops.term_flags
 print(f"  Term flags: bitmask=0x{tf.bitmask:x} "
-      f"(h_adv={tf.horizontal_advection}, sigma_dot={tf.omega}, "
-      f"strain={tf.strain_heating}, drain={tf.drainage})")
+      f"(h_adv={tf.horizontal_advection}, omega={tf.omega}, "
+      f"drain={tf.drainage})")
 
 # ========================================================
 # Output setup
@@ -200,7 +203,7 @@ T_surf_relaxed = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_relaxed, T_field=T_INIT, Q_geo=Q_GEO)
 B_init = thermal.ops.get_arrhenius_factor() / thermal.B_scale
 mg.rheology.B.set(B_init)
-#thermal.update_rheology = False
+thermal.update_rheology = False
 
 # Storage for time-series plot
 times = [t_yr]
@@ -218,6 +221,9 @@ print(f"\n  {'step':>5s}  {'t (yr)':>8s}  {'vol (km3)':>10s}  "
 print(f"  {'-'*68}")
 
 for step in range(N_STEPS):
+    # --- Snapshot E and H before momentum step ---
+    thermal.pre_momentum()
+
     # --- Momentum solve (dt in years) ---
     model.forward(cp.float32(t_yr), dt_yr)
 
@@ -226,23 +232,7 @@ for step in range(N_STEPS):
     thermal.ops.set_surface_enthalpy_from_temperature(T_surf)
 
     # --- Thermal solve (dt in seconds) ---
-    # All terms enabled: horizontal advection uses the SSA velocities,
-    # sigma_dot provides vertical transport, strain heating term is
-    # active (phi_strain field is zero until a viscous dissipation
-    # computation is wired up — the flag enables the kernel path).
-    ops = thermal.ops
-    ops.broadcast_velocity()
-    sec_per_yr = cp.float32(thermal.SEC_PER_YR)
-    ops.enthalpy_velocity.u3d /= sec_per_yr
-    ops.enthalpy_velocity.v3d /= sec_per_yr
-    smb_si = ops.grid.forcing.smb.data / sec_per_yr
-    ops.compute_omega(smb=smb_si)
-    ops.set_rhs(dt_sec)
-    ops.column_sweep(dt_sec, thermal.n_smooth)
-    if thermal.update_rheology:
-        n = float(ops.grid.rheology.n.value)
-        scale = cp.float32(thermal.rho_i * thermal.g * thermal.SEC_PER_YR ** (1.0 / n))
-        ops.grid.rheology.B.data[:] = ops.get_arrhenius_factor() / scale
+    thermal.step(dt_sec)
 
     t_yr += DT_YR
 

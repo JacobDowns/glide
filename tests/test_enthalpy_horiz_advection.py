@@ -37,7 +37,6 @@ def _make_ops(grid, nz):
     ops.enthalpy_forcing.drain_rate.set(0.0)
     ops.enthalpy_velocity.omega.fill(0)
     ops.term_flags.omega = False       # no vertical transport
-    ops.term_flags.strain_heating = False
     ops.term_flags.drainage = False
     return ops
 

@@ -117,11 +117,8 @@ grid = mg.levels[0]
 thermal = ThermalModel(grid, nz=NZ, n_smooth=N_SMOOTH,
                        update_rheology=True, frictional_heating=False)
 
-# Disable horizontal advection and strain heating via term flags
-thermal.ops.term_flags.horizontal_advection = True
-thermal.ops.term_flags.strain_heating = False
+# phi_strain defaults to zero (no strain heating computation wired up)
 thermal.ops.term_flags.drainage = True
-# Keep sigma_dot enabled for vertical transport
 
 thermal.ops.smoother_config.report_norms = True
 thermal.ops.smoother_config.n_newton = 5
@@ -140,8 +137,7 @@ print(f"Surface T: summit = {T_summit:.1f} K ({T_summit-273.15:.1f} C), "
       f"margin = {T_margin:.1f} K ({T_margin-273.15:.1f} C)")
 print(f"Term flags: bitmask = 0x{thermal.ops.term_flags.bitmask:x} "
       f"(h_adv={thermal.ops.term_flags.horizontal_advection}, "
-      f"sigma_dot={thermal.ops.term_flags.omega}, "
-      f"strain={thermal.ops.term_flags.strain_heating}, "
+      f"omega={thermal.ops.term_flags.omega}, "
       f"drain={thermal.ops.term_flags.drainage})")
 
 # ========================================================
@@ -198,6 +194,9 @@ print(f"\n{'step':>5s}  {'t (yr)':>8s}  {'T_bed center':>12s}  {'T_bed margin':>
 print("-" * 65)
 
 for step in range(N_STEPS):
+    # Snapshot E and H before momentum step
+    thermal.pre_momentum()
+
     # Momentum solve
     model.forward(cp.float32(t_yr), dt_yr)
 
@@ -205,18 +204,8 @@ for step in range(N_STEPS):
     T_surf = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
     thermal.ops.set_surface_enthalpy_from_temperature(T_surf)
 
-    # Compute sigma_dot (need velocities for the divergence estimate)
-    ops = thermal.ops
-    ops.broadcast_velocity()
-    sec_per_yr = cp.float32(SEC_PER_YR)
-    ops.enthalpy_velocity.u3d /= sec_per_yr
-    ops.enthalpy_velocity.v3d /= sec_per_yr
-    smb_si = ops.grid.forcing.smb.data / sec_per_yr
-    ops.compute_omega(smb=smb_si)
-
-    # Enthalpy solve (horizontal advection disabled via term_flags)
-    ops.set_rhs(dt_sec)
-    ops.column_sweep(dt_sec, thermal.n_smooth)
+    # Thermal solve (syncs velocities, computes omega, solves)
+    thermal.step(dt_sec)
 
     t_yr += DT_YR
 

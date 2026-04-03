@@ -89,7 +89,7 @@ ops.enthalpy_forcing.drain_rate.set(0.0)
 # Uniform rightward velocity (m/s) on all sigma layers
 ops.enthalpy_velocity.u3d.fill(cp.float32(U_MS))
 ops.enthalpy_velocity.v3d.fill(0)
-ops.enthalpy_velocity.sigma_dot.fill(0)
+ops.enthalpy_velocity.omega.fill(0)
 
 # Smoother config
 ops.smoother_config.report_norms = False

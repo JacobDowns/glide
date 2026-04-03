@@ -52,7 +52,7 @@ ops.enthalpy_forcing.Q_geo[:, :] = Q_geo
 ops.enthalpy_forcing.phi_strain.fill(0)
 ops.enthalpy_velocity.u3d.fill(0)
 ops.enthalpy_velocity.v3d.fill(0)
-ops.enthalpy_velocity.sigma_dot.fill(0)
+ops.enthalpy_velocity.omega.fill(0)
 ops.enthalpy_forcing.Q_fh.fill(0)
 
 # ========================================================

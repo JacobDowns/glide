@@ -38,10 +38,10 @@ DOME_HEIGHT = 2000.0    # m
 
 SMB_CENTER = 0.5        # m/yr accumulation at center
 SMB_EDGE = -2.0         # m/yr ablation at margin
-Q_GEO = 0.05            # W/m^2
+Q_GEO = 0.1            # W/m^2
 
 # Surface temperature
-T_SEA_LEVEL = 270.15    # K (+5 C — margins above freezing, capped at T_melt)
+T_SEA_LEVEL = 278.15    # K (+5 C — margins above freezing, capped at T_melt)
 LAPSE_RATE = -6.5e-3    # K/m
 T_INIT = 253.15         # K (-20 C uniform initial)
 
@@ -50,12 +50,12 @@ N_GLEN = 3.0
 BETA_SLIDING = 10.0
 
 # Thermal
-NZ = 21
+NZ = 11
 N_SMOOTH = 20
 
 # Time stepping
 DT_YR = 5.0
-N_STEPS = 100
+N_STEPS = 200
 SEC_PER_YR = 365.25 * 86400.0
 
 OUT_DIR = Path('column_only_dome_output')
@@ -115,15 +115,15 @@ model.forward_solver.fas_options.set(
 # ========================================================
 grid = mg.levels[0]
 thermal = ThermalModel(grid, nz=NZ, n_smooth=N_SMOOTH,
-                       update_rheology=False, frictional_heating=False)
+                       update_rheology=True, frictional_heating=False)
 
 # Disable horizontal advection and strain heating via term flags
-thermal.ops.term_flags.horizontal_advection = False
+thermal.ops.term_flags.horizontal_advection = True
 thermal.ops.term_flags.strain_heating = False
-thermal.ops.term_flags.drainage = False
+thermal.ops.term_flags.drainage = True
 # Keep sigma_dot enabled for vertical transport
 
-thermal.ops.smoother_config.report_norms = False
+thermal.ops.smoother_config.report_norms = True
 thermal.ops.smoother_config.n_newton = 5
 
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
@@ -140,7 +140,7 @@ print(f"Surface T: summit = {T_summit:.1f} K ({T_summit-273.15:.1f} C), "
       f"margin = {T_margin:.1f} K ({T_margin-273.15:.1f} C)")
 print(f"Term flags: bitmask = 0x{thermal.ops.term_flags.bitmask:x} "
       f"(h_adv={thermal.ops.term_flags.horizontal_advection}, "
-      f"sigma_dot={thermal.ops.term_flags.sigma_dot}, "
+      f"sigma_dot={thermal.ops.term_flags.omega}, "
       f"strain={thermal.ops.term_flags.strain_heating}, "
       f"drain={thermal.ops.term_flags.drainage})")
 
@@ -212,7 +212,7 @@ for step in range(N_STEPS):
     ops.enthalpy_velocity.u3d /= sec_per_yr
     ops.enthalpy_velocity.v3d /= sec_per_yr
     smb_si = ops.grid.forcing.smb.data / sec_per_yr
-    ops.compute_sigma_dot(smb=smb_si)
+    ops.compute_omega(smb=smb_si)
 
     # Enthalpy solve (horizontal advection disabled via term_flags)
     ops.set_rhs(dt_sec)

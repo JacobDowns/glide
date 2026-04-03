@@ -87,7 +87,7 @@ def test_cold_column():
     ops.enthalpy_forcing.phi_strain.fill(0)
     ops.enthalpy_velocity.u3d.fill(0)
     ops.enthalpy_velocity.v3d.fill(0)
-    ops.enthalpy_velocity.sigma_dot.fill(0)
+    ops.enthalpy_velocity.omega.fill(0)
     ops.enthalpy_forcing.Q_fh.fill(0)
 
     # ---- Time stepping ----
@@ -164,7 +164,7 @@ def test_cold_column_residual_convergence():
     ops.enthalpy_forcing.phi_strain.fill(0)
     ops.enthalpy_velocity.u3d.fill(0)
     ops.enthalpy_velocity.v3d.fill(0)
-    ops.enthalpy_velocity.sigma_dot.fill(0)
+    ops.enthalpy_velocity.omega.fill(0)
     ops.enthalpy_forcing.Q_fh.fill(0)
 
     ops.set_rhs(dt)

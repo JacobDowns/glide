@@ -45,7 +45,7 @@ def _make_ops(nx=4, ny=4, nz=21):
     ops.enthalpy_forcing.drain_rate.set(0.0)
     ops.enthalpy_velocity.u3d.fill(0)
     ops.enthalpy_velocity.v3d.fill(0)
-    ops.enthalpy_velocity.sigma_dot.fill(0)
+    ops.enthalpy_velocity.omega.fill(0)
     ops.enthalpy_forcing.Q_fh.fill(0)
     return ops
 
@@ -74,7 +74,8 @@ def test_temperate_bed_still_applies_geothermal_flux():
     ops.compute_residual(dt)
     bed_residual = float(cp.asnumpy(ops.r_E[ny // 2, nx // 2, 0]))
     dsig_half = 0.5 * float(ops.sigma[1] - ops.sigma[0])
-    expected = -Q_GEO / (H_ICE * dsig_half)
+    # Conservative form: Q_geo term is -(Q_geo) / dsig_half (no 1/H factor)
+    expected = -Q_GEO / dsig_half
 
     print("Temperate bed geothermal-flux test:")
     print(f"  Bed residual: {bed_residual:.6e}")

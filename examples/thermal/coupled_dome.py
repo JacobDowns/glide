@@ -46,7 +46,7 @@ DOME_HEIGHT = 3000.0   # m
 SMB_CENTER = 2.       # m/yr ice equivalent (accumulation at center)
 SMB_EDGE = -5.0        # m/yr ice equivalent (ablation at margin)
 Q_GEO = 0.0          # W/m^2 (modest geothermal heat flux)
-T_SEA_LEVEL = 273.15   # K (+5 C at sea level — margins reach melting)
+T_SEA_LEVEL = 270.15   # K (+5 C at sea level — margins reach melting)
 LAPSE_RATE = -6.5e-3   # K/m (standard atmospheric lapse rate)
 T_INIT = 263.15        # K (-10 C, uniform initial ice temperature)
 
@@ -60,12 +60,12 @@ N_GLEN = 3.0
 BETA_SLIDING = 10.0
 
 # Thermal
-NZ = 10                # sigma levels
-N_SMOOTH = 10          # enthalpy smoothing sweeps
+NZ = 21               # sigma levels
+N_SMOOTH = 20         # enthalpy smoothing sweeps
 
 # Time stepping
-DT_YR = 2.5          # years
-N_STEPS = 200
+DT_YR = 1.0           # years
+N_STEPS = 100
 SEC_PER_YR = 365.25 * 86400.0
 
 # Output
@@ -139,9 +139,12 @@ thermal.ops.smoother_config.report_norms = True
 thermal.ops.smoother_config.omega = cp.float32(1.0)
 thermal.ops.smoother_config.n_newton = 5
 thermal.ops.smoother_config.relaxation = cp.float32(1.0)
+thermal.ops.smoother_config.lf_c = cp.float32(1e-4)
+thermal.ops.smoother_config.absolute_tolerance = cp.float32(1e-3)
+thermal.ops.smoother_config.relative_tolerance = cp.float32(1e-7)
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_init, T_field=T_INIT, Q_geo=Q_GEO)
-thermal.ops.enthalpy_forcing.h_thin.set(10.0)
+thermal.ops.enthalpy_forcing.h_thin.set(50.0)
 
 # Set initial B from the Paterson-Budd law at the initial temperature,
 # so there is no discontinuity when the thermal model starts updating B.
@@ -154,7 +157,7 @@ print(f"  Surface T: summit = {T_summit:.2f} K ({T_summit-273.15:.1f} C), "
 print(f"  Initial B (GLIDE units): {float(B_init[ny//2, nx//2]):.4e}")
 tf = thermal.ops.term_flags
 print(f"  Term flags: bitmask=0x{tf.bitmask:x} "
-      f"(h_adv={tf.horizontal_advection}, sigma_dot={tf.sigma_dot}, "
+      f"(h_adv={tf.horizontal_advection}, sigma_dot={tf.omega}, "
       f"strain={tf.strain_heating}, drain={tf.drainage})")
 
 # ========================================================
@@ -233,7 +236,7 @@ for step in range(N_STEPS):
     ops.enthalpy_velocity.u3d /= sec_per_yr
     ops.enthalpy_velocity.v3d /= sec_per_yr
     smb_si = ops.grid.forcing.smb.data / sec_per_yr
-    ops.compute_sigma_dot(smb=smb_si)
+    ops.compute_omega(smb=smb_si)
     ops.set_rhs(dt_sec)
     ops.column_sweep(dt_sec, thermal.n_smooth)
     if thermal.update_rheology:

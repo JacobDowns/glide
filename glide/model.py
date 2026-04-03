@@ -177,7 +177,7 @@ class ThermalModel:
 
         # SMB is in m/yr (GLIDE convention); convert to m/s to match velocities.
         smb_si = ops.grid.forcing.smb.data / sec_per_yr
-        ops.compute_sigma_dot(smb=smb_si)
+        ops.compute_omega(smb=smb_si)
         if self.frictional_heating:
             self._compute_frictional_heating()
 

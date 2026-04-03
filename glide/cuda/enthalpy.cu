@@ -2,16 +2,22 @@
    ================== Enthalpy Kernels =======================
    =========================================================
 
-   Solves the enthalpy advection-diffusion equation in
-   terrain-following (sigma) coordinates:
+   Solves the CONSERVATIVE enthalpy equation in terrain-following
+   (sigma) coordinates:
 
-   rho_i (dE/dt + u dE/dx + v dE/dy + sigma_dot dE/dsigma)
-       - (1/h^2) d/dsigma(K dE/dsigma) = phi - rho_w L Dw(omega)
+   rho_i [d(HE)/dt + d(HuE)/dx + d(HvE)/dy + d(E*omega)/dsigma]
+       = (1/H) d/dsigma(K dE/dsigma) + H*phi - H*rho_w L Dw(omega)
+
+   where omega = H*sigma_dot is the scaled vertical velocity.
+
+   The conservative form tracks depth-integrated enthalpy HE,
+   ensuring exact energy conservation under grid deformation.
+   See docs/conservation.md for the derivation.
 
    Discretization:
-   - Horizontal: finite volume with upwind fluxes on MAC grid
-   - Vertical: finite differences on uniform sigma nodes
-   - Column-wise Newton/Thomas solve as multigrid smoother
+   - Horizontal: Lax-Friedrichs finite volume on MAC grid
+   - Vertical: conservative finite volume on uniform sigma nodes
+   - Column-wise Newton/Thomas solve as smoother (Vanka-style)
 
    Architecture:
    Each physical term is decomposed into a Stencil/Jacobian pair
@@ -151,8 +157,8 @@ float get_v3d(const float* __restrict__ v, int k, int i, int j,
 
 
 /* ---------------------------------------------------------
-   Vertical Diffusion:
-     -(1/h^2) d/dsigma(K dE/dsigma)
+   Vertical Diffusion (conservative form):
+     -(1/H) d/dsigma(K dE/dsigma)
    at an interior node k with neighbors k-1, k+1.
    Returns tridiagonal contributions (d_E_km1, d_E_k, d_E_kp1).
    --------------------------------------------------------- */
@@ -160,20 +166,20 @@ struct ColumnDiffusionStencil {
     float E_km1, E_k, E_kp1;
     float E_pmp_km1, E_pmp_k, E_pmp_kp1;
     float dsig;
-    float h2_inv;
+    float h_inv;
 };
 
 struct ColumnDiffusionStencilDual {
     DualFloat E_km1, E_k, E_kp1;
     float E_pmp_km1, E_pmp_k, E_pmp_kp1;
     float dsig;
-    float h2_inv;
+    float h_inv;
 
     __device__ __forceinline__
     ColumnDiffusionStencil get_primals() const {
         return {E_km1.v, E_k.v, E_kp1.v,
                 E_pmp_km1, E_pmp_k, E_pmp_kp1,
-                dsig, h2_inv};
+                dsig, h_inv};
     }
 
     __device__ __forceinline__
@@ -203,22 +209,17 @@ ColumnDiffusionJacobian get_column_diffusion_jac(ColumnDiffusionStencil s) {
     float K_lower = get_K(0.5f * (s.E_k + s.E_km1),
                           0.5f * (s.E_pmp_k + s.E_pmp_km1));
 
-    // Uniform spacing: dsig_avg = dsig_m = dsig_p = dsig
     float dsig2_inv = 1.0f / (s.dsig * s.dsig);
 
     float dE_upper = s.E_kp1 - s.E_k;
     float dE_lower = s.E_k - s.E_km1;
 
-    // Residual: -(1/h^2) * [K_upper*(E_kp1-E_k) - K_lower*(E_k-E_km1)] / dsig^2
-    jac.res = -s.h2_inv * dsig2_inv * (K_upper * dE_upper - K_lower * dE_lower);
+    // Residual: -(1/H) * [K_upper*(E_kp1-E_k) - K_lower*(E_k-E_km1)] / dsig^2
+    jac.res = -s.h_inv * dsig2_inv * (K_upper * dE_upper - K_lower * dE_lower);
 
-    // Jacobian entries: freeze K at current state.
-    // Including dK/dE chain-rule terms is exact for small perturbations
-    // but catastrophic when dE across a layer is large (e.g., warm surface
-    // BC on cold ice), as the chain term overwhelms the diagonal.
-    // The frozen-K Jacobian is always positive-definite and stable.
-    float diff_lower = s.h2_inv * dsig2_inv * K_lower;
-    float diff_upper = s.h2_inv * dsig2_inv * K_upper;
+    // Jacobian: freeze K at current state (see docs/column_smoother.md).
+    float diff_lower = s.h_inv * dsig2_inv * K_lower;
+    float diff_upper = s.h_inv * dsig2_inv * K_upper;
 
     jac.d_E_km1 = -diff_lower;
     jac.d_E_kp1 = -diff_upper;
@@ -235,15 +236,18 @@ DualFloat get_column_diffusion_dual(ColumnDiffusionStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Bed Diffusion (basal flux BC):
-     -(1/h^2) K_{1/2} (E_1 - E_0)/dsig - (Q_geo + Q_fh)/h
+   Bed Diffusion (conservative form, basal flux BC):
+     -(1/H) K_{1/2} (E_1 - E_0)/dsig - (Q_geo + Q_fh)
+   The Q_geo+Q_fh term no longer has the 1/H factor because
+   the original source -(Q_geo+Q_fh)/H gets multiplied by H
+   in the conservative form, cancelling the denominator.
    Returns contributions for k=0 only (d_E_k = d_E_0, d_E_kp1 = d_E_1).
    --------------------------------------------------------- */
 struct BedDiffusionStencil {
     float E_k, E_kp1;
     float E_pmp_k, E_pmp_kp1;
     float dsig;
-    float h2_inv, h_inv;
+    float h_inv;
     float Q_geo, Q_fh;
 };
 
@@ -251,19 +255,19 @@ struct BedDiffusionStencilDual {
     DualFloat E_k, E_kp1;
     float E_pmp_k, E_pmp_kp1;
     float dsig;
-    float h2_inv, h_inv;
+    float h_inv;
     float Q_geo, Q_fh;
 
     __device__ __forceinline__
     BedDiffusionStencil get_primals() const {
         return {E_k.v, E_kp1.v, E_pmp_k, E_pmp_kp1,
-                dsig, h2_inv, h_inv, Q_geo, Q_fh};
+                dsig, h_inv, Q_geo, Q_fh};
     }
 
     __device__ __forceinline__
     BedDiffusionStencil get_diffs() const {
         return {E_k.d, E_kp1.d, 0.0f, 0.0f,
-                0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+                0.0f, 0.0f, 0.0f, 0.0f};
     }
 };
 
@@ -285,18 +289,16 @@ BedDiffusionJacobian get_bed_diffusion_jac(BedDiffusionStencil s) {
                          0.5f * (s.E_pmp_k + s.E_pmp_kp1));
 
     // Half-cell control volume width at the bed boundary.
-    // The boundary node sits at sigma=0; the control volume extends to
-    // the midpoint with the first interior node, dsig/2.  Dividing
-    // the flux divergence by dsig_half keeps the bed cell consistent
-    // with the interior cells (which divide by dsig).
     float dsig_half = 0.5f * s.dsig;
 
-    // Residual: -(1/h^2)[K_{1/2}(E_1-E_0)/dsig + h(Q_geo+Q_fh)] / dsig_half
-    jac.res = (-s.h2_inv * K_half * (s.E_kp1 - s.E_k) / s.dsig
-               - (s.Q_geo + s.Q_fh) * s.h_inv) / dsig_half;
+    // Residual (conservative form):
+    //   -(1/H) * K_{1/2} * (E_1-E_0)/dsig / dsig_half - (Q_geo+Q_fh) / dsig_half
+    // The Q_geo+Q_fh term has no 1/H because H*source cancels the original 1/H.
+    jac.res = (-s.h_inv * K_half * (s.E_kp1 - s.E_k) / s.dsig
+               - (s.Q_geo + s.Q_fh)) / dsig_half;
 
-    // Jacobian: freeze K at current state (see interior comment)
-    float coeff = s.h2_inv * K_half / (s.dsig * dsig_half);
+    // Jacobian: freeze K at current state
+    float coeff = s.h_inv * K_half / (s.dsig * dsig_half);
     jac.d_E_k   =  coeff;
     jac.d_E_kp1 = -coeff;
 
@@ -311,31 +313,36 @@ DualFloat get_bed_diffusion_dual(BedDiffusionStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Sigma (Vertical) Advection:
-     rho_i * sigma_dot * dE/dsigma  (upwind)
+   Sigma (Vertical) Advection — conservative form:
+     rho_i * d(E * omega) / dsigma
+   where omega = H * sigma_dot is the scaled vertical velocity.
+
+   The conservative flux at interface k+1/2 is:
+     F_{k+1/2} = E_upwind * omega_{k+1/2}
+   where omega_{k+1/2} = 0.5*(omega_k + omega_{k+1}).
    Returns tridiagonal contributions.
    --------------------------------------------------------- */
 struct SigmaAdvectionStencil {
     float E_km1, E_k, E_kp1;
-    float sigma_dot;
+    float omega_km1, omega_k, omega_kp1;  // omega = H*sigma_dot at nodes
     float dsig;
 };
 
 struct SigmaAdvectionStencilDual {
     DualFloat E_km1, E_k, E_kp1;
-    float sigma_dot;
+    float omega_km1, omega_k, omega_kp1;
     float dsig;
 
     __device__ __forceinline__
     SigmaAdvectionStencil get_primals() const {
         return {E_km1.v, E_k.v, E_kp1.v,
-                sigma_dot, dsig};
+                omega_km1, omega_k, omega_kp1, dsig};
     }
 
     __device__ __forceinline__
     SigmaAdvectionStencil get_diffs() const {
         return {E_km1.d, E_k.d, E_kp1.d,
-                0.0f, 0.0f};
+                0.0f, 0.0f, 0.0f, 0.0f};
     }
 };
 
@@ -353,19 +360,28 @@ __device__ __forceinline__
 SigmaAdvectionJacobian get_sigma_advection_jac(SigmaAdvectionStencil s) {
     SigmaAdvectionJacobian jac = {0};
 
-    float sd_pos = fmaxf(s.sigma_dot, 0.0f);
-    float sd_neg = fminf(s.sigma_dot, 0.0f);
     float dsig_inv = 1.0f / s.dsig;
 
-    // Uniform spacing: dsig_m = dsig_p = dsig
-    // Residual: rho_i * [sd+ * (E_k - E_km1) + sd- * (E_kp1 - E_k)] / dsig
-    jac.res = RHO_I * (sd_pos * (s.E_k - s.E_km1)
-                      + sd_neg * (s.E_kp1 - s.E_k)) * dsig_inv;
+    // Interface omega values (averaged to half-nodes)
+    float omega_upper = 0.5f * (s.omega_k + s.omega_kp1);
+    float omega_lower = 0.5f * (s.omega_km1 + s.omega_k);
 
-    // Jacobian
-    jac.d_E_km1 = -RHO_I * sd_pos * dsig_inv;
-    jac.d_E_kp1 =  RHO_I * sd_neg * dsig_inv;
-    jac.d_E_k   =  RHO_I * (sd_pos - sd_neg) * dsig_inv;
+    // Upwind fluxes: F = E_upwind * omega_half
+    float omega_up_pos = fmaxf(omega_upper, 0.0f);
+    float omega_up_neg = fminf(omega_upper, 0.0f);
+    float F_upper = omega_up_pos * s.E_k + omega_up_neg * s.E_kp1;
+
+    float omega_lo_pos = fmaxf(omega_lower, 0.0f);
+    float omega_lo_neg = fminf(omega_lower, 0.0f);
+    float F_lower = omega_lo_pos * s.E_km1 + omega_lo_neg * s.E_k;
+
+    // Residual: rho_i * (F_upper - F_lower) / dsig
+    jac.res = RHO_I * (F_upper - F_lower) * dsig_inv;
+
+    // Jacobian w.r.t. column unknowns
+    jac.d_E_km1 = -RHO_I * omega_lo_pos * dsig_inv;
+    jac.d_E_kp1 =  RHO_I * omega_up_neg * dsig_inv;
+    jac.d_E_k   =  RHO_I * (omega_up_pos - omega_lo_neg) * dsig_inv;
 
     return jac;
 }
@@ -378,29 +394,30 @@ DualFloat get_sigma_advection_dual(SigmaAdvectionStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Bed Sigma Advection (k=0, one-sided):
-     Only downward (sd < 0) can be upwinded; sd > 0 gives zero
-     gradient at bed.
+   Bed Sigma Advection (k=0, conservative form):
+     Uses half-cell. The bed boundary flux is F_bed = omega_bed * E_bed.
+     With no basal melt, omega_bed ≈ 0 so F_bed ≈ 0.
+     The upper interface flux uses upwinding on omega_{1/2}.
    --------------------------------------------------------- */
 struct BedSigmaAdvectionStencil {
     float E_k, E_kp1;
-    float sigma_dot;
+    float omega_k, omega_kp1;  // omega at bed (k=0) and first interior (k=1)
     float dsig;
 };
 
 struct BedSigmaAdvectionStencilDual {
     DualFloat E_k, E_kp1;
-    float sigma_dot;
+    float omega_k, omega_kp1;
     float dsig;
 
     __device__ __forceinline__
     BedSigmaAdvectionStencil get_primals() const {
-        return {E_k.v, E_kp1.v, sigma_dot, dsig};
+        return {E_k.v, E_kp1.v, omega_k, omega_kp1, dsig};
     }
 
     __device__ __forceinline__
     BedSigmaAdvectionStencil get_diffs() const {
-        return {E_k.d, E_kp1.d, 0.0f, 0.0f};
+        return {E_k.d, E_kp1.d, 0.0f, 0.0f, 0.0f};
     }
 };
 
@@ -418,14 +435,25 @@ __device__ __forceinline__
 BedSigmaAdvectionJacobian get_bed_sigma_advection_jac(BedSigmaAdvectionStencil s) {
     BedSigmaAdvectionJacobian jac = {0};
 
-    if (s.sigma_dot < 0.0f) {
-        // Upwind from above
-        float dsig_inv = 1.0f / s.dsig;
-        jac.res = RHO_I * s.sigma_dot * (s.E_kp1 - s.E_k) * dsig_inv;
-        jac.d_E_k   = -RHO_I * s.sigma_dot * dsig_inv;
-        jac.d_E_kp1 =  RHO_I * s.sigma_dot * dsig_inv;
-    }
-    // sd >= 0: cannot upwind from below bed, zero contribution
+    float dsig_half = 0.5f * s.dsig;
+    float dsig_half_inv = 1.0f / dsig_half;
+
+    // Upper interface flux (upwind on omega_{1/2})
+    float omega_half = 0.5f * (s.omega_k + s.omega_kp1);
+    float omega_pos = fmaxf(omega_half, 0.0f);
+    float omega_neg = fminf(omega_half, 0.0f);
+    float F_upper = omega_pos * s.E_k + omega_neg * s.E_kp1;
+
+    // Bed boundary flux: F_bed = omega_bed * E_bed
+    // omega_bed = omega[k=0] which includes basal melt (typically ~0)
+    float F_bed = s.omega_k * s.E_k;
+
+    // Residual: rho_i * (F_upper - F_bed) / dsig_half
+    jac.res = RHO_I * (F_upper - F_bed) * dsig_half_inv;
+
+    // Jacobian
+    jac.d_E_k   = RHO_I * (omega_pos - s.omega_k) * dsig_half_inv;
+    jac.d_E_kp1 = RHO_I * omega_neg * dsig_half_inv;
 
     return jac;
 }
@@ -529,21 +557,23 @@ struct DrainageStencil {
     float E_k;
     float E_pmp_k;
     float drain_rate;
+    float H;           // ice thickness (conservative form scales by H)
 };
 
 struct DrainageStencilDual {
     DualFloat E_k;
     float E_pmp_k;
     float drain_rate;
+    float H;
 
     __device__ __forceinline__
     DrainageStencil get_primals() const {
-        return {E_k.v, E_pmp_k, drain_rate};
+        return {E_k.v, E_pmp_k, drain_rate, H};
     }
 
     __device__ __forceinline__
     DrainageStencil get_diffs() const {
-        return {E_k.d, 0.0f, 0.0f};
+        return {E_k.d, 0.0f, 0.0f, 0.0f};
     }
 };
 
@@ -562,12 +592,9 @@ DrainageJacobian get_drainage_jac(DrainageStencil s) {
     DrainageJacobian jac = {0};
 
     float omega = get_omega(s.E_k, s.E_pmp_k);
-    jac.res = RHO_W * L_HEAT * get_drainage(omega, s.drain_rate);
-
-    // Smoothed Jacobian: d/dE(rho_w * L * drain_rate * omega_smooth)
-    //                   = rho_w * L * drain_rate * sigmoid(alpha*(E - E_pmp)) / L
-    //                   = rho_w * drain_rate * sigmoid(alpha*(E - E_pmp))
-    jac.d_E_k = RHO_W * L_HEAT * s.drain_rate * get_domega_dE(s.E_k, s.E_pmp_k);
+    // Conservative form: H * rho_w * L * drain_rate * omega
+    jac.res = s.H * RHO_W * L_HEAT * get_drainage(omega, s.drain_rate);
+    jac.d_E_k = s.H * RHO_W * L_HEAT * s.drain_rate * get_domega_dE(s.E_k, s.E_pmp_k);
 
     return jac;
 }
@@ -580,15 +607,13 @@ DualFloat get_drainage_dual(DrainageStencilDual s) {
 
 
 /* ---------------------------------------------------------
-   Horizontal advection assembly for one layer.
+   Horizontal advection assembly for one layer (conservative form).
 
-   Uses the advective form  rho_i * (u dE/dx + v dE/dy)
-   rather than the flux divergence form  rho_i * div(u*E).
-
-   The difference is rho_i * E * div(u), which is nonzero in
-   sigma coordinates (horizontal divergence != 0 in general).
-   We compute the upwind flux divergence and subtract the
-   E * div(u) correction to recover the advective form.
+   Computes rho_i * div_h(H*u*E) in flux divergence form.
+   The mass flux H*u at each face is computed from the face
+   velocity and face-averaged thickness.  No advective form
+   correction is needed — the conservative equation is already
+   in divergence form.  See docs/conservation.md.
    --------------------------------------------------------- */
 struct HorizAdvectionResult {
     float res;       // rho_i * (u dE/dx + v dE/dy)  [advective form]
@@ -600,6 +625,7 @@ HorizAdvectionResult get_horiz_advection(
     const float* __restrict__ E,
     const float* __restrict__ u3d,
     const float* __restrict__ v3d,
+    const float* __restrict__ H,
     float E_here,
     int i, int j, int k,
     int ny, int nx, int nz,
@@ -608,28 +634,41 @@ HorizAdvectionResult get_horiz_advection(
 {
     HorizAdvectionResult result = {0};
 
-    // x-direction
+    // Cell thicknesses for mass flux computation
+    float H_here = H[i * nx + j];
+
+    // x-direction: mass flux Hu at each face
     float u_left  = get_u3d(u3d, k, i, j,   nz, ny, nx);
     float u_right = get_u3d(u3d, k, i, j+1, nz, ny, nx);
     float E_xm = get_E(E, i, j-1, k, ny, nx, nz);
     float E_xp = get_E(E, i, j+1, k, ny, nx, nz);
 
-    // x-direction faces:
-    //   left face (j-1/2):  E_l = E_xm (j-1), E_r = E_here (j)  => d_E_here = fl.d_E_r
-    //   right face (j+1/2): E_l = E_here (j),  E_r = E_xp (j+1) => d_E_here = fr.d_E_l
+    // x-direction faces. Boundary faces use zero-gradient (free outflow):
+    // the exterior ghost cell has E = E_here, H = H_here, so the LF flux
+    // reduces to F = Hu * E_here (pure outflow, no dissipation).
     HorizEnthalpyFluxJacobian fl = {0};
     HorizEnthalpyFluxJacobian fr = {0};
 
     if (j > 0) {
-        fl = get_horiz_enthalpy_flux_jac({u_left, E_xm, E_here}, lf_c);
+        float H_xm = get_cell(H, i, j-1, ny, nx);
+        float Hu_left = 0.5f * (H_xm + H_here) * u_left;
+        fl = get_horiz_enthalpy_flux_jac({Hu_left, E_xm, E_here}, lf_c);
+    } else {
+        // Left boundary: free outflow
+        float Hu_left = H_here * u_left;
+        fl = get_horiz_enthalpy_flux_jac({Hu_left, E_here, E_here}, lf_c);
     }
     if (j < nx - 1) {
-        fr = get_horiz_enthalpy_flux_jac({u_right, E_here, E_xp}, lf_c);
+        float H_xp = get_cell(H, i, j+1, ny, nx);
+        float Hu_right = 0.5f * (H_here + H_xp) * u_right;
+        fr = get_horiz_enthalpy_flux_jac({Hu_right, E_here, E_xp}, lf_c);
+    } else {
+        // Right boundary: free outflow
+        float Hu_right = H_here * u_right;
+        fr = get_horiz_enthalpy_flux_jac({Hu_right, E_here, E_here}, lf_c);
     }
 
-    // y-direction faces:
-    //   top face (i-1/2):    E_l = E_ym (i-1), E_r = E_here (i) => d_E_here = ft.d_E_r
-    //   bottom face (i+1/2): E_l = E_here (i), E_r = E_yp (i+1) => d_E_here = fb.d_E_l
+    // y-direction faces (same boundary treatment)
     float v_top    = get_v3d(v3d, k, i,   j, nz, ny, nx);
     float v_bottom = get_v3d(v3d, k, i+1, j, nz, ny, nx);
     float E_ym = get_E(E, i-1, j, k, ny, nx, nz);
@@ -639,41 +678,40 @@ HorizAdvectionResult get_horiz_advection(
     HorizEnthalpyFluxJacobian fb = {0};
 
     if (i > 0) {
-        ft = get_horiz_enthalpy_flux_jac({v_top, E_ym, E_here}, lf_c);
+        float H_ym = get_cell(H, i-1, j, ny, nx);
+        float Hv_top = 0.5f * (H_ym + H_here) * v_top;
+        ft = get_horiz_enthalpy_flux_jac({Hv_top, E_ym, E_here}, lf_c);
+    } else {
+        float Hv_top = H_here * v_top;
+        ft = get_horiz_enthalpy_flux_jac({Hv_top, E_here, E_here}, lf_c);
     }
     if (i < ny - 1) {
-        fb = get_horiz_enthalpy_flux_jac({v_bottom, E_here, E_yp}, lf_c);
+        float H_yp = get_cell(H, i+1, j, ny, nx);
+        float Hv_bottom = 0.5f * (H_here + H_yp) * v_bottom;
+        fb = get_horiz_enthalpy_flux_jac({Hv_bottom, E_here, E_yp}, lf_c);
+    } else {
+        float Hv_bottom = H_here * v_bottom;
+        fb = get_horiz_enthalpy_flux_jac({Hv_bottom, E_here, E_here}, lf_c);
     }
 
-    // Flux divergence: rho_i * div(F_LF) / dx
+    // Conservative flux divergence: rho_i * div(H*u*E)
+    // No advective form correction needed.
     result.res = RHO_I * ((fr.res - fl.res) + (fb.res - ft.res)) * dx_inv;
     result.d_E_here = RHO_I * ((fr.d_E_l - fl.d_E_r)
                               + (fb.d_E_l - ft.d_E_r)) * dx_inv;
-
-    // Correct the central flux part to advective form.
-    // The LF flux is F = F_central - F_dissipation, where:
-    //   F_central = 0.5 * u * (E_l + E_r)   => div(F_central) includes E * div(u)
-    //   F_dissipation = 0.5 * alpha * (E_r - E_l)  => pure diffusion, no div(u) issue
-    // We subtract E * div(u) to recover the advective form for the central part.
-    // The dissipation part stays in flux divergence form (conservative diffusion).
-    float u_l = (j > 0)      ? u_left   : 0.0f;
-    float u_r = (j < nx - 1) ? u_right  : 0.0f;
-    float v_t = (i > 0)      ? v_top    : 0.0f;
-    float v_b = (i < ny - 1) ? v_bottom : 0.0f;
-    float div_u = (u_r - u_l + v_b - v_t) * dx_inv;
-    result.res     -= RHO_I * E_here * div_u;
-    result.d_E_here -= RHO_I * div_u;
 
     return result;
 }
 
 
 /* =========================================================
-   Compute the enthalpy residual at all (i, j, k) points.
+   Compute the conservative enthalpy residual at all (i, j, k).
+
+   R = rho_i*(H*E - H_prev*E_prev)/dt + rho_i*div_h(HuE)
+       + rho_i*d(E*omega)/dsig - (1/H)*d/dsig(K*dE/dsig)
+       - H*phi + H*drainage
 
    Uses the Jacobian structs above — only reads .res fields.
-   This guarantees residual/Jacobian consistency: both kernels
-   evaluate the same get_*_jac() functions.
    ========================================================= */
 extern "C" __global__
 void enthalpy_compute_residual(
@@ -683,8 +721,9 @@ void enthalpy_compute_residual(
     const float* __restrict__ f_E,      // (ny, nx, nz) FAS tau correction (0 on finest)
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity per layer
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity per layer
-    const float* __restrict__ sigma_dot,// (ny, nx, nz) sigma velocity
+    const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
     const float* __restrict__ H,        // (ny, nx) ice thickness
+    const float* __restrict__ H_prev,   // (ny, nx) previous ice thickness
     const float* __restrict__ phi_strain,// (ny, nx, nz) strain heating
     const float* __restrict__ E_surface,// (ny, nx) surface enthalpy BC
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
@@ -701,6 +740,7 @@ void enthalpy_compute_residual(
     int j = idx % nx;
 
     float h = H[i * nx + j];
+    float hp = H_prev[i * nx + j];
 
     // Thin-ice bypass: not a solver unknown, zero residual.
     if (h < h_thin) {
@@ -711,14 +751,12 @@ void enthalpy_compute_residual(
     }
 
     float h_inv = 1.0f / h;
-    float h2_inv = h_inv * h_inv;
     float dx_inv = 1.0f / dx;
     float dsig = 1.0f / (float)(nz - 1);
 
     for (int k = 0; k < nz; k++) {
         int ijk = (i * nx + j) * nz + k;
 
-        // Surface Dirichlet BC: not a solver unknown, zero residual.
         if (k == nz - 1) {
             r_E[ijk] = 0.0f;
             continue;
@@ -728,43 +766,44 @@ void enthalpy_compute_residual(
         float sigma_k = k * dsig;
         float E_pmp_k = get_E_pmp(sigma_k, h);
 
-        // --- Time derivative ---
-        float r = RHO_I * (E_k - E_prev[ijk]) / dt - f_E[ijk];
+        // --- Conservative time derivative: rho_i * (H*E - H_prev*E_prev) / dt ---
+        float r = RHO_I * (h * E_k - hp * E_prev[ijk]) / dt - f_E[ijk];
 
-        // --- Horizontal advection ---
+        // --- Horizontal advection: rho_i * div(H*u*E) ---
         if (term_flags & TERM_HORIZ_ADV) {
             HorizAdvectionResult h_adv = get_horiz_advection(
-                E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv, lf_c);
+                E, u3d, v3d, H, E_k, i, j, k, ny, nx, nz, dx_inv, lf_c);
             r += h_adv.res;
         }
 
-        // --- Vertical advection + diffusion ---
+        // --- Vertical terms ---
         if (k == 0) {
-            // Bed boundary
             float E_pmp_bed = get_E_pmp(0.0f, h);
             float E_kp1 = get_E(E, i, j, 1, ny, nx, nz);
 
             if (term_flags & TERM_SIGMA_DOT) {
+                float omega_k = omega[ijk];
+                float omega_kp1 = omega[(i*nx+j)*nz + 1];
                 BedSigmaAdvectionJacobian adv_jac = get_bed_sigma_advection_jac(
-                    {E_k, E_kp1, sigma_dot[ijk], dsig});
+                    {E_k, E_kp1, omega_k, omega_kp1, dsig});
                 r += adv_jac.res;
             }
 
             BedDiffusionJacobian diff_jac = get_bed_diffusion_jac(
                 {E_k, E_kp1, E_pmp_bed, get_E_pmp(dsig, h),
-                 dsig, h2_inv, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
+                 dsig, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
             r += diff_jac.res;
 
             if (term_flags & TERM_STRAIN_HEAT) {
-                r -= phi_strain[ijk];
+                r -= h * phi_strain[ijk];
             }
 
             if (term_flags & TERM_DRAINAGE) {
-                DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
+                DrainageJacobian drain_jac = get_drainage_jac(
+                    {E_k, E_pmp_bed, drain_rate, h});
                 r += drain_jac.res;
             }
         } else {
-            // Interior layers (k = 1 .. nz-2)
             float E_km1 = get_E(E, i, j, k-1, ny, nx, nz);
             float E_kp1 = (k < nz-1) ? get_E(E, i, j, k+1, ny, nx, nz)
                                       : E_surface[i*nx+j];
@@ -773,22 +812,26 @@ void enthalpy_compute_residual(
             float E_pmp_kp1 = get_E_pmp(min(k+1, nz-1) * dsig, h);
 
             if (term_flags & TERM_SIGMA_DOT) {
+                float omega_km1 = omega[(i*nx+j)*nz + k-1];
+                float omega_k   = omega[ijk];
+                float omega_kp1 = omega[(i*nx+j)*nz + min(k+1, nz-1)];
                 SigmaAdvectionJacobian adv_jac = get_sigma_advection_jac(
-                    {E_km1, E_k, E_kp1, sigma_dot[ijk], dsig});
+                    {E_km1, E_k, E_kp1, omega_km1, omega_k, omega_kp1, dsig});
                 r += adv_jac.res;
             }
 
             ColumnDiffusionJacobian diff_jac = get_column_diffusion_jac(
                 {E_km1, E_k, E_kp1, E_pmp_km1, E_pmp_k, E_pmp_kp1,
-                 dsig, h2_inv});
+                 dsig, h_inv});
             r += diff_jac.res;
 
             if (term_flags & TERM_STRAIN_HEAT) {
-                r -= phi_strain[ijk];
+                r -= h * phi_strain[ijk];
             }
 
             if (term_flags & TERM_DRAINAGE) {
-                DrainageJacobian drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
+                DrainageJacobian drain_jac = get_drainage_jac(
+                    {E_k, E_pmp_k, drain_rate, h});
                 r += drain_jac.res;
             }
         }
@@ -830,8 +873,9 @@ void enthalpy_column_smooth(
     const float* __restrict__ f_E,      // (ny, nx, nz) FAS tau correction
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity
-    const float* __restrict__ sigma_dot,// (ny, nx, nz) sigma velocity
+    const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
     const float* __restrict__ H,        // (ny, nx) thickness
+    const float* __restrict__ H_prev,   // (ny, nx) previous thickness
     const float* __restrict__ phi_strain,// (ny, nx, nz) strain heating
     const float* __restrict__ E_surface,// (ny, nx) surface BC
     const float* __restrict__ Q_geo,    // (ny, nx) geothermal heat flux
@@ -849,6 +893,7 @@ void enthalpy_column_smooth(
     int j = idx % nx;
 
     float h = H[i * nx + j];
+    float hp = H_prev[i * nx + j];
 
     // Thin-ice bypass: drive column toward E_surface, capped at E_pmp
     if (h < h_thin) {
@@ -863,14 +908,10 @@ void enthalpy_column_smooth(
     }
 
     float h_inv = 1.0f / h;
-    float h2_inv = h_inv * h_inv;
     float dx_inv = 1.0f / dx;
     float dsig = 1.0f / (float)(nz - 1);
     float E_s = E_surface[i * nx + j];
 
-    // Local copy of column enthalpy for Newton iteration.
-    // Vertical neighbors come from E_local (updated each Newton step).
-    // Horizontal neighbors come from global E (frozen across Newton steps).
     float E_local[MAX_NZ];
     for (int k = 0; k < nz; k++) {
         E_local[k] = E[(i * nx + j) * nz + k];
@@ -884,7 +925,6 @@ void enthalpy_column_smooth(
         for (int k = 0; k < nz; k++) {
             int ijk = (i * nx + j) * nz + k;
 
-            // --- Surface: Dirichlet ---
             if (k == nz - 1) {
                 a[k] = 0.0f;
                 b[k] = 1.0f;
@@ -897,17 +937,14 @@ void enthalpy_column_smooth(
             float sigma_k = k * dsig;
             float E_pmp_k = get_E_pmp(sigma_k, h);
 
-            // --- Full PDE residual ---
-            float r = RHO_I * (E_k - E_prev[ijk]) / dt - f_E[ijk];
+            // --- Conservative time derivative ---
+            float r = RHO_I * (h * E_k - hp * E_prev[ijk]) / dt - f_E[ijk];
 
-            // Horizontal advection: evaluate with E_k from E_local (current
-            // Newton iterate) and neighbors from global E (frozen).
-            // get_horiz_advection reads E_here as a parameter (we pass E_k)
-            // and neighbors via get_E() from the global E array.
+            // --- Horizontal advection (conservative, Vanka-style) ---
             float horiz_diag = 0.0f;
             if (term_flags & TERM_HORIZ_ADV) {
                 HorizAdvectionResult h_adv = get_horiz_advection(
-                    E, u3d, v3d, E_k, i, j, k, ny, nx, nz, dx_inv, lf_c);
+                    E, u3d, v3d, H, E_k, i, j, k, ny, nx, nz, dx_inv, lf_c);
                 r += h_adv.res;
                 horiz_diag = h_adv.d_E_here;
             }
@@ -919,28 +956,31 @@ void enthalpy_column_smooth(
 
                 BedSigmaAdvectionJacobian adv_jac = {0};
                 if (term_flags & TERM_SIGMA_DOT) {
+                    float omega_k   = omega[ijk];
+                    float omega_kp1 = omega[(i*nx+j)*nz + 1];
                     adv_jac = get_bed_sigma_advection_jac(
-                        {E_k, E_kp1, sigma_dot[ijk], dsig});
+                        {E_k, E_kp1, omega_k, omega_kp1, dsig});
                     r += adv_jac.res;
                 }
 
                 BedDiffusionJacobian diff_jac = get_bed_diffusion_jac(
                     {E_k, E_kp1, E_pmp_bed, get_E_pmp(dsig, h),
-                     dsig, h2_inv, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
+                     dsig, h_inv, Q_geo[i*nx+j], Q_fh[i*nx+j]});
                 r += diff_jac.res;
 
                 if (term_flags & TERM_STRAIN_HEAT) {
-                    r -= phi_strain[ijk];
+                    r -= h * phi_strain[ijk];
                 }
 
                 DrainageJacobian drain_jac = {0};
                 if (term_flags & TERM_DRAINAGE) {
-                    drain_jac = get_drainage_jac({E_k, E_pmp_bed, drain_rate});
+                    drain_jac = get_drainage_jac(
+                        {E_k, E_pmp_bed, drain_rate, h});
                     r += drain_jac.res;
                 }
 
                 a[0] = 0.0f;
-                b[0] = RHO_I / dt
+                b[0] = RHO_I * h / dt
                      + diff_jac.d_E_k + adv_jac.d_E_k
                      + drain_jac.d_E_k + horiz_diag;
                 c_arr[0] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
@@ -954,28 +994,32 @@ void enthalpy_column_smooth(
 
                 SigmaAdvectionJacobian adv_jac = {0};
                 if (term_flags & TERM_SIGMA_DOT) {
+                    float omega_km1 = omega[(i*nx+j)*nz + k-1];
+                    float omega_k   = omega[ijk];
+                    float omega_kp1 = omega[(i*nx+j)*nz + min(k+1, nz-1)];
                     adv_jac = get_sigma_advection_jac(
-                        {E_km1, E_k, E_kp1, sigma_dot[ijk], dsig});
+                        {E_km1, E_k, E_kp1, omega_km1, omega_k, omega_kp1, dsig});
                     r += adv_jac.res;
                 }
 
                 ColumnDiffusionJacobian diff_jac = get_column_diffusion_jac(
                     {E_km1, E_k, E_kp1, E_pmp_km1, E_pmp_k, E_pmp_kp1,
-                     dsig, h2_inv});
+                     dsig, h_inv});
                 r += diff_jac.res;
 
                 if (term_flags & TERM_STRAIN_HEAT) {
-                    r -= phi_strain[ijk];
+                    r -= h * phi_strain[ijk];
                 }
 
                 DrainageJacobian drain_jac = {0};
                 if (term_flags & TERM_DRAINAGE) {
-                    drain_jac = get_drainage_jac({E_k, E_pmp_k, drain_rate});
+                    drain_jac = get_drainage_jac(
+                        {E_k, E_pmp_k, drain_rate, h});
                     r += drain_jac.res;
                 }
 
                 a[k] = diff_jac.d_E_km1 + adv_jac.d_E_km1;
-                b[k] = RHO_I / dt
+                b[k] = RHO_I * h / dt
                      + diff_jac.d_E_k + adv_jac.d_E_k
                      + drain_jac.d_E_k + horiz_diag;
                 c_arr[k] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
@@ -1013,17 +1057,18 @@ void enthalpy_column_smooth(
 
 
 /* =========================================================
-   Compute sigma_dot from 3D velocity field.
+   Compute omega = H * sigma_dot from 3D velocity field.
 
-   h * sigma_dot = uz - ux*(db/dx + sigma*dh/dx)
-                      - uy*(db/dy + sigma*dh/dy)
-                      - sigma * dh/dt
+   omega = h * sigma_dot = uz - ux*(db/dx + sigma*dh/dx)
+                              - uy*(db/dy + sigma*dh/dy)
+                              - sigma * dh/dt
 
-   where dh/dt is approximated from mass conservation.
+   Stores omega directly (no division by H) for use in the
+   conservative enthalpy equation.
    ========================================================= */
 extern "C" __global__
-void compute_sigma_dot(
-    float* __restrict__ sigma_dot,  // (ny, nx, nz) output
+void compute_omega(
+    float* __restrict__ omega_out,  // (ny, nx, nz) output: omega = H*sigma_dot
     const float* __restrict__ u3d,  // (nz, ny, nx+1)
     const float* __restrict__ v3d,  // (nz, ny+1, nx)
     const float* __restrict__ H,    // (ny, nx)
@@ -1136,7 +1181,9 @@ void compute_sigma_dot(
             - uy_k * (db_dy + sig_k * dH_dy)
             - sig_k * dh_dt;
 
-        sigma_dot[(i*nx+j)*nz + k] = h_sigma_dot * h_inv;
+        // Store omega = H * sigma_dot directly (conservative form).
+        // h_sigma_dot IS omega — no division by H needed.
+        omega_out[(i*nx+j)*nz + k] = h_sigma_dot;
     }
 }
 

@@ -7,7 +7,7 @@ within the multigrid framework.
 
 The enthalpy equation (Aschwanden et al. 2012):
 
-    rho_i (dE/dt + u dE/dx + v dE/dy + sigma_dot dE/dsigma)
+    rho_i (dE/dt + u dE/dx + v dE/dy + omega dE/dsigma)
         - (1/h^2) d/dsigma(K dE/dsigma) = phi - rho_w L Dw(omega)
 
 is discretized with:
@@ -101,10 +101,11 @@ class EnthalpyForcing:
 
     drain_rate: Constant = field(
         default_factory=lambda: Constant(
-            value=cp.float32(0.01),
+            value=cp.float32(0.01 / (365.25 * 86400.0)),
             name='drain_rate',
-            units='a^{-1}',
-            attrs={'long_name': 'Water drainage rate in temperate ice'})
+            units='s^{-1}',
+            attrs={'long_name': 'Water drainage rate in temperate ice '
+                                '(0.01 a^{-1} default)'})
     )
 
     h_thin: Constant = field(
@@ -134,7 +135,7 @@ class EnthalpyVelocity:
     """3D velocity fields for enthalpy advection."""
     u3d: cp.ndarray | None = None       # (nz, ny, nx+1) x-velocity
     v3d: cp.ndarray | None = None       # (nz, ny+1, nx) y-velocity
-    sigma_dot: cp.ndarray | None = None # (ny, nx, nz) sigma velocity
+    omega: cp.ndarray | None = None     # (ny, nx, nz) omega = H*omega
 
     def __repr__(self):
         if self.u3d is not None:
@@ -150,7 +151,7 @@ class EnthalpyTermFlags:
     debugging convergence and isolating the effect of individual physics.
     """
     horizontal_advection: bool = True
-    sigma_dot: bool = True
+    omega: bool = True
     strain_heating: bool = True
     drainage: bool = True
 
@@ -158,7 +159,7 @@ class EnthalpyTermFlags:
     def bitmask(self) -> int:
         """Pack flags into the integer bitmask expected by CUDA kernels."""
         return ((1 if self.horizontal_advection else 0)
-              | ((1 if self.sigma_dot else 0) << 1)
+              | ((1 if self.omega else 0) << 1)
               | ((1 if self.strain_heating else 0) << 2)
               | ((1 if self.drainage else 0) << 3))
 
@@ -196,7 +197,7 @@ class EnthalpyOperators:
     - compute_residual: full enthalpy residual at all (i,j,k)
     - column_smooth: column-wise Newton/Thomas smoother
     - column_sweep: repeated smoothing with solution update
-    - compute_sigma_dot: sigma velocity from 3D velocity field
+    - compute_omega: sigma velocity from 3D velocity field
     - set_rhs: set forcing / previous time step data
 
     Parallels the ForwardOperators class for the SSA solver.
@@ -230,7 +231,7 @@ class EnthalpyOperators:
         self.enthalpy_velocity = EnthalpyVelocity(
             u3d=cp.zeros((nz, ny, nx + 1), dtype=cp.float32),
             v3d=cp.zeros((nz, ny + 1, nx), dtype=cp.float32),
-            sigma_dot=cp.zeros((ny, nx, nz), dtype=cp.float32),
+            omega=cp.zeros((ny, nx, nz), dtype=cp.float32),
         )
 
         # Forcing / BCs
@@ -271,7 +272,7 @@ class EnthalpyOperators:
             self.enthalpy_velocity.u3d[k, :, :] = u2d
             self.enthalpy_velocity.v3d[k, :, :] = v2d
 
-    def compute_sigma_dot(self, smb=None):
+    def compute_omega(self, smb=None):
         """Compute sigma velocity from 3D velocity field.
 
         Parameters
@@ -282,7 +283,7 @@ class EnthalpyOperators:
             year-based units — only correct when velocities are also
             in m/yr).
         """
-        kernel = self.kernels.get_function('compute_sigma_dot')
+        kernel = self.kernels.get_function('compute_omega')
         grid_size, block_size = self._column_launch_config
 
         grid = self.grid
@@ -290,7 +291,7 @@ class EnthalpyOperators:
         smb_data = smb if smb is not None else grid.forcing.smb.data
 
         kernel(grid_size, block_size,
-               (vel.sigma_dot,
+               (vel.omega,
                 vel.u3d, vel.v3d,
                 grid.state.H.data,
                 grid.geometry.bed.data,
@@ -314,8 +315,9 @@ class EnthalpyOperators:
                (self.r_E,
                 state.E, state.E_prev,
                 self.f_E,
-                vel.u3d, vel.v3d, vel.sigma_dot,
+                vel.u3d, vel.v3d, vel.omega,
                 grid.state.H.data,
+                grid.state.H_prev.data,
                 forcing.phi_strain,
                 forcing.E_surface,
                 forcing.Q_geo,
@@ -350,8 +352,9 @@ class EnthalpyOperators:
                (self.delta_E,
                 state.E, state.E_prev,
                 self.f_E,
-                vel.u3d, vel.v3d, vel.sigma_dot,
+                vel.u3d, vel.v3d, vel.omega,
                 grid.state.H.data,
+                grid.state.H_prev.data,
                 forcing.phi_strain,
                 forcing.E_surface,
                 forcing.Q_geo,

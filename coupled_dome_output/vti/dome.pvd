@@ -1,25 +1,9 @@
 <?xml version="1.0" ?>
 <VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
   <Collection>
-    <DataSet timestep="37.5" group="" part="0" file="dome_0010.vti"/>
-    <DataSet timestep="62.5" group="" part="0" file="dome_0020.vti"/>
-    <DataSet timestep="87.5" group="" part="0" file="dome_0030.vti"/>
-    <DataSet timestep="112.5" group="" part="0" file="dome_0040.vti"/>
-    <DataSet timestep="137.5" group="" part="0" file="dome_0050.vti"/>
-    <DataSet timestep="162.5" group="" part="0" file="dome_0060.vti"/>
-    <DataSet timestep="187.5" group="" part="0" file="dome_0070.vti"/>
-    <DataSet timestep="212.5" group="" part="0" file="dome_0080.vti"/>
-    <DataSet timestep="237.5" group="" part="0" file="dome_0090.vti"/>
-    <DataSet timestep="262.5" group="" part="0" file="dome_0100.vti"/>
-    <DataSet timestep="287.5" group="" part="0" file="dome_0110.vti"/>
-    <DataSet timestep="312.5" group="" part="0" file="dome_0120.vti"/>
-    <DataSet timestep="337.5" group="" part="0" file="dome_0130.vti"/>
-    <DataSet timestep="362.5" group="" part="0" file="dome_0140.vti"/>
-    <DataSet timestep="387.5" group="" part="0" file="dome_0150.vti"/>
-    <DataSet timestep="412.5" group="" part="0" file="dome_0160.vti"/>
-    <DataSet timestep="437.5" group="" part="0" file="dome_0170.vti"/>
-    <DataSet timestep="462.5" group="" part="0" file="dome_0180.vti"/>
-    <DataSet timestep="487.5" group="" part="0" file="dome_0190.vti"/>
-    <DataSet timestep="512.5" group="" part="0" file="dome_0200.vti"/>
+    <DataSet timestep="15.0" group="" part="0" file="dome_0010.vti"/>
+    <DataSet timestep="25.0" group="" part="0" file="dome_0020.vti"/>
+    <DataSet timestep="35.0" group="" part="0" file="dome_0030.vti"/>
+    <DataSet timestep="45.0" group="" part="0" file="dome_0040.vti"/>
   </Collection>
 </VTKFile>

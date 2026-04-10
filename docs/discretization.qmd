@@ -1,0 +1,461 @@
+---
+title: "Discretization of the Conservative Enthalpy Equation"
+date: 2026-04-09
+categories: [glaciology, numerical methods, finite volume]
+description: "Finite-volume discretization of the conservative enthalpy equation on a MAC grid with Lax-Friedrichs horizontal fluxes, upwind vertical advection, and a column-wise Newton/Thomas smoother."
+---
+
+This note describes the spatial and temporal discretization of the conservative enthalpy equation derived in [Deriving the Conservative Enthalpy Equation](derivation.qmd). The continuous PDE is:
+
+$$
+\rho_i \left[
+\frac{\partial (HE)}{\partial t}
++ \frac{\partial (HuE)}{\partial x}
++ \frac{\partial (HvE)}{\partial y}
++ \frac{\partial (E\omega)}{\partial \sigma}
+\right]
+= \frac{1}{H}\frac{\partial}{\partial \sigma}\!\left(K \frac{\partial E}{\partial \sigma}\right) + H\phi - H \rho_w L \, r_d \, D_w(\varpi)
+$$
+
+where $u(\sigma), v(\sigma)$ are the horizontal velocity profiles at each sigma level, $\omega = H\dot{\sigma}$ is the scaled vertical velocity, $K$ is the enthalpy diffusivity, $\phi$ is an externally provided volumetric source (e.g., strain heating), and $D_w$ is the meltwater drainage function. The solver accepts arbitrary 3D velocity fields. That is, the assumption is that the momentum balance that produces the velocity field, which is passed into the enthalpy module.
+
+The implementation primarily lives in `enthalpy.cu`, where each physical term is decomposed into a `get_*_jac()` function that computes both the residual and its partial derivatives. Both the residual kernel and the column smoother call the same functions.
+
+::: callout-important
+## Key Design Principle
+
+Every `get_*_jac()` function returns a struct containing both a residual field (`.res`) and its partial derivatives (`.d_E_*`). The residual kernel reads only `.res`; the smoother reads both. Because both paths call the same function, the Jacobian is the exact linearization of the residua**l** (modulo the frozen-$K$ approximation in the diffusion term).
+:::
+
+## 1. The Computational Grid
+
+### Horizontal: Marker-and-Cell (MAC) Grid
+
+Enthalpy $E$ is stored at cell centers $(i, j)$. Horizontal velocities live on cell faces: $u$ on the vertical faces at $(i, j+\tfrac{1}{2})$ and $v$ on the horizontal faces at $(i+\tfrac{1}{2}, j)$. This staggering avoids checkerboard modes and places the advective flux directly at the face where it is needed by the finite-volume divergence.
+
+Crucially, the velocity fields are fully three-dimensional: $u$ is stored as $(N_z, N_y, N_x+1)$ and $v$ as $(N_z, N_y+1, N_x)$, with an independent horizontal velocity profile at each sigma level $k$. This generality allows the same enthalpy solver to be driven by any momentum model. Under SSA, all layers receive the same depth-averaged velocity; under Blatter-Pattyn or full Stokes, each layer carries its own velocity field with vertical shear.
+
+### Vertical: Uniform Sigma Nodes
+
+The vertical coordinate is discretized into $N_z$ uniformly spaced sigma nodes:
+
+$$
+\sigma_k = \frac{k}{N_z - 1}, \quad k = 0, 1, \ldots, N_z - 1, \qquad \Delta\sigma = \frac{1}{N_z - 1}.
+$$
+
+The bed is at $k = 0$ ($\sigma = 0$) and the surface is at $k = N_z - 1$ ($\sigma = 1$). Enthalpy is stored at nodes; vertical fluxes are evaluated at half-nodes $k + \tfrac{1}{2}$.
+
+The bed node ($k = 0$) has a half-cell control volume extending from $\sigma = 0$ to $\sigma = \Delta\sigma/2$. Interior nodes have full-cell control volumes of width $\Delta\sigma$. The surface node ($k = N_z - 1$) is prescribed by a Dirichlet boundary condition and is not a solver unknown.
+
+Enthalpy is stored in $(N_y, N_x, N_z)$ layout so that each column $(i, j, :)$ is contiguous in memory, enabling efficient access during the Thomas algorithm.
+
+## 2. The Full Discrete Residual
+
+The residual at each grid point $(i, j, k)$ is the sum of all discretized terms, arranged so that $R_{i,j,k} = 0$ at a converged solution:
+
+$$
+R_{i,j,k} = \underbrace{R^{\text{time}}}_{\text{conservative time}}
+           + \underbrace{R^{\text{h-adv}}}_{\text{horizontal advection}}
+           + \underbrace{R^{\sigma\text{-adv}}}_{\text{sigma advection}}
+           + \underbrace{R^{\text{diff}}}_{\text{vertical diffusion}}
+           + \underbrace{R^{\text{source}}}_{\text{external source}}
+           + \underbrace{R^{\text{drain}}}_{\text{drainage}}
+$$
+
+Each term is described in the following sections.
+
+## 3. Time Discretization: Conservative Implicit Euler
+
+The time derivative is discretized as:
+
+$$
+R^{\text{time}} = \frac{\rho_i}{\Delta t} \left( H^n E^n_k - H^{n-1} E^{n-1}_k \right)
+$$
+
+where superscript $n$ denotes the current time level and $n-1$ the previous. This is the natural implicit-Euler discretization of $\rho_i \frac{\partial(HE)}{\partial t}$.
+
+Because both $H$ and $E$ are evaluated at their respective time levels, this form conserves total energy exactly even when the ice thickness changes between time steps. If the thickness were frozen (i.e., $R^{\text{time}} = \rho_i H^n (E^n_k - E^{n-1}_k)/\Delta t$), energy would leak whenever $H$ changes — precisely the deficiency that the conservative formulation was designed to eliminate.
+
+The Jacobian contribution is purely diagonal: $$
+\frac{\partial R^{\text{time}}}{\partial E_k} = \frac{\rho_i H}{\Delta t}.
+$$
+
+## 4. Horizontal Advection: Factored Mass-Flux Form
+
+The conservative horizontal flux divergence $\rho_i \nabla_h \cdot (H \mathbf{u} E)$ is discretized face-by-face on the MAC grid.
+
+### Why a Factored Flux?
+
+The enthalpy flux $HuE$ has the structure of a *mass flux times a specific quantity*. Two approaches are possible for discretizing this:
+
+1.  **Naive conserved-variable approach.** Treat $HE$ as a single conserved variable and apply a standard Riemann solver (e.g., Rusanov/Lax-Friedrichs) to it directly: $$
+    F^{\text{naive}} = \tfrac{1}{2}u(H_L E_L + H_R E_R) - \tfrac{1}{2}\alpha(H_R E_R - H_L E_L).
+    $$
+2.  **Factored mass-flux approach.** Compute the mass flux $F^m$ first, then upwind the specific enthalpy $E$ using that mass flux as the wave speed: $$
+    F = F^m \cdot \hat{E}(E_L, E_R).
+    $$
+
+The naive approach violates a fundamental consistency requirement identified by Abgrall (1996): *a uniform scalar must remain uniform regardless of what the thickness does*. To see why, suppose $E$ is uniform ($E_L = E_R = E_0$) but $H$ varies across a face. The naive dissipation term $-\tfrac{1}{2}\alpha(H_R E_R - H_L E_L) = -\tfrac{1}{2}\alpha E_0 (H_R - H_L)$ is nonzero — the $H$ gradient alone generates spurious numerical diffusion of enthalpy. In the factored form, $F = F^m \cdot E_0$ regardless of the thickness gradient. The dissipation acts only on $\nabla E$, never on $\nabla H$.
+
+This is not a minor technicality. At ice margins, calving fronts, and grounding lines, $H$ has sharp gradients while the enthalpy profile may be smooth. The naive flux would smear the temperature field at every such feature.
+
+### Connection to Riemann Solvers
+
+The theoretical justification comes from the wave structure of the coupled thickness–tracer system:
+
+$$
+\partial_t H + \partial_x(Hu) = \ldots, \qquad \partial_t(HE) + \partial_x(HuE) = \ldots
+$$
+
+This is the shallow water equations with a passive tracer. In the full wave decomposition, $E$ is carried only by the *contact wave* (the middle wave, speed $u$) — it does not participate in the gravity waves that carry $H$ jumps. The Riemann solution for $E$ is therefore trivial: whichever side the mass comes from, that is the $E$ value crossing the face.
+
+The **HLLC** (Harten-Lax-van Leer-Contact) Riemann solver was designed precisely to capture this structure. It restores the contact wave that the simpler HLL/Rusanov solvers miss, and for a passive tracer the HLLC flux naturally factors into $F_{HE} = F^m \cdot E^*$, where $E^*$ is the upwind value of $E$ across the contact.
+
+The flux used here can be understood as: start from the HLLC framework (which separates mass flux from tracer transport), then use a Rusanov-level approximation for the tracer upwinding. The factored structure — which is the important part — comes from the HLLC wave decomposition; the specific choice of dissipation (Rusanov, Roe, etc.) is secondary. This factored mass-flux approach is standard practice in ocean models (MOM6, ROMS) and atmospheric dynamical cores (FV3), where tracers like temperature and salinity are always upwinded by the mass flux rather than treated as independent conserved variables (see also Toro 2009, Ch. 10).
+
+### Per-Face Flux
+
+At each face and sigma level $k$, the mass flux $F^m = \tfrac{1}{2}(H_L + H_R) \, u_{\text{face},k}$ is formed from the layer velocity at that face and the arithmetic average of the two neighboring cell thicknesses. This is the same mass-flux stencil used by the thickness solver in `flux.cu`, ensuring that the energy transport is exactly consistent with the mass transport.
+
+The specific enthalpy is then upwinded using a **Rusanov (local Lax-Friedrichs) flux** with the mass flux as the wave speed:
+
+$$
+\boxed{
+F = \frac{1}{2} F^m (E_L + E_R) - \frac{1}{2}\alpha \, (E_R - E_L)
+}
+$$
+
+where $\alpha$ is the regularized wave speed:
+
+$$
+\alpha = |F^m| \sqrt{1 + c_{\text{LF}}}.
+$$
+
+The parameter $c_{\text{LF}}$ controls the amount of numerical diffusion beyond pure upwind:
+
+-   When $c_{\text{LF}} = 0$: the flux reduces to pure first-order upwind, $F = F^m E_{\text{upwind}}$. The Jacobian is discontinuous at $F^m = 0$.
+-   When $c_{\text{LF}} > 0$: the wave speed $\alpha$ is smoothly regularized, giving a continuously differentiable flux. Crucially, $\alpha$ vanishes when $F^m = 0$ (no spurious cross-diffusion on quiescent faces), while for nonzero $F^m$ it adds a fractional diffusion boost of $\sqrt{1 + c_{\text{LF}}} - 1 \approx c_{\text{LF}}/2$.
+
+### Divergence Assembly
+
+The horizontal advection residual for cell $(i, j)$ at sigma level $k$ is the net flux entering the cell:
+
+$$
+R^{\text{h-adv}} = \rho_i \, \frac{F_R - F_L + F_B - F_T}{\Delta x}
+$$
+
+where $F_R, F_L$ are the right and left x-face fluxes and $F_B, F_T$ are the bottom and top y-face fluxes (in grid index space).
+
+At domain boundaries, a free-outflow condition is applied: the exterior ghost cell is assigned $E_{\text{ghost}} = E_{\text{here}}$ and $H_{\text{ghost}} = H_{\text{here}}$, so the Lax-Friedrichs flux reduces to $F = F^m E_{\text{here}}$ (pure outflow, no artificial dissipation).
+
+### Jacobian
+
+The Lax-Friedrichs flux is always differentiable with respect to $E_L$ and $E_R$:
+
+$$
+\frac{\partial F}{\partial E_L} = \frac{1}{2}(F^m + \alpha), \qquad \frac{\partial F}{\partial E_R} = \frac{1}{2}(F^m - \alpha).
+$$
+
+The net diagonal contribution from all four faces is accumulated into a single scalar `d_E_here`. The off-diagonal neighbor derivatives exist but are frozen in the column smoother (Section 10).
+
+### Conservation and Consistency
+
+Two distinct properties are worth distinguishing:
+
+1.  **Conservation.** Both cells sharing a face see the identical flux value $F$, so summing over the entire domain all internal fluxes cancel (telescope) to machine precision. This is a property of the FVM divergence operator and holds for *any* $H$ field — even a random one.
+
+2.  **Mass-flux consistency.** The mass flux $F^m = \tfrac{1}{2}(H_L + H_R) u_{\text{face}}$ is the same stencil used by the thickness solver. This ensures that the energy crossing a face is exactly $E_{\text{upwind}}$ per unit mass transported. If the enthalpy and thickness solvers used different mass-flux stencils, total energy would still be conserved (property 1 still holds), but the energy-per-unit-mass would drift, producing non-physical temperature changes.
+
+The one place where mass-flux consistency is approximate rather than exact is across the operator split: the momentum solver advances $H^{n-1} \to H^n$ first, then the enthalpy solver uses $H^n$ for its fluxes. The mass fluxes that *produced* $H^n$ used intermediate Newton states during the momentum solve, not exactly $H^n$ itself. This is the standard $O(\Delta t)$ operator-splitting error and vanishes under time-step refinement.
+
+## 5. Vertical (Sigma) Advection: Conservative Upwind
+
+The conservative sigma flux $\rho_i \, \partial_\sigma(E\omega)$ is discretized using upwind fluxes on the product $E\omega$ at half-nodes.
+
+### Interior Nodes ($k = 1, \ldots, N_z - 2$)
+
+The omega field is interpolated to half-nodes by simple averaging:
+
+$$
+\omega_{k+\tfrac{1}{2}} = \tfrac{1}{2}(\omega_k + \omega_{k+1}), \qquad \omega_{k-\tfrac{1}{2}} = \tfrac{1}{2}(\omega_{k-1} + \omega_k).
+$$
+
+The upwind enthalpy flux at each half-node is:
+
+$$
+F_{k+\tfrac{1}{2}} = \omega^+_{k+\tfrac{1}{2}} \, E_k + \omega^-_{k+\tfrac{1}{2}} \, E_{k+1}
+$$
+
+where $\omega^+ = \max(\omega, 0)$ and $\omega^- = \min(\omega, 0)$. The residual is the net flux divergence:
+
+$$
+\boxed{
+R^{\sigma\text{-adv}}_k = \frac{\rho_i}{\Delta\sigma} \left( F_{k+\tfrac{1}{2}} - F_{k-\tfrac{1}{2}} \right)
+}
+$$
+
+The Jacobian entries are:
+
+$$
+\frac{\partial R^{\sigma}_k}{\partial E_{k-1}} = -\frac{\rho_i \, \omega^+_{k-\tfrac{1}{2}}}{\Delta\sigma}, \quad
+\frac{\partial R^{\sigma}_k}{\partial E_{k+1}} = \frac{\rho_i \, \omega^-_{k+\tfrac{1}{2}}}{\Delta\sigma}, \quad
+\frac{\partial R^{\sigma}_k}{\partial E_k} = \frac{\rho_i}{\Delta\sigma}\!\left(\omega^+_{k+\tfrac{1}{2}} - \omega^-_{k-\tfrac{1}{2}}\right).
+$$
+
+### Bed Node ($k = 0$): Half-Cell
+
+The bed node has a half-cell control volume of width $\Delta\sigma_{\text{half}} = \Delta\sigma/2$. The upper interface flux uses the same upwind formula on $\omega_{\tfrac{1}{2}}$. The lower boundary flux is:
+
+$$
+F_{\text{bed}} = \omega_0 \, E_0
+$$
+
+where $\omega_0 = -\dot{m}$ (the basal melt rate; see Section 4 of the derivation). With no basal melt, $\omega_0 \approx 0$ and $F_{\text{bed}} \approx 0$. The residual is:
+
+$$
+R^{\sigma\text{-adv}}_0 = \frac{\rho_i}{\Delta\sigma_{\text{half}}} \left( F_{\tfrac{1}{2}} - F_{\text{bed}} \right).
+$$
+
+## 6. Vertical Diffusion
+
+The diffusion term $-\frac{1}{H}\frac{\partial}{\partial\sigma}\!\left(K\frac{\partial E}{\partial\sigma}\right)$ is discretized with centered differences and half-node diffusivities.
+
+**A note on notation:** The kernel uses the enthalpy diffusivity $K = k_i / c_i$ (units kg/(m$\cdot$s)), which is related to the thermal diffusivity $\kappa = k_i/(\rho_i c_i)$ in the continuous derivation by $K = \rho_i \kappa$. This absorbs the $\rho_i$ factor that multiplies the advective terms, so the diffusion residual carries no explicit $\rho_i$.
+
+### Interior Nodes ($k = 1, \ldots, N_z - 2$)
+
+The diffusivity is evaluated at half-nodes using the arithmetic mean of the neighboring enthalpy values:
+
+$$
+K_{k+\tfrac{1}{2}} = K\!\left(\tfrac{1}{2}(E_k + E_{k+1}),\; \tfrac{1}{2}(E_{\text{pmp},k} + E_{\text{pmp},k+1})\right).
+$$
+
+The discrete residual is:
+
+$$
+\boxed{
+R^{\text{diff}}_k = -\frac{1}{H \, \Delta\sigma^2} \left[ K_{k+\tfrac{1}{2}} (E_{k+1} - E_k) - K_{k-\tfrac{1}{2}} (E_k - E_{k-1}) \right]
+}
+$$
+
+The Jacobian entries freeze $K$ at the current state (omitting the $dK/dE$ chain-rule terms):
+
+$$
+\frac{\partial R^{\text{diff}}_k}{\partial E_{k-1}} = -\frac{K_{k-\tfrac{1}{2}}}{H \, \Delta\sigma^2}, \qquad
+\frac{\partial R^{\text{diff}}_k}{\partial E_{k+1}} = -\frac{K_{k+\tfrac{1}{2}}}{H \, \Delta\sigma^2}, \qquad
+\frac{\partial R^{\text{diff}}_k}{\partial E_k} = \frac{K_{k-\tfrac{1}{2}} + K_{k+\tfrac{1}{2}}}{H \, \Delta\sigma^2}.
+$$
+
+### Bed Node ($k = 0$): Neumann Flux
+
+The bed boundary condition prescribes the diffusive heat flux entering the ice from below. In the conservative formulation, the geothermal and frictional heat fluxes appear without the $1/H$ factor that was present in the advective form (the outer $H$ from the conservative scaling cancels it):
+
+$$
+\boxed{
+R^{\text{diff}}_0 = \frac{1}{\Delta\sigma_{\text{half}}} \left( -\frac{K_{\tfrac{1}{2}}}{H} \frac{E_1 - E_0}{\Delta\sigma} - (Q_{\text{geo}} + Q_{\text{fh}}) \right)
+}
+$$
+
+The Jacobian:
+
+$$
+\frac{\partial R^{\text{diff}}_0}{\partial E_0} = \frac{K_{\tfrac{1}{2}}}{H \, \Delta\sigma \, \Delta\sigma_{\text{half}}}, \qquad
+\frac{\partial R^{\text{diff}}_0}{\partial E_1} = -\frac{K_{\tfrac{1}{2}}}{H \, \Delta\sigma \, \Delta\sigma_{\text{half}}}.
+$$
+
+The Neumann flux $Q_{\text{geo}} + Q_{\text{fh}}$ has no $E$-dependence.
+
+### The Diffusivity $K(E)$
+
+The diffusivity transitions smoothly between cold-ice and temperate-ice values via a sigmoid:
+
+$$
+K(E) = K_{\text{cold}}\!\left(1 - s + \epsilon \, s\right), \qquad s = \frac{1}{1 + \exp\!\left(-\frac{E - E_{\text{pmp}}}{\delta}\right)}
+$$
+
+where $K_{\text{cold}} = k_i / c_i$, $\epsilon = 0.1$ is the temperate reduction factor, and $\delta = 100$ (in enthalpy units) controls the transition sharpness. In cold ice ($E \ll E_{\text{pmp}}$), $K \approx K_{\text{cold}}$. In temperate ice ($E \gg E_{\text{pmp}}$), $K \approx \epsilon \, K_{\text{cold}}$: thermal conduction is suppressed because temperature is locked at the pressure melting point and heat transport occurs primarily through liquid water movement.
+
+**Frozen-**$K$ Jacobian. The exact linearization of the diffusion term includes $dK/dE$ chain-rule contributions. These are deliberately omitted from the Jacobian because when $|E_{k+1} - E_k|$ is large (e.g., warm surface above cold ice), the $dK/dE$ term can overwhelm the diagonal and destroy the positive definiteness needed for a stable Thomas solve. With $K$ frozen, the diffusion Jacobian is always symmetric positive semi-definite. Since the residual is always computed exactly (using the current $K(E)$), Newton's method still converges to the correct solution — it simply takes a few extra iterations near cold–temperate transitions.
+
+## 7. Source Terms
+
+### External Source Field
+
+The enthalpy solver accepts an externally computed volumetric source field $\phi_k$ (units W/m$^3$). The solver does not know or care how this field is produced — it simply enters the residual as:
+
+$$
+R^{\text{source}}_k = -H \phi_k.
+$$
+
+This term has no $E$-dependence and does not contribute to the Jacobian.
+
+In a typical coupled ice-sheet model, $\phi$ is the strain heating (viscous dissipation) $\phi = A^{-1/n} |D(\mathbf{u})|^{1+1/n}$, computed by the momentum solver from the current velocity field. But the enthalpy solver treats it as a generic forcing: any volumetric heat source (radioactive decay in subglacial sediment, latent heat release from refreezing, etc.) can be injected through the same interface.
+
+### Meltwater Drainage
+
+The drainage term removes enthalpy from temperate ice at a rate proportional to the water content:
+
+$$
+R^{\text{drain}}_k = H \rho_w L \, r_d \, \varpi(E_k)
+$$
+
+where $r_d$ is the drainage rate (units s$^{-1}$) and $\varpi$ is the water content. To avoid the non-differentiable $\max$ in $\varpi = \max(E - E_{\text{pmp}}, 0)/L$, the implementation uses a softplus approximation:
+
+$$
+\varpi(E) \approx \frac{1}{L} \cdot \frac{1}{\beta} \ln\!\left(1 + \exp\!\left(\beta(E - E_{\text{pmp}})\right)\right)
+$$
+
+where $\beta$ is the smoothing sharpness. The Jacobian is the corresponding sigmoid:
+
+$$
+\frac{\partial R^{\text{drain}}_k}{\partial E_k} = H \rho_w \, r_d \cdot \frac{1}{1 + \exp(-\beta(E_k - E_{\text{pmp},k}))}.
+$$
+
+## 8. Boundary Conditions
+
+### Surface ($k = N_z - 1$): Dirichlet
+
+The surface enthalpy is prescribed by the climate. The residual is set to zero and the smoother row enforces the constraint directly:
+
+$$
+R_{N_z-1} = 0, \qquad a_{N_z-1} = c_{N_z-1} = 0, \quad b_{N_z-1} = 1, \quad \text{rhs}_{N_z-1} = -(E_{N_z-1} - E_s).
+$$
+
+The prescribed surface value also participates as a neighbor in the diffusion and sigma-advection stencils of the sub-surface node ($k = N_z - 2$).
+
+### Bed ($k = 0$): Neumann Flux
+
+The bed boundary combines the Neumann diffusive flux (Section 6) with the sigma-advection half-cell (Section 5). The geothermal and frictional heat fluxes $Q_{\text{geo}} + Q_{\text{fh}}$ are always applied regardless of the thermal state at the bed.
+
+### Thin-Ice Margins ($H < H_{\text{thin}}$)
+
+When the ice thickness falls below a threshold $H_{\text{thin}}$ (default 100 m), the column is too thin for a meaningful thermal profile. The entire column is driven toward the surface enthalpy, capped at the local pressure melting point:
+
+$$
+\delta E_k = \min(E_s, \; E_{\text{pmp},k}) - E_k \quad \forall \, k.
+$$
+
+The residual kernel returns zero for thin-ice columns so they do not contribute to the convergence norm.
+
+## 9. The Vertical Velocity ($\omega$)
+
+The scaled vertical velocity $\omega = H\dot{\sigma}$ is an input to the enthalpy solver, not computed by it. The enthalpy kernels receive $\omega_{i,j,k}$ as a precomputed $(N_y, N_x, N_z)$ array alongside the horizontal velocity fields $u_{i,j,k}$ and $v_{i,j,k}$. How $\omega$ is produced depends on the momentum model driving the simulation.
+
+The general requirement is that $\omega$ must satisfy the sigma-space continuity equation:
+
+$$
+\frac{\partial H}{\partial t} + \frac{\partial (Hu)}{\partial x} + \frac{\partial (Hv)}{\partial y} + \frac{\partial \omega}{\partial \sigma} = 0
+$$
+
+with boundary values $\omega_0 = -\dot{m}$ (bed) and $\omega_{N_z-1} = -\dot{a}$ (surface). Any $\omega$ field satisfying this constraint is consistent with the conservative enthalpy equation.
+
+### The `compute_omega` Kernel
+
+A convenience kernel `compute_omega` is provided for the common case where $\omega$ is diagnosed from a given velocity field. It integrates the continuity equation upward from the bed:
+
+1.  **Layer-wise mass flux divergence.** At each sigma level $k$, the horizontal mass flux divergence $\nabla_h \cdot (H\mathbf{u})_k$ is computed using the same face-averaged stencil as the horizontal enthalpy flux — $F^m_{\text{face}} = \tfrac{1}{2}(H_L + H_R) \, u_{\text{face},k}$ — ensuring exact consistency between the enthalpy equation and mass conservation. Note that each sigma level $k$ uses its own velocity $(u_k, v_k)$, so with a non-SSA momentum model the divergence varies with depth.
+
+2.  **Column mass balance.** The vertically averaged divergence $\overline{\nabla_h \cdot (H\mathbf{u})}$ is combined with the surface and basal mass balance rates to estimate the thickness tendency:
+
+$$
+\frac{\partial H}{\partial t} \approx \dot{a} - \dot{m} - \overline{\nabla_h \cdot (H\mathbf{u})}.
+$$
+
+3.  **Upward integration from the bed.** Starting from $\omega_0 = -\dot{m}$:
+
+$$
+\omega_k = \omega_{k-1} - \Delta\sigma \left( \frac{\partial H}{\partial t} + \left[\nabla_h \cdot (H\mathbf{u})\right]_{k-\tfrac{1}{2}} \right)
+$$
+
+where $[\cdot]_{k-\tfrac{1}{2}} = \tfrac{1}{2}(\text{div}_{k-1} + \text{div}_k)$ is the half-node average.
+
+By construction, the surface value satisfies $\omega_{N_z-1} = -\dot{a}$, matching the kinematic boundary condition derived in the continuous formulation. Under SSA (depth-uniform velocities), the mass flux divergence is constant across layers, and $\omega$ is linear in $\sigma$ — the classical $\dot{\sigma} = (\dot{m} - \sigma \dot{a})/H$. Under a higher-order model with vertical shear, the layer-wise divergences differ and $\omega$ is a more general function of $\sigma$.
+
+## 10. The Column-Wise Newton/Thomas Smoother
+
+The enthalpy equation is solved iteratively using a column-wise smoother in the spirit of the Vanka smoother used for the momentum balance. Each application of the smoother independently solves every column $(i, j)$ in parallel, freezing horizontal neighbors at their current values.
+
+### Structure
+
+Ordering unknowns column-by-column, the full Jacobian $\mathbf{J}$ has a block structure:
+
+$$
+\mathbf{J} = \begin{pmatrix}
+\mathbf{T}_{1,1} & \mathbf{C}_{1,2} & \cdots \\
+\mathbf{C}_{2,1} & \mathbf{T}_{2,2} & \cdots \\
+\vdots & & \ddots
+\end{pmatrix}
+$$
+
+where each diagonal block $\mathbf{T}_{(i,j)}$ is an $N_z \times N_z$ tridiagonal matrix (vertical coupling within the column), and the off-diagonal blocks $\mathbf{C}$ are diagonal (horizontal coupling between columns at the same sigma level). The column smoother uses only the diagonal blocks $\mathbf{T}_{(i,j)}$ plus the diagonal horizontal advection contribution — a standard block-Jacobi preconditioner.
+
+### Newton Iteration
+
+Because the residual is nonlinear (the diffusivity $K$ switches between cold and temperate regimes, and the drainage term activates at $E_{\text{pmp}}$), each column solve uses Newton's method. Each Newton step:
+
+1.  **Evaluate** the residual $r_k = R_{i,j,k}(\mathbf{E}^{(\nu)})$ at the current iterate, using `E_local` for vertical neighbors and the global $E$ array for horizontal neighbors.
+2.  **Assemble** the tridiagonal Jacobian from the `.d_E_*` fields returned by each `get_*_jac()` call.
+3.  **Solve** $\mathbf{J}_{\text{col}} \, \delta\mathbf{E} = -\mathbf{r}$ via the Thomas algorithm.
+4.  **Update** $\mathbf{E}^{(\nu+1)} = \mathbf{E}^{(\nu)} + \alpha \, \delta\mathbf{E}$ with relaxation factor $\alpha$.
+
+### Tridiagonal Assembly
+
+For an interior node $k$, the tridiagonal entries are assembled by summing the Jacobian contributions from every physical term:
+
+$$
+a_k = \frac{\partial R^{\text{diff}}}{\partial E_{k-1}} + \frac{\partial R^{\sigma}}{\partial E_{k-1}}
+$$
+
+$$
+c_k = \frac{\partial R^{\text{diff}}}{\partial E_{k+1}} + \frac{\partial R^{\sigma}}{\partial E_{k+1}}
+$$
+
+$$
+b_k = \frac{\rho_i H}{\Delta t}
+     + \frac{\partial R^{\text{diff}}}{\partial E_k}
+     + \frac{\partial R^{\sigma}}{\partial E_k}
+     + \frac{\partial R^{\text{drain}}}{\partial E_k}
+     + \frac{\partial R^{\text{h-adv}}}{\partial E_k}
+$$
+
+Note that $R^{\text{source}}$ does not appear in the Jacobian since the external source field $\phi$ has no $E$-dependence. It contributes only to the right-hand side:
+
+$$
+\text{rhs}_k = -R_k \quad \text{(which includes } {-H\phi_k}\text{)}
+$$
+
+The sub-diagonal $a_k$ and super-diagonal $c_k$ carry only the vertical coupling (diffusion + sigma advection). The diagonal $b_k$ accumulates contributions from all terms, including the diagonal-only entries from horizontal advection and drainage. This structure ensures the diagonal is always dominant for physically reasonable time steps.
+
+### The Thomas Algorithm
+
+The tridiagonal system is solved by forward elimination followed by back substitution — an $O(N_z)$ direct solve:
+
+**Forward elimination** ($k = 1, \ldots, N_z-1$): $$
+w = a_k / b_{k-1}, \qquad b_k \leftarrow b_k - w \, c_{k-1}, \qquad \text{rhs}_k \leftarrow \text{rhs}_k - w \, \text{rhs}_{k-1}.
+$$
+
+**Back substitution** ($k = N_z - 2, \ldots, 0$): $$
+\delta E_k = (\text{rhs}_k - c_k \, \delta E_{k+1}) / b_k.
+$$
+
+## 11. Outer Iteration and Convergence
+
+One call to the column smoother applies the Newton solve independently to every column in parallel. The outer iteration loop then:
+
+1.  Updates the global solution: $E \leftarrow E + \omega_{\text{relax}} \, \delta E$.
+2.  Recomputes the **full** residual $R$ (including horizontal coupling from all neighbors at their updated values).
+3.  Checks convergence: $\|R\|_\infty / \|R_0\|_\infty < \text{rtol}$ or $\|R\|_\infty < \text{atol}$.
+
+Because horizontal neighbors are frozen during each sweep, the smoother is a block-Jacobi iteration. Each sweep propagates information one cell horizontally, so convergence of horizontal coupling requires $O(\max(N_x, N_y))$ sweeps in the worst case. The iteration cap `n_iter` and `absolute_tolerance` act as safety nets — the solver does its best and moves on, exactly as the momentum solver does when its maximum V-cycle count is reached.
+
+## References
+
+-   Abgrall, R. (1996). How to prevent pressure oscillations in multicomponent flow calculations: A quasi-conservative approach. *Journal of Computational Physics*, 125(1), 150–160. doi:10.1006/jcph.1996.0085
+
+-   Aschwanden, A., Bueler, E., Khroulev, C., and Blatter, H. (2012). An enthalpy formulation for glaciers and ice sheets. *Journal of Glaciology*, 58(209), 441–457. doi:10.3189/2012JoG11J088
+
+-   Harten, A., Lax, P. D., and van Leer, B. (1983). On upstream differencing and Godunov-type schemes for hyperbolic conservation laws. *SIAM Review*, 25(1), 35–61. doi:10.1137/1025002
+
+-   Toro, E. F., Spruce, M., and Speares, W. (1994). Restoration of the contact surface in the HLL-Riemann solver. *Shock Waves*, 4(1), 25–34. doi:10.1007/BF01414629
+
+-   Toro, E. F. (2009). *Riemann Solvers and Numerical Methods for Fluid Dynamics: A Practical Introduction* (3rd ed.). Springer. doi:10.1007/b79761

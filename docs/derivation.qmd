@@ -1,0 +1,302 @@
+---
+title: "Deriving the Conservative Enthalpy Equation in Sigma Coordinates"
+date: 2026-04-09
+categories: [glaciology, numerical methods, finite volume]
+description: "A derivation of the conservative enthalpy equation in sigma coordinates, with attention to continuity, boundary conditions, and finite-volume implementation."
+---
+
+This note derives a strong-conservation form of the enthalpy equation in terrain-following sigma coordinates. The key goal is to rewrite the thermodynamics in a form that is compatible with a finite-volume method (FVM) on a deforming ice column.
+
+::: {.callout-important}
+## Key Result
+
+To guarantee energy conservation on a moving grid, the conserved FVM quantity is not the specific enthalpy $E$, but the thickness-weighted quantity $HE$. The resulting conservative equation is:
+
+$$
+\frac{\partial (HE)}{\partial t}
++ \frac{\partial (HEu)}{\partial x}
++ \frac{\partial (HEv)}{\partial y}
++ \frac{\partial}{\partial \sigma} \left( E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right)
+= \frac{H\Phi}{\rho} - \frac{H \rho_w}{\rho} L \, r_d \, \varpi(E).
+$$
+:::
+
+## 1. The Cartesian Baseline and the "Flux Problem" in Sigma Space
+
+The finite-volume method is built around a simple balance law: the rate of change of a conserved quantity inside a control volume must equal the net flux through its boundaries plus any internal source terms. 
+
+In a rigid Cartesian coordinate system $(x, y, z)$, the physical volume of a grid cell is constant. Because ice is treated as incompressible ($\nabla \cdot \mathbf{v} = 0$), the Cartesian enthalpy equation naturally exists in a strong conservative, flux-divergence form:
+
+$$
+\frac{\partial E}{\partial t} + \nabla \cdot (\mathbf{v}E) = S
+$$
+
+For an FVM solver, the face fluxes are unambiguous: the vector $\mathbf{v}E$ represents the exact transport of energy crossing a static cell boundary. 
+
+However, in a terrain-following sigma coordinate system,
+
+$$
+\sigma = \frac{z - b}{H},
+$$
+
+the computational grid stretches and shrinks over time as the ice thickness $H$ evolves. If the enthalpy equation is transformed directly into its advective form, we get:
+
+$$
+\frac{\partial E}{\partial t}
++ u \frac{\partial E}{\partial x}
++ v \frac{\partial E}{\partial y}
++ \dot{\sigma} \frac{\partial E}{\partial \sigma}
+= S.
+$$
+
+This creates a severe numerical issue for FVM. The spatial derivative terms (e.g., $u \frac{\partial E}{\partial x}$) are gradients, not divergences. You cannot apply the Divergence Theorem to them to calculate a boundary flux. If an FVM solver updates $E$ using these gradient terms while the mass-continuity solver independently shrinks the cell thickness $H$, total energy is numerically destroyed. 
+
+To recover strict conservation, we must force the equation back into a flux-divergence form by shifting the state variable from specific enthalpy $E$ to the depth-integrated enthalpy per unit area, $HE$.
+
+## 2. Governing Continuous Equations
+
+To synthesize the conservative form, we must couple the advective thermodynamics with mass conservation. 
+
+### The Advective Enthalpy Equation
+The advective transport of specific enthalpy $E$ in a moving sigma-coordinate framework is given by the material derivative:
+
+$$
+\frac{\partial E}{\partial t}
++ u \frac{\partial E}{\partial x}
++ v \frac{\partial E}{\partial y}
++ \dot{\sigma} \frac{\partial E}{\partial \sigma}
+= S.
+$$
+
+### Unpacking the Source Term ($S$)
+To ensure nothing is lost in translation during discretization, we must explicitly define the source term $S$. It contains three distinct physical processes: vertical diffusion (thermal conduction), internal heat generation (strain heating), and meltwater drainage.
+
+In Cartesian coordinates, $S$ is defined as:
+$$
+S_{\text{Cartesian}} = \frac{\partial}{\partial z} \left( \kappa \frac{\partial E}{\partial z} \right) + \frac{\Phi}{\rho} - \frac{\rho_w}{\rho} L \, r_d \, \varpi(E)
+$$
+*(where $\kappa$ is the effective thermal diffusivity, $\Phi$ is the strain heating rate, $\rho$ is ice density, and $\varpi$ is the water content).*
+
+The **drainage** term removes enthalpy from temperate ice to represent the gravitational percolation of liquid water out of the ice matrix (Aschwanden et al., 2012). The water content $\varpi$ is defined as the liquid fraction above the pressure melting point:
+$$
+\varpi(E) = \frac{\max(E - E_{\text{pmp}}, \; 0)}{L}
+$$
+where $E_{\text{pmp}} = c_i(T_{\text{pmp}} - T_{\text{ref}})$ is the enthalpy at the pressure melting point (which depends on the local overburden pressure via the Clausius-Clapeyron relation), $L$ is the latent heat of fusion, and $r_d$ is the drainage rate (units s$^{-1}$). Without this sink, temperate ice would accumulate unbounded water content — a physically unrealistic state that also degrades solver stability.
+
+To transform into sigma coordinates, we apply the chain rule for vertical derivatives ($\frac{\partial}{\partial z} = \frac{1}{H}\frac{\partial}{\partial \sigma}$), yielding the sigma-space source term:
+$$
+S_{\sigma} = \frac{1}{H} \frac{\partial}{\partial \sigma} \left( \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right) + \frac{\Phi}{\rho} - \frac{\rho_w}{\rho} L \, r_d \, \varpi(E)
+$$
+
+### Cartesian and Sigma-Space Continuity
+Assuming ice is incompressible, mass conservation in Cartesian coordinates gives $\nabla \cdot \mathbf{v} = 0$. After applying the multivariate chain rule to map from $(x, y, z)$ to $(x, y, \sigma)$, this transforms into the sigma-space continuity equation:
+
+$$
+\frac{\partial H}{\partial t}
++ \frac{\partial (Hu)}{\partial x}
++ \frac{\partial (Hv)}{\partial y}
++ \frac{\partial \omega}{\partial \sigma}
+= 0,
+$$
+
+where $\omega = H\dot{\sigma}$ is the scaled relative vertical velocity.
+
+## 3. Deriving the Relative Vertical Velocity ($\omega$)
+
+To unpack $\omega$, start from the sigma-coordinate definition,
+
+$$
+\sigma = \frac{z - b}{H},
+$$
+
+and take its material derivative:
+
+$$
+\dot{\sigma}
+= \frac{d\sigma}{dt}
+= \frac{\partial \sigma}{\partial t}
++ u \frac{\partial \sigma}{\partial x}
++ v \frac{\partial \sigma}{\partial y}
++ w \frac{\partial \sigma}{\partial z}.
+$$
+
+Using the quotient rule, for any $\xi \in \{x, y, t\}$ we obtain:
+
+$$
+\frac{\partial \sigma}{\partial \xi}
+= -\frac{1}{H}
+\left(
+\frac{\partial b}{\partial \xi}
++ \sigma \frac{\partial H}{\partial \xi}
+\right),
+\qquad
+\frac{\partial \sigma}{\partial z} = \frac{1}{H}.
+$$
+
+Substituting these into the expression for $\dot{\sigma}$ and multiplying through by $H$ gives the scaled relative vertical velocity:
+
+$$
+\omega
+= w
+- \left(
+\frac{\partial b}{\partial t}
++ u \frac{\partial b}{\partial x}
++ v \frac{\partial b}{\partial y}
+\right)
+- \sigma \left(
+\frac{\partial H}{\partial t}
++ u \frac{\partial H}{\partial x}
++ v \frac{\partial H}{\partial y}
+\right).
+$$
+
+## 4. Transforming the Kinematic Boundary Conditions
+
+The physical interpretation of $\omega$ becomes clear when we evaluate it at the boundaries. In Cartesian coordinates, the kinematic boundary conditions (KBCs) are:
+
+- **Surface** ($z = h_s = b + H$):
+  $$
+  w_s - \left(
+  \frac{\partial h_s}{\partial t}
+  + u_s \frac{\partial h_s}{\partial x}
+  + v_s \frac{\partial h_s}{\partial y}
+  \right) = -\dot{a},
+  $$
+  where $\dot{a}$ is surface accumulation.
+
+- **Bed** ($z = b$):
+  $$
+  w_b - \left(
+  \frac{\partial b}{\partial t}
+  + u_b \frac{\partial b}{\partial x}
+  + v_b \frac{\partial b}{\partial y}
+  \right) = -\dot{m},
+  $$
+  where $\dot{m}$ is basal melt.
+
+### At the Upper Surface ($\sigma = 1$)
+Substituting $\sigma = 1$ into our $\omega$ equation and expanding $H = h_s - b$, all bed terms perfectly cancel:
+
+$$
+\omega_s
+= w_s - \left(
+\frac{\partial h_s}{\partial t}
++ u_s \frac{\partial h_s}{\partial x}
++ v_s \frac{\partial h_s}{\partial y}
+\right).
+$$
+
+This matches the Cartesian surface KBC exactly, yielding $\omega_s = -\dot{a}$.
+
+### At the Lower Bed ($\sigma = 0$)
+Substituting $\sigma = 0$ into the $\omega$ equation removes the grid-stretching term entirely:
+
+$$
+\omega_b
+= w_b - \left(
+\frac{\partial b}{\partial t}
++ u_b \frac{\partial b}{\partial x}
++ v_b \frac{\partial b}{\partial y}
+\right).
+$$
+
+This matches the Cartesian basal KBC exactly, yielding $\omega_b = -\dot{m}$.
+
+## 5. Synthesis: Deriving the Conservative Equation
+
+We now use the product rule to merge the advective enthalpy equation with the sigma-space continuity equation.
+
+**Step 1:** Multiply the advective enthalpy equation by $H$. Since $H\dot{\sigma} = \omega$:
+
+$$
+H \frac{\partial E}{\partial t}
++ Hu \frac{\partial E}{\partial x}
++ Hv \frac{\partial E}{\partial y}
++ \omega \frac{\partial E}{\partial \sigma}
+= HS_{\sigma}.
+$$
+
+*(Note: Applying this $H$ multiplier to the source term $S_{\sigma}$ perfectly cancels the outer $1/H$ on the vertical diffusion term, yielding $HS_{\sigma} = \frac{\partial}{\partial \sigma} \left( \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right) + \frac{H\Phi}{\rho} - \frac{H\rho_w}{\rho} L \, r_d \, \varpi(E)$.)*
+
+**Step 2:** Multiply the sigma-space continuity equation by $E$:
+
+$$
+E \frac{\partial H}{\partial t}
++ E \frac{\partial (Hu)}{\partial x}
++ E \frac{\partial (Hv)}{\partial y}
++ E \frac{\partial \omega}{\partial \sigma}
+= 0.
+$$
+
+**Step 3:** Add the two equations together. By applying the reverse product rule ($A\,dB + B\,dA = d(AB)$) to every pair of terms, the advective gradients cleanly collapse into divergences:
+
+- Time: $H \frac{\partial E}{\partial t} + E \frac{\partial H}{\partial t} = \frac{\partial (HE)}{\partial t}$
+- $x$-Advection: $Hu \frac{\partial E}{\partial x} + E \frac{\partial (Hu)}{\partial x} = \frac{\partial (HEu)}{\partial x}$
+- $y$-Advection: $Hv \frac{\partial E}{\partial y} + E \frac{\partial (Hv)}{\partial y} = \frac{\partial (HEv)}{\partial y}$
+- $\sigma$-Advection: $\omega \frac{\partial E}{\partial \sigma} + E \frac{\partial \omega}{\partial \sigma} = \frac{\partial (E\omega)}{\partial \sigma}$
+
+Finally, we pull the vertical diffusion term from the right-hand side over to the left-hand side, grouping it with the vertical advection term. This yields the complete conservative equation:
+
+$$
+\frac{\partial (HE)}{\partial t}
++ \frac{\partial (HEu)}{\partial x}
++ \frac{\partial (HEv)}{\partial y}
++ \frac{\partial}{\partial \sigma} \left( E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right)
+= \frac{H\Phi}{\rho} - \frac{H \rho_w}{\rho} L \, r_d \, \varpi(E).
+$$
+
+## 6. Thermodynamic Boundary Conditions in Conservative Form
+
+Because the state variable is now $HE$, the physical boundary conditions must be applied directly to the vertical fluxes, rather than as pointwise state constraints on $E$.
+
+### Upper Surface Face ($\sigma = 1$)
+In the advective formulation, the surface is a Dirichlet condition ($E = E_{\text{surface}}$). In conservative form, the FVM solver requires the total energy flux at the top face. The total vertical flux $F_\sigma = E\omega - \frac{\kappa}{H}\frac{\partial E}{\partial \sigma}$ has two components at the surface:
+
+1. **Advective flux** from accumulation. Using $\omega_s = -\dot{a}$:
+$$
+F_{\sigma, \text{surface}}^{\text{adv}} = E_{\text{surface}} \omega_s = -E_{\text{surface}} \dot{a}.
+$$
+Accumulation injects both mass and enthalpy consistently into the top control volume.
+
+2. **Diffusive flux** from thermal conduction. The Dirichlet condition ($E_s$ prescribed) implicitly determines this flux: the solver computes the gradient between the prescribed surface value and the first interior node, and the resulting conductive flux $-\frac{\kappa}{H}(\partial E / \partial \sigma)_s$ enters the sub-surface control volume naturally through the diffusion stencil. Unlike the advective component — which is a new consideration introduced by the conservative formulation — the diffusive flux is handled identically to the original advective formulation.
+
+### Lower Bed Face ($\sigma = 0$)
+In the advective formulation, the bed requires a Neumann condition for diffusion: $-\frac{\kappa}{H} \left(\frac{\partial E}{\partial \sigma}\right)_{\sigma=0} = q_{\text{geo}} + q_{\text{fric}}$. 
+
+In conservative form, the total basal flux $F_{\sigma, \text{bed}}$ combines this diffusive contribution with the advective contribution from melting ($E_b \omega_b = -E_b \dot{m}$):
+
+$$
+F_{\sigma, \text{bed}} = -E_b \dot{m} + q_{\text{geo}} + q_{\text{fric}}.
+$$
+
+If basal melting occurs, the exact corresponding enthalpy leaves the system in the same mathematical step as the mass loss.
+
+## 7. Conclusion: Why This is the Desired FVM Form
+
+We began this derivation by noting that a finite-volume solver requires the governing equation to take a strict flux-divergence form:
+
+$$
+\frac{\partial U}{\partial t} + \nabla_\sigma \cdot \mathbf{F} = Q
+$$
+
+The equation we have derived perfectly satisfies this requirement in the computational space $(x, y, \sigma)$:
+
+1. **The Conserved Variable ($U$):** The state variable tracked by the solver is $U = HE$. 
+2. **The Flux Vector ($\mathbf{F}$):** Every spatial derivative now wraps entirely around a boundary-crossing flux:
+   $$
+   \mathbf{F} = \begin{bmatrix} F_x \\ F_y \\ F_\sigma \end{bmatrix} = 
+   \begin{bmatrix} 
+   HEu \\ 
+   HEv \\ 
+   E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} 
+   \end{bmatrix}
+   $$
+3. **The Source Term ($Q$):** The remaining terms on the right-hand side are $Q = \frac{H\Phi}{\rho} - \frac{H\rho_w}{\rho} L \, r_d \, \varpi(E)$, representing strain heating (internal volumetric generation) and meltwater drainage.
+
+**The Numerical Payoff:**
+By moving the grid thickness $H$ inside the derivatives, the computational grid $(\Delta x, \Delta y, \Delta \sigma)$ becomes completely static from the perspective of the FVM solver. The Divergence Theorem can now be safely applied. The complex physical stretching of the real-world ice column is entirely abstracted into the definitions of the fluxes ($HEu$, $E\omega$). Summed over the entire domain, all internal fluxes will perfectly cancel (telescope) to machine precision, guaranteeing absolute global energy conservation regardless of how severely the ice deforms.
+
+
+## References
+
+- Aschwanden, A., Bueler, E., Khroulev, C., and Blatter, H. (2012). An enthalpy formulation for glaciers and ice sheets. *Journal of Glaciology*, 58(209), 441–457. doi:10.3189/2012JoG11J088

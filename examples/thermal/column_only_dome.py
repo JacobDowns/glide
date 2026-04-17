@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 from glide.model import IceDynamics, ThermalModel
-from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
+from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY, E_SCALE
 
 # ========================================================
 # Parameters
@@ -174,7 +174,7 @@ sigma = cp.asnumpy(thermal.ops.sigma)
 
 
 def get_T_profile(i, j):
-    E = cp.asnumpy(thermal.ops.enthalpy_state.E[i, j, :])
+    E = cp.asnumpy(thermal.ops.enthalpy_state.E[i, j, :]) * E_SCALE
     H = float(grid.state.H.data[i, j])
     T = np.zeros(NZ)
     for k in range(NZ):

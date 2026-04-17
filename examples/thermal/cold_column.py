@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 
 from glide.grid import Grid
 from glide.enthalpy import (
-    EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC
+    EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC,
+    E_SCALE
 )
 
 # ========================================================
@@ -76,7 +77,7 @@ step = 0
 time_kyr = 0.0
 
 # Save initial
-E_init = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
+E_init = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :]) * E_SCALE
 snapshots_E[0.0] = E_init.copy()
 snapshots_T[0.0] = E_init / C_I + T_REF
 
@@ -86,7 +87,7 @@ for target_kyr in snapshot_times_kyr[1:]:
         ops.column_sweep(dt, n_smooth)
         step += 1
         time_kyr += dt_kyr
-    E_snap = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
+    E_snap = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :]) * E_SCALE
     snapshots_E[target_kyr] = E_snap.copy()
     snapshots_T[target_kyr] = E_snap / C_I + T_REF
     print(f"  t = {target_kyr:6.0f} kyr, T_bed = {snapshots_T[target_kyr][0]:.2f} K")

@@ -15,7 +15,7 @@ from scipy.special import erf
 from glide.grid import Grid
 from glide.enthalpy import (
     EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC,
-    K_COLD
+    K_COLD, E_SCALE
 )
 
 # ---- Shared parameters (match examples/thermal/cold_column.py) ----
@@ -121,7 +121,7 @@ def test_constant_advection_diffusion():
     steps, converged = _run_to_steady_state(ops)
 
     i_col, j_col = 2, 2
-    E_final = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
+    E_final = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :]) * E_SCALE
     T_final = E_final / C_I + T_REF
 
     # Errors (exclude surface Dirichlet node)

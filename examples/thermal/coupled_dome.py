@@ -35,8 +35,8 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
 # ========================================================
 # Grid
 n_levels = 4
-ny, nx = 512, 512
-dx = 500.0           # m
+ny, nx = 1024, 1024
+dx = 250.0           # m
 
 # Dome geometry
 DOME_RADIUS = 100000.0 # m

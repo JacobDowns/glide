@@ -44,51 +44,46 @@
 #define TERM_DRAINAGE     (1 << 2)
 
 
-// ---- Helper: enthalpy at pressure melting point ----
+// ---- Helper: enthalpy at pressure melting point (scaled) ----
 __device__ __forceinline__
 float get_E_pmp(float sigma, float H) {
-    // depth = (1 - sigma) * H
+    // Returns E_pmp / E_SCALE (dimensionless, O(1)).
     float depth = (1.0f - sigma) * H;
     float T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth;
-    return C_I * (T_pmp - T_REF);
+    return C_I * (T_pmp - T_REF) / E_SCALE;
 }
 
 // ---- Helper: diffusivity K(E) with smooth transition ----
+// Arguments are in scaled units (E/E_SCALE). The sigmoid
+// reconstructs physical-scale differences internally.
 __device__ __forceinline__
 float get_K(float E, float E_pmp) {
-    // Smooth sigmoid transition from cold to temperate
-    // K_cold for E < E_pmp, K_temp for E >= E_pmp
-    float z = (E - E_pmp) * 0.01f;  // transition sharpness
+    float z = (E - E_pmp) * E_SCALE * 0.01f;
     z = fminf(fmaxf(z, -20.0f), 20.0f);
     float s = 1.0f / (1.0f + __expf(-z));
     return K_COLD * (1.0f - s + K_TEMP_FACTOR * s);
 }
 
-// ---- Helper: derivative dK/dE ----
-__device__ __forceinline__
-float get_dK_dE(float E, float E_pmp) {
-    float z = (E - E_pmp) * 0.01f;
-    z = fminf(fmaxf(z, -20.0f), 20.0f);
-    float s = 1.0f / (1.0f + __expf(-z));
-    float ds_dE = 0.01f * s * (1.0f - s);
-    return K_COLD * (K_TEMP_FACTOR - 1.0f) * ds_dE;
-}
-
 // ---- Helper: water content from enthalpy (smoothed) ----
+// Arguments are in scaled units. Reconstructs physical E for
+// the softplus, returns physical water content (dimensionless).
 __device__ __forceinline__
 float get_omega(float E, float E_pmp) {
-    // Softplus approximation of max(E - E_pmp, 0) / L_HEAT
-    float x = E - E_pmp;
+    float x = (E - E_pmp) * E_SCALE;  // physical difference
     float ax = DRAIN_SHARPNESS * x;
     ax = fminf(fmaxf(ax, -20.0f), 20.0f);
     float sp = (ax > 10.0f) ? x : __logf(1.0f + __expf(ax)) / DRAIN_SHARPNESS;
     return sp / L_HEAT;
 }
 
-// ---- Helper: d(omega_smooth)/dE — sigmoid ----
+// ---- Helper: d(omega)/dE_phys — sigmoid ----
+// Arguments are in scaled units. Returns the derivative with
+// respect to *physical* E (not scaled), i.e. d(omega)/d(E_phys).
+// The drainage Jacobian d(R_scaled)/d(E_scaled) = d(R_phys)/d(E_phys)
+// because the E_SCALE factors cancel (see derivation in enthalpy.py).
 __device__ __forceinline__
 float get_domega_dE(float E, float E_pmp) {
-    float z = DRAIN_SHARPNESS * (E - E_pmp);
+    float z = DRAIN_SHARPNESS * (E - E_pmp) * E_SCALE;
     z = fminf(fmaxf(z, -20.0f), 20.0f);
     float s = 1.0f / (1.0f + __expf(-z));
     return s / L_HEAT;
@@ -581,8 +576,11 @@ DrainageJacobian get_drainage_jac(DrainageStencil s) {
     DrainageJacobian jac = {0};
 
     float omega = get_omega(s.E_k, s.E_pmp_k);
-    // Conservative form: H * rho_w * L * drain_rate * omega
-    jac.res = s.H * RHO_W * L_HEAT * get_drainage(omega, s.drain_rate);
+    // Drainage is nonlinear in E and produces a physical-scale residual.
+    // Divide by E_SCALE to match the other (E-linear) residual terms.
+    // The Jacobian d(R_scaled)/d(E_scaled) = d(R_phys)/d(E_phys)
+    // because the E_SCALE factors cancel in the chain rule.
+    jac.res = s.H * RHO_W * L_HEAT * get_drainage(omega, s.drain_rate) / E_SCALE;
     jac.d_E_k = s.H * RHO_W * L_HEAT * s.drain_rate * get_domega_dE(s.E_k, s.E_pmp_k);
 
     return jac;
@@ -624,38 +622,36 @@ HorizAdvectionResult get_horiz_advection(
     // Cell thicknesses for mass flux computation
     float H_here = H[i * nx + j];
 
-    // x-direction: mass flux Hu at each face
+    // x-direction: mass flux Hu at each face using Lax-Friedrichs on H,
+    // matching the momentum solver (flux.cu: get_horizontal_flux_jac).
+    // This ensures div(Hu) here equals the momentum solver's div(Hu),
+    // so uniform E produces zero residual when combined with omega.
     float u_left  = get_u3d(u3d, k, i, j,   nz, ny, nx);
     float u_right = get_u3d(u3d, k, i, j+1, nz, ny, nx);
     float E_xm = get_E(E, i, j-1, k, ny, nx, nz);
     float E_xp = get_E(E, i, j+1, k, ny, nx, nz);
 
-    // x-direction faces. Boundary faces use zero-gradient (free outflow):
-    // the exterior ghost cell has E = E_here, H = H_here, so the LF flux
-    // reduces to F = Hu * E_here (pure outflow, no dissipation).
     HorizEnthalpyFluxJacobian fl = {0};
     HorizEnthalpyFluxJacobian fr = {0};
 
     if (j > 0) {
         float H_xm = get_cell(H, i, j-1, ny, nx);
-        float Hu_left = 0.5f * (H_xm + H_here) * u_left;
+        float H_avg = 0.5f * (H_xm + H_here);
+        float Hu_left = H_avg * u_left - 0.5f * sqrtf(u_left * u_left + MASS_FLUX_REG) * (H_here - H_xm);
         fl = get_horiz_enthalpy_flux_jac({Hu_left, E_xm, E_here}, lf_c);
     } else {
-        // Left boundary: free outflow
-        float Hu_left = H_here * u_left;
-        fl = get_horiz_enthalpy_flux_jac({Hu_left, E_here, E_here}, lf_c);
+        fl = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
     if (j < nx - 1) {
         float H_xp = get_cell(H, i, j+1, ny, nx);
-        float Hu_right = 0.5f * (H_here + H_xp) * u_right;
+        float H_avg = 0.5f * (H_here + H_xp);
+        float Hu_right = H_avg * u_right - 0.5f * sqrtf(u_right * u_right + MASS_FLUX_REG) * (H_xp - H_here);
         fr = get_horiz_enthalpy_flux_jac({Hu_right, E_here, E_xp}, lf_c);
     } else {
-        // Right boundary: free outflow
-        float Hu_right = H_here * u_right;
-        fr = get_horiz_enthalpy_flux_jac({Hu_right, E_here, E_here}, lf_c);
+        fr = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
 
-    // y-direction faces (same boundary treatment)
+    // y-direction faces (same LF mass flux treatment)
     float v_top    = get_v3d(v3d, k, i,   j, nz, ny, nx);
     float v_bottom = get_v3d(v3d, k, i+1, j, nz, ny, nx);
     float E_ym = get_E(E, i-1, j, k, ny, nx, nz);
@@ -666,19 +662,19 @@ HorizAdvectionResult get_horiz_advection(
 
     if (i > 0) {
         float H_ym = get_cell(H, i-1, j, ny, nx);
-        float Hv_top = 0.5f * (H_ym + H_here) * v_top;
+        float H_avg = 0.5f * (H_ym + H_here);
+        float Hv_top = H_avg * v_top - 0.5f * sqrtf(v_top * v_top + MASS_FLUX_REG) * (H_here - H_ym);
         ft = get_horiz_enthalpy_flux_jac({Hv_top, E_ym, E_here}, lf_c);
     } else {
-        float Hv_top = H_here * v_top;
-        ft = get_horiz_enthalpy_flux_jac({Hv_top, E_here, E_here}, lf_c);
+        ft = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
     if (i < ny - 1) {
         float H_yp = get_cell(H, i+1, j, ny, nx);
-        float Hv_bottom = 0.5f * (H_here + H_yp) * v_bottom;
+        float H_avg = 0.5f * (H_here + H_yp);
+        float Hv_bottom = H_avg * v_bottom - 0.5f * sqrtf(v_bottom * v_bottom + MASS_FLUX_REG) * (H_yp - H_here);
         fb = get_horiz_enthalpy_flux_jac({Hv_bottom, E_here, E_yp}, lf_c);
     } else {
-        float Hv_bottom = H_here * v_bottom;
-        fb = get_horiz_enthalpy_flux_jac({Hv_bottom, E_here, E_here}, lf_c);
+        fb = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
 
     // Conservative flux divergence: rho_i * div(H*u*E)
@@ -1192,7 +1188,7 @@ void compute_omega(
     const float* __restrict__ u3d,  // (nz, ny, nx+1) layer x-velocity
     const float* __restrict__ v3d,  // (nz, ny+1, nx) layer y-velocity
     const float* __restrict__ H,    // (ny, nx) ice thickness
-    const float* __restrict__ smb,  // (ny, nx) surface mass balance (m/s)
+    const float* __restrict__ dh_dt_in, // (ny, nx) actual dH/dt (m/s)
     const float* __restrict__ bmb,  // (ny, nx) basal mass balance (m/s, typically 0)
     float dx,
     int ny, int nx, int nz)
@@ -1213,15 +1209,16 @@ void compute_omega(
     float dx_inv = 1.0f / dx;
     float dsig = 1.0f / (float)(nz - 1);
 
-    // Neighbor thicknesses for face-averaged mass flux
+    // Neighbor thicknesses for mass flux computation
     float H_xm = get_cell(H, i, j-1, ny, nx);
     float H_xp = get_cell(H, i, j+1, ny, nx);
     float H_ym = get_cell(H, i-1, j, ny, nx);
     float H_yp = get_cell(H, i+1, j, ny, nx);
 
-    // 1. Compute layer-wise div(Hu) and column average
+    // 1. Compute layer-wise div(Hu) using the same mass flux stencil
+    //    as the enthalpy horizontal advection (LF on H, matching the
+    //    momentum solver).
     float div_Hu[MAX_NZ];
-    float div_Hu_bar = 0.0f;
 
     for (int k = 0; k < nz; k++) {
         float u_l = get_u3d(u3d, k, i, j,   nz, ny, nx);
@@ -1229,19 +1226,41 @@ void compute_omega(
         float v_t = get_v3d(v3d, k, i,   j, nz, ny, nx);
         float v_b = get_v3d(v3d, k, i+1, j, nz, ny, nx);
 
-        // Mass flux divergence — matches enthalpy horizontal flux stencil
-        float flux_x = 0.5f*(h_here + H_xp)*u_r - 0.5f*(H_xm + h_here)*u_l;
-        float flux_y = 0.5f*(h_here + H_yp)*v_b - 0.5f*(H_ym + h_here)*v_t;
+        // x-direction LF mass flux
+        float flux_r = 0.0f, flux_l = 0.0f;
+        if (j < nx - 1) {
+            float H_avg_r = 0.5f * (h_here + H_xp);
+            float u_mag_r = sqrtf(u_r * u_r + MASS_FLUX_REG);
+            flux_r = H_avg_r * u_r - 0.5f * u_mag_r * (H_xp - h_here);
+        }
+        if (j > 0) {
+            float H_avg_l = 0.5f * (H_xm + h_here);
+            float u_mag_l = sqrtf(u_l * u_l + MASS_FLUX_REG);
+            flux_l = H_avg_l * u_l - 0.5f * u_mag_l * (h_here - H_xm);
+        }
 
-        div_Hu[k] = (flux_x + flux_y) * dx_inv;
-        div_Hu_bar += div_Hu[k];
+        // y-direction LF mass flux
+        float flux_b = 0.0f, flux_t = 0.0f;
+        if (i < ny - 1) {
+            float H_avg_b = 0.5f * (h_here + H_yp);
+            float v_mag_b = sqrtf(v_b * v_b + MASS_FLUX_REG);
+            flux_b = H_avg_b * v_b - 0.5f * v_mag_b * (H_yp - h_here);
+        }
+        if (i > 0) {
+            float H_avg_t = 0.5f * (H_ym + h_here);
+            float v_mag_t = sqrtf(v_t * v_t + MASS_FLUX_REG);
+            flux_t = H_avg_t * v_t - 0.5f * v_mag_t * (h_here - H_ym);
+        }
+
+        div_Hu[k] = (flux_r - flux_l + flux_b - flux_t) * dx_inv;
     }
-    div_Hu_bar /= (float)nz;
 
-    // 2. Column mass balance: dH/dt = SMB - BMB - div(Hu_bar)
-    float smb_val = smb[i * nx + j];
+    // 2. Use the actual dH/dt passed from the caller.
+    //    This is (H_new - H_prev)/dt from the momentum step, ensuring
+    //    exact consistency: the omega field cancels the time + advection
+    //    residual for uniform enthalpy.
+    float dh_dt = dh_dt_in[i * nx + j];
     float bmb_val = bmb[i * nx + j];
-    float dh_dt = smb_val - bmb_val - div_Hu_bar;
 
     // 3. Integrate upward from bed BC: omega(0) = -bmb
     float current_omega = -bmb_val;
@@ -1253,5 +1272,4 @@ void compute_omega(
         current_omega = current_omega - dsig * (dh_dt + div_half);
         omega[(i*nx+j)*nz + k] = current_omega;
     }
-    // omega at surface (k=nz-1) should equal -smb_val by construction
 }

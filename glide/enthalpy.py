@@ -37,6 +37,11 @@ GRAVITY = 9.81       # Gravitational acceleration (m/s^2)
 K_COLD = K_I / C_I   # Enthalpy diffusion coeff k_i/c_i (kg/(m*s)), not thermal diffusivity
 K_TEMP_FACTOR = 1e-1 # Temperate diffusivity reduction factor (Aschwanden et al. 2012)
 K_TEMP = K_COLD * K_TEMP_FACTOR
+E_SCALE = C_I * (T_MELT - T_REF)  # Enthalpy scale (J/kg) for non-dimensionalization
+SEC_PER_YR = 365.25 * 86400.0
+# Mass flux regularization: must match momentum solver (flux.cu: sqrt(u^2 + 10))
+# where 10 is in (m/yr)^2. Convert to (m/s)^2 for the enthalpy solver.
+MASS_FLUX_REG = 10.0 / (SEC_PER_YR ** 2)
 
 
 def water_content_from_enthalpy(E, depth=0.0):
@@ -208,9 +213,11 @@ class EnthalpyOperators:
             'L_HEAT': L_HEAT, 'T_REF': T_REF, 'T_MELT': T_MELT,
             'BETA_CC': BETA_CC, 'GRAVITY': GRAVITY,
             'K_TEMP_FACTOR': K_TEMP_FACTOR,
+            'MASS_FLUX_REG': MASS_FLUX_REG,
         }
         defines = '\n'.join(f'#define {k} {v}f' for k, v in constants.items())
         defines += '\n#define K_COLD (K_I/C_I)\n'
+        defines += '#define E_SCALE (C_I * (T_MELT - T_REF))\n'
         file_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         cuda_source = defines + '\n' + file_source
 
@@ -271,19 +278,22 @@ class EnthalpyOperators:
             self.enthalpy_velocity.u3d[k, :, :] = u2d
             self.enthalpy_velocity.v3d[k, :, :] = v2d
 
-    def compute_omega(self, smb, bmb=None):
+    def compute_omega(self, dh_dt, bmb=None):
         """
         Compute omega = H * sigma_dot by integrating the sigma-space
         continuity equation upward from the bed.
 
-        This ensures exact consistency between the conservative enthalpy
-        equation and mass conservation. The mass flux stencil matches
-        the horizontal enthalpy flux (H_face = average of neighbors).
+        Uses the actual dH/dt (passed by the caller) instead of
+        estimating it from SMB - div(Hu). This ensures exact
+        consistency with the realized thickness change from the
+        momentum step, so uniform enthalpy produces zero residual.
 
         Parameters
         ----------
-        smb : cp.ndarray, shape (ny, nx)
-            Surface mass balance in m/s.
+        dh_dt : cp.ndarray, shape (ny, nx)
+            Thickness change rate in m/s. For coupled runs this is
+            (H_new - H_prev) / dt from the momentum step. For
+            standalone runs, pass SMB (m/s) for a steady-state estimate.
         bmb : cp.ndarray, shape (ny, nx), optional
             Basal mass balance in m/s. Defaults to 0.
         """
@@ -300,7 +310,7 @@ class EnthalpyOperators:
                (vel.omega,
                 vel.u3d, vel.v3d,
                 grid.state.H.data,
-                smb, bmb,
+                dh_dt, bmb,
                 grid.dx,
                 grid.ny, grid.nx, self.nz))
 
@@ -472,16 +482,19 @@ class EnthalpyOperators:
         H = self.grid.state.H.data
         forcing = self.enthalpy_forcing
 
-        # Interior and bed nodes: time forcing + strain heating
+        # Interior and bed nodes: time forcing + strain heating.
+        # E_prev is in scaled units; phi_strain and heat fluxes are
+        # physical (W/m^2 etc.) and must be divided by E_SCALE.
+        e_scale = cp.float32(E_SCALE)
         for k in range(self.nz - 1):
             self.f_E[:, :, k] = (
                 RHO_I * self.H_prev * self.enthalpy_state.E_prev[:, :, k]
                 / cp.float32(dt)
-                + H * forcing.phi_strain[:, :, k]
+                + H * forcing.phi_strain[:, :, k] / e_scale
             )
 
         # Bed node (k=0): add Neumann heat flux
-        self.f_E[:, :, 0] += (forcing.Q_geo + forcing.Q_fh) / cp.float32(dsig_half)
+        self.f_E[:, :, 0] += (forcing.Q_geo + forcing.Q_fh) / (cp.float32(dsig_half) * e_scale)
 
         # Surface node: Dirichlet row (f_E = 0, handled by the kernel)
         self.f_E[:, :, self.nz - 1] = 0.0
@@ -497,7 +510,7 @@ class EnthalpyOperators:
         """
         T_capped = cp.minimum(cp.asarray(T_surface, dtype=cp.float32),
                               cp.float32(T_MELT))
-        self.enthalpy_forcing.E_surface[:] = C_I * (T_capped - T_REF)
+        self.enthalpy_forcing.E_surface[:] = C_I * (T_capped - T_REF) / E_SCALE
 
     def initialize_from_temperature(self, T_field):
         """
@@ -526,7 +539,7 @@ class EnthalpyOperators:
             T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth
             T[:, :, k] = cp.minimum(T[:, :, k], T_pmp)
 
-        self.enthalpy_state.E[:] = C_I * (T - T_REF)
+        self.enthalpy_state.E[:] = C_I * (T - T_REF) / E_SCALE
         self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
         self.H_prev[:] = self.grid.state.H.data
 
@@ -545,7 +558,7 @@ class EnthalpyOperators:
             sigma_k = float(self.sigma[k])
             depth = (1.0 - sigma_k) * H
             T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth
-            T[:, :, k] = cp.minimum(E[:, :, k] / C_I + T_REF, T_pmp)
+            T[:, :, k] = cp.minimum(E[:, :, k] * E_SCALE / C_I + T_REF, T_pmp)
         return T
 
     def get_water_content(self):
@@ -562,7 +575,7 @@ class EnthalpyOperators:
         for k in range(self.nz):
             sigma_k = float(self.sigma[k])
             depth = (1.0 - sigma_k) * H
-            omega[:, :, k] = water_content_from_enthalpy(E[:, :, k], depth)
+            omega[:, :, k] = water_content_from_enthalpy(E[:, :, k] * E_SCALE, depth)
         return omega
 
     def get_arrhenius_factor(self):
@@ -601,7 +614,7 @@ class EnthalpyOperators:
         for k in range(self.nz):
             sigma_k = float(self.sigma[k])
             depth = (1.0 - sigma_k) * H
-            omega = water_content_from_enthalpy(E[:, :, k], depth)
+            omega = water_content_from_enthalpy(E[:, :, k] * E_SCALE, depth)
             A[:, :, k] *= (1.0 + 181.25 * omega)
 
         # Depth average and convert to B

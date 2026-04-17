@@ -32,28 +32,28 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
 n_levels = 3
 ny, nx = 64, 128
 nz = 15
-dx = 200.0  # m
+dx = 250.0  # m
 
 # Valley geometry
 VALLEY_LENGTH = nx * dx       # m (along x)
 VALLEY_WIDTH = ny * dx        # m (across y)
-HEAD_ELEVATION = 3200.0       # m (bed at x=0)
-TOE_ELEVATION = 1800.0        # m (bed at x=max)
+HEAD_ELEVATION = 3000.0       # m (bed at x=0)
+TOE_ELEVATION = 1500.0        # m (bed at x=max)
 VALLEY_DEPTH = 500.0          # m (U-shape depth below ridgeline)
-VALLEY_FLOOR_WIDTH = 0.4      # fraction of domain width
+VALLEY_FLOOR_WIDTH = 0.5      # fraction of domain width
 
 # Initial ice geometry (prescribed starting profile)
 MAX_THICKNESS = 350.0         # m (center of upper valley)
 TERMINUS_FRACTION = 0.75      # initial glacier fills this fraction of valley
 
 # Climate / forcing
-ELA = 3200.0                  # m (equilibrium line altitude)
+ELA = 2750.0                  # m (equilibrium line altitude)
 SMB_GRAD = 0.007              # m/yr per m elevation (mass balance gradient)
-SMB_MAX = 1.0                 # m/yr (accumulation cap)
-SMB_MIN = -5.0                # m/yr (ablation cap)
+SMB_MAX = 2.0               # m/yr (accumulation cap)
+SMB_MIN = -4.0                # m/yr (ablation cap)
 T_SEA_LEVEL = 288.15          # K (15 C)
 LAPSE_RATE = -6.5e-3          # K/m
-Q_GEO = 0.003                  # W/m^2 (geothermal heat flux)
+Q_GEO = 0.05                  # W/m^2 (geothermal heat flux)
 T_INIT = 253.15               # K (-20 C uniform initial)
 
 # Rheology
@@ -67,7 +67,7 @@ N_SMOOTH = 25                 # enthalpy smoothing sweeps
 
 # Time stepping
 DT_YR = 5.0
-N_STEPS = 400                 # 2000 yr total
+N_STEPS = 100              
 SEC_PER_YR = 365.25 * 86400.0
 
 OUT_DIR = Path('examples/thermal')
@@ -164,9 +164,9 @@ model.forward_solver.fas_options.set(
 thermal = ThermalModel(grid, nz=nz,
                        n_smooth=N_SMOOTH,
                        update_rheology=True,
-                       frictional_heating=True)
+                       frictional_heating=False)
 
-thermal.ops.smoother_config.report_norms = False
+thermal.ops.smoother_config.report_norms = True
 thermal.ops.smoother_config.omega = cp.float32(1.0)
 thermal.ops.smoother_config.n_newton = 5
 thermal.ops.smoother_config.relaxation = cp.float32(1.0)
@@ -181,6 +181,7 @@ thermal.ops.enthalpy_forcing.drain_rate.set(0.01 / SEC_PER_YR)
 
 thermal.ops.term_flags.horizontal_advection = True
 thermal.ops.term_flags.drainage = True
+thermal.ops.term_flags.omega = True
 
 # Set initial B from Paterson-Budd at the initial temperature
 B_init = thermal.ops.get_arrhenius_factor() / thermal.B_scale

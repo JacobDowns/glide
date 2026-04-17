@@ -185,8 +185,8 @@ class ThermalModel:
         ops.enthalpy_velocity.u3d /= sec_per_yr
         ops.enthalpy_velocity.v3d /= sec_per_yr
 
-        # Compute omega from the sigma-space continuity equation (SSA)
-        self._compute_omega()
+        # Compute omega from the actual thickness change
+        self._compute_omega(dt)
 
         if self.frictional_heating:
             self._compute_frictional_heating()
@@ -222,17 +222,21 @@ class ThermalModel:
         m = sliding.m.value
         self.ops.enthalpy_forcing.Q_fh[:] = sliding.beta.data * speed ** (m + 1.0)
 
-    def _compute_omega(self):
-        """Compute omega by integrating the sigma-space continuity equation.
+    def _compute_omega(self, dt):
+        """Compute omega from the actual thickness change.
 
-        Uses the actual layer-wise velocity divergence div(Hu) at each
-        sigma level, integrated upward from the bed BC (omega_b = 0).
-        The mass flux stencil matches the enthalpy horizontal flux.
+        Uses (H_new - H_prev) / dt as the column dH/dt, ensuring exact
+        consistency between the conservative enthalpy equation and the
+        realized mass balance from the momentum step.
+
+        Parameters
+        ----------
+        dt : float
+            Time step in seconds.
         """
         ops = self.ops
-        sec_per_yr = cp.float32(self.SEC_PER_YR)
-        smb_si = ops.grid.forcing.smb.data / sec_per_yr
-        ops.compute_omega(smb_si)
+        dh_dt = (ops.grid.state.H.data - ops.H_prev) / cp.float32(dt)
+        ops.compute_omega(dh_dt)
 
     @property
     def B_scale(self):

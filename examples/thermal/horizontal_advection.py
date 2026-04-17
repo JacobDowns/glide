@@ -19,21 +19,21 @@ from pathlib import Path
 
 from glide.grid import Grid
 from glide.enthalpy import (
-    EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I
+    EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, E_SCALE
 )
 
 # ========================================================
 # Parameters
 # ========================================================
-ny, nx = 32*10, 64*10
+ny, nx = 32*5, 64*5
 nz = 9
-dx = 100.0           # m
+dx = 250.0           # m
 H_ice = 1000.0        # m
 T_background = 243.15 # K (-30 C)
 T_bump = 260.0        # K (-13 C, well below melting)
 
 # Velocity: uniform rightward, 500 m/yr converted to m/s
-U_MYR = 500.0
+U_MYR = 1000.0
 SEC_PER_YR = 365.25 * 86400.0
 U_MS = U_MYR / SEC_PER_YR
 
@@ -44,7 +44,7 @@ bump_sigma_y = 5000.0  # m (std dev in y)
 # Time stepping
 DT_YR = 1.0
 DT_SEC = DT_YR * SEC_PER_YR
-N_STEPS = 40
+N_STEPS = 100
 N_SMOOTH = 20
 
 # ========================================================
@@ -76,9 +76,10 @@ T_init_2d = T_background + bump  # (ny, nx)
 T_init_3d = cp.broadcast_to(T_init_2d[:, :, None],
                              (ny, nx, nz)).copy()
 
-ops.enthalpy_state.E[:] = C_I * (T_init_3d - T_REF)
+ops.enthalpy_state.E[:] = C_I * (T_init_3d - T_REF) / E_SCALE
 ops.enthalpy_state.E_prev[:] = ops.enthalpy_state.E
-ops.set_surface_enthalpy_from_temperature(T_init_2d)
+ops.set_surface_enthalpy_from_temperature(
+    cp.full((ny, nx), T_background, dtype=cp.float32))
 
 # No heat sources
 ops.enthalpy_forcing.Q_geo.fill(0)

@@ -33,7 +33,8 @@ import cupy as cp
 import numpy as np
 from glide.grid import Grid
 from glide.enthalpy import (
-    EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC
+    EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC,
+    E_SCALE
 )
 
 
@@ -97,7 +98,7 @@ def test_cold_column():
 
     # ---- Compare against analytical ----
     sigma = cp.asnumpy(ops.sigma)
-    E_numerical = cp.asnumpy(ops.enthalpy_state.E[ny // 2, nx // 2, :])
+    E_numerical = cp.asnumpy(ops.enthalpy_state.E[ny // 2, nx // 2, :]) * E_SCALE
 
     # Analytical: E(sigma) = E_surface + (Q_geo * H / k_i) * c_i * (1 - sigma)
     # Since E = c_i * (T - T_ref), and T(sigma) = T_s + dT*(1-sigma):

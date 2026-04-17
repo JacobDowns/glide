@@ -12,7 +12,7 @@ Tests the conservative form: rho_i * div(H * u * E).
 import cupy as cp
 import numpy as np
 from glide.grid import Grid
-from glide.enthalpy import EnthalpyOperators, C_I, T_REF
+from glide.enthalpy import EnthalpyOperators, C_I, T_REF, E_SCALE
 
 
 def _make_grid(ny, nx, dx, H_ice):
@@ -111,7 +111,7 @@ def test_uniform_velocity_step_profile():
     # Temperature step: cold on left half, warm on right half
     T_init = cp.full((ny, nx, nz), T_cold, dtype=cp.float32)
     T_init[:, nx // 2:, :] = T_warm
-    ops.enthalpy_state.E[:] = C_I * (T_init - T_REF)
+    ops.enthalpy_state.E[:] = C_I * (T_init - T_REF) / E_SCALE
     ops.enthalpy_state.E_prev[:] = ops.enthalpy_state.E
     ops.set_surface_enthalpy_from_temperature(
         cp.full((ny, nx), T_cold, dtype=cp.float32))
@@ -134,7 +134,7 @@ def test_uniform_velocity_step_profile():
     print(f"  Max row spread (y-asymmetry) = {max_row_spread:.2e} J/kg")
 
     E_init_row = C_I * (np.where(np.arange(nx) >= nx // 2,
-                                  T_warm, T_cold) - T_REF)
+                                  T_warm, T_cold) - T_REF) / E_SCALE
     E_final_row = E_mid[ny // 2, :]
     print(f"  E at interface-2: {E_final_row[nx//2-2]:.1f} "
           f"(init: {E_init_row[nx//2-2]:.1f})")
@@ -177,7 +177,7 @@ def test_energy_conservation():
     T_amp = 0.5 * (T_warm - T_cold)
     for j in range(nx):
         T_j = T_avg + T_amp * np.sin(2 * np.pi * j / nx)
-        E_init[:, j, :] = C_I * (T_j - T_REF)
+        E_init[:, j, :] = C_I * (T_j - T_REF) / E_SCALE
     ops.enthalpy_state.E[:] = cp.asarray(E_init)
     ops.enthalpy_state.E_prev[:] = ops.enthalpy_state.E
     ops.set_surface_enthalpy_from_temperature(

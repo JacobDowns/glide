@@ -26,7 +26,7 @@ from scipy.optimize import brentq
 from glide.grid import Grid
 from glide.enthalpy import (
     EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC,
-    L_HEAT, K_COLD, K_TEMP, K_TEMP_FACTOR
+    L_HEAT, K_COLD, K_TEMP, K_TEMP_FACTOR, E_SCALE
 )
 
 # ========================================================
@@ -166,7 +166,7 @@ step = 0
 time_kyr = 0.0
 converged = False
 
-E_col = lambda: cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
+E_col = lambda: cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :]) * E_SCALE
 T_col = lambda: cp.asnumpy(ops.get_temperature()[i_col, j_col, :])
 W_col = lambda: cp.asnumpy(ops.get_water_content()[i_col, j_col, :])
 

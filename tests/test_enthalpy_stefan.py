@@ -14,7 +14,7 @@ from scipy.optimize import brentq
 from glide.grid import Grid
 from glide.enthalpy import (
     EnthalpyOperators, C_I, K_I, T_REF, T_MELT, RHO_I, GRAVITY, BETA_CC,
-    L_HEAT, K_COLD, K_TEMP, K_TEMP_FACTOR
+    L_HEAT, K_COLD, K_TEMP, K_TEMP_FACTOR, E_SCALE
 )
 
 # ---- Shared parameters (match examples/thermal/stefan.py) ----
@@ -67,7 +67,7 @@ def test_temperate_bed_still_applies_geothermal_flux():
     ops = _make_ops(nx=nx, ny=ny)
 
     E_pmp_bed = _E_pmp_bed()
-    E_temperate = E_pmp_bed + 1000.0
+    E_temperate = (E_pmp_bed + 1000.0) / E_SCALE
     ops.enthalpy_state.E.fill(E_temperate)
     ops.enthalpy_state.E_prev.fill(E_temperate)
 
@@ -75,8 +75,8 @@ def test_temperate_bed_still_applies_geothermal_flux():
     ops.compute_residual(dt)
     bed_residual = float(cp.asnumpy(ops.r_E[ny // 2, nx // 2, 0]))
     dsig_half = 0.5 * float(ops.sigma[1] - ops.sigma[0])
-    # Conservative form: Q_geo term is -(Q_geo) / dsig_half (no 1/H factor)
-    expected = -Q_GEO / dsig_half
+    # Conservative form: Q_geo term is -(Q_geo) / (dsig_half * E_SCALE)
+    expected = -Q_GEO / (dsig_half * E_SCALE)
 
     print("Temperate bed geothermal-flux test:")
     print(f"  Bed residual: {bed_residual:.6e}")
@@ -94,7 +94,7 @@ def test_temperate_bed_is_not_clamped_to_pmp():
     ops = _make_ops()
 
     E_pmp_bed = _E_pmp_bed()
-    E_temperate = E_pmp_bed + 1000.0
+    E_temperate = (E_pmp_bed + 1000.0) / E_SCALE
     ops.enthalpy_state.E.fill(E_temperate)
     ops.enthalpy_state.E_prev.fill(E_temperate)
 
@@ -102,7 +102,7 @@ def test_temperate_bed_is_not_clamped_to_pmp():
     ops.column_sweep(dt, 5)
     ops.enthalpy_state.E[:] += ops.smoother_config.omega * ops.delta_E
 
-    E_bed = float(cp.asnumpy(ops.enthalpy_state.E[0, 0, 0]))
+    E_bed = float(cp.asnumpy(ops.enthalpy_state.E[0, 0, 0])) * E_SCALE
     print("Temperate bed unclamped test:")
     print(f"  E_bed after sweep: {E_bed:.2f}")
     print(f"  E_pmp at bed:      {E_pmp_bed:.2f}")
@@ -175,7 +175,7 @@ def test_steady_state_polythermal_profile():
             converged = True
             break
 
-    E_final = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :])
+    E_final = cp.asnumpy(ops.enthalpy_state.E[i_col, j_col, :]) * E_SCALE
     T_final = cp.asnumpy(ops.get_temperature()[i_col, j_col, :])
     omega_final = cp.asnumpy(ops.get_water_content()[i_col, j_col, :])
 

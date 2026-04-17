@@ -256,7 +256,7 @@ class Multigrid:
 
         kernel((grid_size,), (block_size,),
                (coarse_field, fine_field, ny_fine, nx_fine))
-        return fine_field   
+        return fine_field
 
     def __getitem__(self,key):
         return self.levels[key]

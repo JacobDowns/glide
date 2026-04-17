@@ -393,4 +393,3 @@ void prolongate_cell_bilinear(
     H_fine[idx] = (1.0f - t_y) * ((1.0f - t_x) * v00 + t_x * v01)
                 + t_y         * ((1.0f - t_x) * v10 + t_x * v11);
 }
-

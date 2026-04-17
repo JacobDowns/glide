@@ -125,6 +125,8 @@ for step in range(1, N_STEPS + 1):
         for sweep in range(N_SMOOTH):
             ops.column_smooth(DT_SEC)
             ops.enthalpy_state.E[:] += cfg.omega * ops.delta_E
+            ops.layer_smooth(DT_SEC)
+            ops.enthalpy_state.E[:] += cfg.omega * ops.delta_E
             r = float(ops.compute_residual(DT_SEC))
             rel = r / r0 if r0 > 0 else 0.0
             print(f"    sweep {sweep:2d}: |r|/|r0| = {rel:.2e}, |r| = {r:.2e}")

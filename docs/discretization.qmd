@@ -84,34 +84,52 @@ $$
 
 The conservative horizontal flux divergence $\rho_i \nabla_h \cdot (H \mathbf{u} E)$ is discretized face-by-face on the MAC grid.
 
+### Thickness as Density: The Compressible-Flow Analogy
+
+The depth-integrated ice sheet equations are structurally identical to the compressible Euler equations with a passive scalar. The ice thickness $H$ (mass per unit area) plays the role of density $\rho$ (mass per unit volume):
+
+| Compressible flow | Depth-integrated ice |
+|------------------------------------|------------------------------------|
+| $\partial_t \rho + \partial_x(\rho u) = 0$ | $\partial_t H + \partial_x(Hu) = \dot{a} - \dot{m}$ |
+| $\partial_t(\rho \phi) + \partial_x(\rho u \phi) = S$ | $\partial_t(HE) + \partial_x(HuE) = S$ |
+| Density $\rho$ | Ice thickness $H$ |
+| Passive scalar $\phi$ | Specific enthalpy $E$ |
+| Mass flux $\rho u$ | Column mass flux $Hu$ |
+
+The continuity equation for $H$ *is* conservation of column mass, and the enthalpy equation is a passive scalar transported by that mass flux. This analogy is exact, not approximate — the mathematical structure is identical. Once we recognize this, the entire finite-volume literature for compressible flows with variable density applies directly to the choice of numerical flux.
+
+This analogy also illuminates why the conservative form derived in the [companion note](derivation.qmd) requires the product-rule synthesis of its Section 5. In a compressible flow, a passive scalar $\phi$ does not satisfy its own conservation law — it satisfies only the advective (material derivative) equation $D\phi/Dt = S$, which cannot be put into flux-divergence form. To obtain a conservation law suitable for FVM, one multiplies the scalar equation by $\rho$ and combines it with the continuity equation via the product rule:
+
+$$
+\rho \frac{D\phi}{Dt} + \phi\!\left(\frac{\partial \rho}{\partial t} + \nabla \cdot (\rho \mathbf{u})\right) = \frac{\partial(\rho\phi)}{\partial t} + \nabla \cdot (\rho \mathbf{u} \phi).
+$$
+
+This is exactly the procedure used in the derivation to convert from the advective enthalpy equation to the conservative $\partial_t(HE) + \nabla \cdot (H\mathbf{u}E) = HS$ form. The need for conservative form and the need for a factored flux are two sides of the same coin: both arise because $E$ is a specific (per-unit-mass) quantity transported by a variable-density flow.
+
 ### Why a Factored Flux?
 
-The enthalpy flux $HuE$ has the structure of a *mass flux times a specific quantity*. Two approaches are possible for discretizing this:
+In compressible-flow FVM, it is well known that applying a standard Riemann solver (e.g., Rusanov/Lax-Friedrichs) independently to the conserved variable $\rho\phi$ produces spurious numerical diffusion at contact discontinuities — interfaces where $\rho$ jumps but the scalar $\phi$ is uniform. Abgrall (1996) formalized the requirement: *a uniform scalar must remain uniform regardless of what the density does*. The same issue arises here with $H$ and $E$.
 
-1.  **Naive conserved-variable approach.** Treat $HE$ as a single conserved variable and apply a standard Riemann solver (e.g., Rusanov/Lax-Friedrichs) to it directly: $$
+Two approaches are possible:
+
+1.  **Naive conserved-variable approach.** Treat $HE$ as a single conserved variable and apply dissipation to it directly: $$
     F^{\text{naive}} = \tfrac{1}{2}u(H_L E_L + H_R E_R) - \tfrac{1}{2}\alpha(H_R E_R - H_L E_L).
     $$
-2.  **Factored mass-flux approach.** Compute the mass flux $F^m$ first, then upwind the specific enthalpy $E$ using that mass flux as the wave speed: $$
+2.  **Factored mass-flux approach.** Compute the mass flux $F^m$ first, then upwind only the specific quantity $E$ using that mass flux as the wave speed: $$
     F = F^m \cdot \hat{E}(E_L, E_R).
     $$
 
-The naive approach violates a fundamental consistency requirement identified by Abgrall (1996): *a uniform scalar must remain uniform regardless of what the thickness does*. To see why, suppose $E$ is uniform ($E_L = E_R = E_0$) but $H$ varies across a face. The naive dissipation term $-\tfrac{1}{2}\alpha(H_R E_R - H_L E_L) = -\tfrac{1}{2}\alpha E_0 (H_R - H_L)$ is nonzero — the $H$ gradient alone generates spurious numerical diffusion of enthalpy. In the factored form, $F = F^m \cdot E_0$ regardless of the thickness gradient. The dissipation acts only on $\nabla E$, never on $\nabla H$.
+The naive approach violates Abgrall's condition. Suppose $E$ is uniform ($E_L = E_R = E_0$) but $H$ varies across a face. The naive dissipation term $-\tfrac{1}{2}\alpha(H_R E_R - H_L E_L) = -\tfrac{1}{2}\alpha E_0 (H_R - H_L)$ is nonzero — the $H$ gradient alone generates spurious numerical diffusion of enthalpy. In the factored form, $F = F^m \cdot E_0$ regardless of the thickness gradient. The dissipation acts only on $\nabla E$, never on $\nabla H$.
 
-This is not a minor technicality. At ice margins, calving fronts, and grounding lines, $H$ has sharp gradients while the enthalpy profile may be smooth. The naive flux would smear the temperature field at every such feature.
+This is not a minor technicality. At ice margins, calving fronts, and grounding lines, $H$ has sharp gradients while the enthalpy profile may be smooth. The naive flux would smear the temperature field at every such feature — the ice-sheet analogue of spurious pressure oscillations at contact discontinuities in compressible gas dynamics.
 
 ### Connection to Riemann Solvers
 
-The theoretical justification comes from the wave structure of the coupled thickness–tracer system:
+The wave structure of the coupled system makes the factored form inevitable. In the full wave decomposition, $E$ is carried only by the *contact wave* (the middle wave, speed $u$) — it does not participate in the gravity waves (or acoustic waves, in the gas dynamics analogy) that carry $H$ jumps. The Riemann solution for $E$ is therefore trivial: whichever side the mass comes from, that is the $E$ value crossing the face.
 
-$$
-\partial_t H + \partial_x(Hu) = \ldots, \qquad \partial_t(HE) + \partial_x(HuE) = \ldots
-$$
+The **HLLC** (Harten-Lax-van Leer-Contact) Riemann solver was designed precisely to capture this structure. It restores the contact wave that the simpler HLL/Rusanov solvers miss, and for a passive scalar the HLLC flux naturally factors into $F_{HE} = F^m \cdot E^*$, where $E^*$ is the upwind value of $E$ across the contact.
 
-This is the shallow water equations with a passive tracer. In the full wave decomposition, $E$ is carried only by the *contact wave* (the middle wave, speed $u$) — it does not participate in the gravity waves that carry $H$ jumps. The Riemann solution for $E$ is therefore trivial: whichever side the mass comes from, that is the $E$ value crossing the face.
-
-The **HLLC** (Harten-Lax-van Leer-Contact) Riemann solver was designed precisely to capture this structure. It restores the contact wave that the simpler HLL/Rusanov solvers miss, and for a passive tracer the HLLC flux naturally factors into $F_{HE} = F^m \cdot E^*$, where $E^*$ is the upwind value of $E$ across the contact.
-
-The flux used here can be understood as: start from the HLLC framework (which separates mass flux from tracer transport), then use a Rusanov-level approximation for the tracer upwinding. The factored structure — which is the important part — comes from the HLLC wave decomposition; the specific choice of dissipation (Rusanov, Roe, etc.) is secondary. This factored mass-flux approach is standard practice in ocean models (MOM6, ROMS) and atmospheric dynamical cores (FV3), where tracers like temperature and salinity are always upwinded by the mass flux rather than treated as independent conserved variables (see also Toro 2009, Ch. 10).
+The flux used here can be understood as: start from the HLLC framework (which separates mass flux from scalar transport), then use a Rusanov-level approximation for the scalar upwinding. The factored structure — which is the important part — comes from the HLLC wave decomposition; the specific choice of dissipation (Rusanov, Roe, etc.) is secondary. This factored mass-flux approach is standard practice in ocean models (MOM6, ROMS) and atmospheric dynamical cores (FV3), where tracers like temperature and salinity are always upwinded by the mass flux rather than treated as independent conserved variables (see also Toro 2009, Ch. 10).
 
 ### Per-Face Flux
 

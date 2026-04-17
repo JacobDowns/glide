@@ -39,19 +39,6 @@ K_TEMP_FACTOR = 1e-1 # Temperate diffusivity reduction factor (Aschwanden et al.
 K_TEMP = K_COLD * K_TEMP_FACTOR
 
 
-def enthalpy_from_temperature(T, depth=0.0):
-    """Convert temperature to enthalpy (cold ice only)."""
-    return C_I * (T - T_REF)
-
-
-def temperature_from_enthalpy(E, depth=0.0):
-    """Convert enthalpy to temperature (clipped at pressure melting point)."""
-    T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth
-    E_pmp = C_I * (T_pmp - T_REF)
-    T = E / C_I + T_REF
-    return cp.minimum(T, T_pmp)
-
-
 def water_content_from_enthalpy(E, depth=0.0):
     """Extract water content from enthalpy."""
     T_pmp = T_MELT - BETA_CC * RHO_I * GRAVITY * depth
@@ -110,7 +97,7 @@ class EnthalpyForcing:
 
     h_thin: Constant = field(
         default_factory=lambda: Constant(
-            value=cp.float32(100.0),
+            value=cp.float32(25.0),
             name='h_thin',
             units='m',
             attrs={'long_name': 'Thickness below which the column is clamped '
@@ -162,7 +149,7 @@ class EnthalpyTermFlags:
         """Pack flags into the integer bitmask expected by CUDA kernels."""
         return ((1 if self.horizontal_advection else 0)
               | ((1 if self.omega else 0) << 1)
-              | ((1 if self.drainage else 0) << 3))
+              | ((1 if self.drainage else 0) << 2))
 
 
 @dataclass
@@ -211,11 +198,21 @@ class EnthalpyOperators:
         # Sigma levels (uniform spacing)
         self.sigma = make_sigma(nz)
 
-        # Compile CUDA kernels
+        # Compile CUDA kernels.
+        # Physical constants are injected as #define directives so that
+        # Python remains the single source of truth.
         cuda_dir = Path(__file__).parent / "cuda"
-        # Include common.cu for get_cell helper
         cuda_files = ['common.cu', 'enthalpy.cu']
-        cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
+        constants = {
+            'RHO_I': RHO_I, 'RHO_W': RHO_W, 'C_I': C_I, 'K_I': K_I,
+            'L_HEAT': L_HEAT, 'T_REF': T_REF, 'T_MELT': T_MELT,
+            'BETA_CC': BETA_CC, 'GRAVITY': GRAVITY,
+            'K_TEMP_FACTOR': K_TEMP_FACTOR,
+        }
+        defines = '\n'.join(f'#define {k} {v}f' for k, v in constants.items())
+        defines += '\n#define K_COLD (K_I/C_I)\n'
+        file_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
+        cuda_source = defines + '\n' + file_source
 
         options = ("--use_fast_math",) if use_fast_math else ()
         self.kernels = cp.RawModule(code=cuda_source, options=options)
@@ -246,6 +243,7 @@ class EnthalpyOperators:
         # Work arrays
         self.H_prev = cp.zeros((ny, nx), dtype=cp.float32)  # thickness before momentum step
         self.r_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
+        self.f_E = cp.zeros((ny, nx, nz), dtype=cp.float32)  # precomputed forcing
         self.delta_E = cp.zeros((ny, nx, nz), dtype=cp.float32)
 
         self.smoother_config = ColumnSmootherConfig()
@@ -313,27 +311,22 @@ class EnthalpyOperators:
         kernel = self.kernels.get_function('enthalpy_compute_residual')
         grid_size, block_size = self._column_launch_config
 
-        state = self.enthalpy_state
         vel = self.enthalpy_velocity
-        forcing = self.enthalpy_forcing
         grid = self.grid
 
         self.r_E.fill(0)
         kernel(grid_size, block_size,
                (self.r_E,
-                state.E, state.E_prev,
+                self.enthalpy_state.E, self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
                 grid.state.H.data,
-                self.H_prev,
-                forcing.phi_strain,
-                forcing.E_surface,
-                forcing.Q_geo,
-                forcing.Q_fh,
+                self.enthalpy_forcing.E_surface,
                 grid.dx, cp.float32(dt),
-                forcing.drain_rate.value,
-                forcing.h_thin.value,
+                self.enthalpy_forcing.drain_rate.value,
+                self.enthalpy_forcing.h_thin.value,
                 self.smoother_config.lf_c,
                 cp.int32(self.term_flags.bitmask),
+                cp.int32(1),  # use_forcing=true
                 grid.ny, grid.nx, self.nz))
 
         return float(cp.max(cp.abs(self.r_E)))
@@ -348,44 +341,64 @@ class EnthalpyOperators:
         kernel = self.kernels.get_function('enthalpy_column_smooth')
         grid_size, block_size = self._column_launch_config
 
-        state = self.enthalpy_state
         vel = self.enthalpy_velocity
-        forcing = self.enthalpy_forcing
         grid = self.grid
         cfg = self.smoother_config
 
         self.delta_E.fill(0)
         kernel(grid_size, block_size,
                (self.delta_E,
-                state.E, state.E_prev,
+                self.enthalpy_state.E, self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
                 grid.state.H.data,
-                self.H_prev,
-                forcing.phi_strain,
-                forcing.E_surface,
-                forcing.Q_geo,
-                forcing.Q_fh,
+                self.enthalpy_forcing.E_surface,
                 grid.dx, cp.float32(dt),
-                forcing.drain_rate.value,
-                forcing.h_thin.value,
+                self.enthalpy_forcing.drain_rate.value,
+                self.enthalpy_forcing.h_thin.value,
                 cfg.lf_c,
                 cp.int32(self.term_flags.bitmask),
                 grid.ny, grid.nx, self.nz,
                 cfg.n_newton, cfg.relaxation))
 
-    def column_sweep(self, dt, n_iter):
+    def layer_smooth(self, dt):
         """
-        Repeated column smoothing with convergence checking.
+        One application of the pointwise Jacobi layer smoother.
 
-        Mirrors the FASCDSolver.solve() pattern: compute the initial
-        residual, iterate, and stop when the relative or absolute
-        residual tolerance is met (or n_iter sweeps are exhausted).
+        Computes delta_E = -R / J_diag at every node simultaneously.
+        One thread per (i,j,k) — fully parallel, no data dependencies.
+        """
+        kernel = self.kernels.get_function('enthalpy_layer_smooth')
+        ny, nx, nz = self.grid.ny, self.grid.nx, self.nz
 
-        Without multigrid coarse-grid correction the residual may
-        plateau when horizontal coupling dominates. The n_iter cap
-        and absolute_tolerance act as safety nets — the solver does
-        its best and moves on, exactly as the momentum solver does
-        when maximum_vcycles is reached.
+        total_work = ny * nx * nz
+        block_size = 256
+        grid_size = (total_work + block_size - 1) // block_size
+
+        vel = self.enthalpy_velocity
+        grid = self.grid
+
+        self.delta_E.fill(0)
+        kernel((grid_size,), (block_size,),
+               (self.delta_E,
+                self.enthalpy_state.E, self.f_E,
+                vel.u3d, vel.v3d, vel.omega,
+                grid.state.H.data,
+                self.enthalpy_forcing.E_surface,
+                grid.dx, cp.float32(dt),
+                self.enthalpy_forcing.drain_rate.value,
+                self.enthalpy_forcing.h_thin.value,
+                self.smoother_config.lf_c,
+                cp.int32(self.term_flags.bitmask),
+                ny, nx, nz))
+
+    def column_sweep(self, dt, n_iter, alternating=True):
+        """
+        Repeated smoothing with convergence checking.
+
+        Each iteration applies a column sweep (exact vertical solve)
+        followed optionally by a layer sweep (pointwise Jacobi on
+        horizontal error). Convergence is checked after each iteration
+        against the full PDE residual.
 
         Parameters
         ----------
@@ -393,6 +406,9 @@ class EnthalpyOperators:
             Time step size.
         n_iter : int
             Maximum number of smoothing sweeps.
+        alternating : bool
+            If True (default), follow each column sweep with a layer
+            sweep for faster horizontal convergence.
         """
         cfg = self.smoother_config
 
@@ -404,9 +420,14 @@ class EnthalpyOperators:
         for iteration in range(n_iter):
             self.column_smooth(dt)
             self.enthalpy_state.E[:] += cfg.omega * self.delta_E
+
+            if alternating:
+                self.layer_smooth(dt)
+                self.enthalpy_state.E[:] += cfg.omega * self.delta_E
+
             cfg.hook_func(iteration)
 
-            # Convergence check (same metric as FASCDSolver.solve)
+            # Convergence check
             r = float(self.compute_residual(dt))
             rel = r / r0 if r0 > 0 else 0.0
 
@@ -417,16 +438,53 @@ class EnthalpyOperators:
             if rel < cfg.relative_tolerance or r < cfg.absolute_tolerance:
                 break
 
-    def set_rhs(self, dt):
-        """Store previous time step enthalpy and thickness.
+    def set_rhs(self, dt, snapshot=True):
+        """Precompute the forcing array f_E.
 
-        Must be called BEFORE the momentum step so that H_prev
-        captures the thickness at the start of the time step.
-        The conservative time derivative rho_i*(H*E - H_prev*E_prev)/dt
-        then correctly accounts for the thickness change.
+        Optionally snapshots E_prev and H_prev from the current state,
+        then precomputes f_E which encodes all E-independent forcing:
+
+            f_E = rho_i * H_prev * E_prev / dt
+                + H * phi_strain
+                + (Q_geo + Q_fh) / dsig_half  [at k=0 only]
+
+        The residual kernel then computes R = F(E) - f_E.
+        On the finest grid, set_rhs is called once per time step.
+        On coarse grids, f_E is overwritten by the FAS defect equation.
+
+        Parameters
+        ----------
+        dt : float
+            Time step size.
+        snapshot : bool
+            If True (default), snapshot E_prev and H_prev from the
+            current state before computing f_E. Set to False when
+            E_prev/H_prev were already captured earlier (e.g., by
+            pre_momentum() in the coupled ThermalModel).
         """
-        self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
-        self.H_prev[:] = self.grid.state.H.data
+        if snapshot:
+            self.enthalpy_state.E_prev[:] = self.enthalpy_state.E
+            self.H_prev[:] = self.grid.state.H.data
+
+        dsig = 1.0 / (self.nz - 1)
+        dsig_half = 0.5 * dsig
+
+        H = self.grid.state.H.data
+        forcing = self.enthalpy_forcing
+
+        # Interior and bed nodes: time forcing + strain heating
+        for k in range(self.nz - 1):
+            self.f_E[:, :, k] = (
+                RHO_I * self.H_prev * self.enthalpy_state.E_prev[:, :, k]
+                / cp.float32(dt)
+                + H * forcing.phi_strain[:, :, k]
+            )
+
+        # Bed node (k=0): add Neumann heat flux
+        self.f_E[:, :, 0] += (forcing.Q_geo + forcing.Q_fh) / cp.float32(dsig_half)
+
+        # Surface node: Dirichlet row (f_E = 0, handled by the kernel)
+        self.f_E[:, :, self.nz - 1] = 0.0
 
     def set_surface_enthalpy_from_temperature(self, T_surface):
         """
@@ -551,3 +609,4 @@ class EnthalpyOperators:
         B_avg = A_avg ** (-1.0 / n_glen)
 
         return B_avg
+

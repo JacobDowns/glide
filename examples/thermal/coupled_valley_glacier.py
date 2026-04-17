@@ -30,8 +30,8 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
 # ========================================================
 # Grid
 n_levels = 3
-ny, nx = 64, 128
-nz = 15
+ny, nx = 64*2, 128*2
+nz = 21
 dx = 250.0  # m
 
 # Valley geometry
@@ -51,10 +51,11 @@ ELA = 2750.0                  # m (equilibrium line altitude)
 SMB_GRAD = 0.007              # m/yr per m elevation (mass balance gradient)
 SMB_MAX = 2.0               # m/yr (accumulation cap)
 SMB_MIN = -4.0                # m/yr (ablation cap)
-T_SEA_LEVEL = 288.15          # K (15 C)
-LAPSE_RATE = -6.5e-3          # K/m
-Q_GEO = 0.05                  # W/m^2 (geothermal heat flux)
-T_INIT = 253.15               # K (-20 C uniform initial)
+T_HEAD = 248.15               # K at highest bed elevation)
+T_TOE = 288.15                # K at lowest bed elevation)
+LAPSE_RATE = (T_TOE - T_HEAD) / (TOE_ELEVATION - HEAD_ELEVATION)  # K/m (derived)
+Q_GEO = 0.0                  # W/m^2 (geothermal heat flux)
+T_INIT = T_HEAD               # K (uniform initial, coldest surface T)
 
 # Rheology
 N_GLEN = 3.0
@@ -119,7 +120,7 @@ def surface_temperature(H, bed):
     """Elevation-dependent surface temperature from lapse rate."""
     surface_elev = bed + H
     return cp.minimum(
-        cp.float32(T_SEA_LEVEL) + cp.float32(LAPSE_RATE) * surface_elev,
+        cp.float32(T_HEAD) + cp.float32(LAPSE_RATE) * (surface_elev - cp.float32(HEAD_ELEVATION)),
         cp.float32(T_MELT))
 
 

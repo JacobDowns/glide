@@ -42,6 +42,9 @@ SEC_PER_YR = 365.25 * 86400.0
 # Mass flux regularization: must match momentum solver (flux.cu: sqrt(u^2 + 10))
 # where 10 is in (m/yr)^2. Convert to (m/s)^2 for the enthalpy solver.
 MASS_FLUX_REG = 10.0 / (SEC_PER_YR ** 2)
+# Same constant in (m/yr)^2 for the omega kernel, which operates on
+# m/yr velocities to avoid float32 scale mismatch with the momentum solver.
+MASS_FLUX_REG_YR = 10.0
 
 
 def water_content_from_enthalpy(E, depth=0.0):
@@ -214,6 +217,7 @@ class EnthalpyOperators:
             'BETA_CC': BETA_CC, 'GRAVITY': GRAVITY,
             'K_TEMP_FACTOR': K_TEMP_FACTOR,
             'MASS_FLUX_REG': MASS_FLUX_REG,
+            'MASS_FLUX_REG_YR': MASS_FLUX_REG_YR,
         }
         defines = '\n'.join(f'#define {k} {v}f' for k, v in constants.items())
         defines += '\n#define K_COLD (K_I/C_I)\n'

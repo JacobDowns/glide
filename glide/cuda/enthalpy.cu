@@ -651,7 +651,15 @@ HorizAdvectionResult get_horiz_advection(
         fr = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
 
-    // y-direction faces (same LF mass flux treatment)
+    // y-direction faces.
+    // The momentum solver's v-convention has v > 0 = decreasing i
+    // (flux.cu: get_vertical_flux_jac, residual assembles j_t - j_b).
+    // The mass flux Hv > 0 means flow toward smaller i (from E_r=E[i]
+    // toward E_l=E[i-1] at the top face). The LF flux upwinds E_l when
+    // u > 0. To get correct upwinding, we swap E_l and E_r so that
+    // E_l is the upstream cell: {Hv, E[i], E[i-1]} at the top face.
+    // This preserves the mass flux sign (for uniform-E conservation)
+    // while fixing the upwind direction.
     float v_top    = get_v3d(v3d, k, i,   j, nz, ny, nx);
     float v_bottom = get_v3d(v3d, k, i+1, j, nz, ny, nx);
     float E_ym = get_E(E, i-1, j, k, ny, nx, nz);
@@ -663,25 +671,25 @@ HorizAdvectionResult get_horiz_advection(
     if (i > 0) {
         float H_ym = get_cell(H, i-1, j, ny, nx);
         float H_avg = 0.5f * (H_ym + H_here);
-        float Hv_top = H_avg * v_top - 0.5f * sqrtf(v_top * v_top + MASS_FLUX_REG) * (H_here - H_ym);
-        ft = get_horiz_enthalpy_flux_jac({Hv_top, E_ym, E_here}, lf_c);
+        float Hv_top = H_avg * v_top - 0.5f * sqrtf(v_top * v_top + MASS_FLUX_REG) * (H_ym - H_here);
+        ft = get_horiz_enthalpy_flux_jac({Hv_top, E_here, E_ym}, lf_c);
     } else {
         ft = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
     if (i < ny - 1) {
         float H_yp = get_cell(H, i+1, j, ny, nx);
         float H_avg = 0.5f * (H_here + H_yp);
-        float Hv_bottom = H_avg * v_bottom - 0.5f * sqrtf(v_bottom * v_bottom + MASS_FLUX_REG) * (H_yp - H_here);
-        fb = get_horiz_enthalpy_flux_jac({Hv_bottom, E_here, E_yp}, lf_c);
+        float Hv_bottom = H_avg * v_bottom - 0.5f * sqrtf(v_bottom * v_bottom + MASS_FLUX_REG) * (H_here - H_yp);
+        fb = get_horiz_enthalpy_flux_jac({Hv_bottom, E_yp, E_here}, lf_c);
     } else {
         fb = get_horiz_enthalpy_flux_jac({0.0f, E_here, E_here}, lf_c);
     }
 
     // Conservative flux divergence: rho_i * div(H*u*E)
-    // No advective form correction needed.
-    result.res = RHO_I * ((fr.res - fl.res) + (fb.res - ft.res)) * dx_inv;
+    // y-convention: (ft - fb) matches the momentum solver's (j_t - j_b).
+    result.res = RHO_I * ((fr.res - fl.res) + (ft.res - fb.res)) * dx_inv;
     result.d_E_here = RHO_I * ((fr.d_E_l - fl.d_E_r)
-                              + (fb.d_E_l - ft.d_E_r)) * dx_inv;
+                              + (ft.d_E_l - fb.d_E_r)) * dx_inv;
 
     return result;
 }
@@ -1215,9 +1223,12 @@ void compute_omega(
     float H_ym = get_cell(H, i-1, j, ny, nx);
     float H_yp = get_cell(H, i+1, j, ny, nx);
 
-    // 1. Compute layer-wise div(Hu) using the same mass flux stencil
-    //    as the enthalpy horizontal advection (LF on H, matching the
-    //    momentum solver).
+    // 1. Compute layer-wise div(Hu) using the same LF mass flux as the
+    //    momentum solver (flux.cu). The velocity is passed in m/yr (the
+    //    momentum solver's native units) so that the float32 evaluation
+    //    of sqrt(u^2 + 10) matches the momentum solver exactly, avoiding
+    //    scale-dependent rounding differences that would corrupt omega
+    //    through catastrophic cancellation in dH/dt + div(Hu).
     float div_Hu[MAX_NZ];
 
     for (int k = 0; k < nz; k++) {
@@ -1226,33 +1237,37 @@ void compute_omega(
         float v_t = get_v3d(v3d, k, i,   j, nz, ny, nx);
         float v_b = get_v3d(v3d, k, i+1, j, nz, ny, nx);
 
-        // x-direction LF mass flux
+        // x-direction LF mass flux (velocity in m/yr, reg constant in (m/yr)^2)
         float flux_r = 0.0f, flux_l = 0.0f;
         if (j < nx - 1) {
             float H_avg_r = 0.5f * (h_here + H_xp);
-            float u_mag_r = sqrtf(u_r * u_r + MASS_FLUX_REG);
+            float u_mag_r = sqrtf(u_r * u_r + MASS_FLUX_REG_YR);
             flux_r = H_avg_r * u_r - 0.5f * u_mag_r * (H_xp - h_here);
         }
         if (j > 0) {
             float H_avg_l = 0.5f * (H_xm + h_here);
-            float u_mag_l = sqrtf(u_l * u_l + MASS_FLUX_REG);
+            float u_mag_l = sqrtf(u_l * u_l + MASS_FLUX_REG_YR);
             flux_l = H_avg_l * u_l - 0.5f * u_mag_l * (h_here - H_xm);
         }
 
-        // y-direction LF mass flux
+        // y-direction LF mass flux.
+        // Convention matches flux.cu: dissipation is (H_top - H_bottom)
+        // where top = smaller i, bottom = larger i.
         float flux_b = 0.0f, flux_t = 0.0f;
         if (i < ny - 1) {
             float H_avg_b = 0.5f * (h_here + H_yp);
-            float v_mag_b = sqrtf(v_b * v_b + MASS_FLUX_REG);
-            flux_b = H_avg_b * v_b - 0.5f * v_mag_b * (H_yp - h_here);
+            float v_mag_b = sqrtf(v_b * v_b + MASS_FLUX_REG_YR);
+            flux_b = H_avg_b * v_b - 0.5f * v_mag_b * (h_here - H_yp);
         }
         if (i > 0) {
             float H_avg_t = 0.5f * (H_ym + h_here);
-            float v_mag_t = sqrtf(v_t * v_t + MASS_FLUX_REG);
-            flux_t = H_avg_t * v_t - 0.5f * v_mag_t * (h_here - H_ym);
+            float v_mag_t = sqrtf(v_t * v_t + MASS_FLUX_REG_YR);
+            flux_t = H_avg_t * v_t - 0.5f * v_mag_t * (H_ym - h_here);
         }
 
-        div_Hu[k] = (flux_r - flux_l + flux_b - flux_t) * dx_inv;
+        // Divergence convention: matches the momentum solver's continuity
+        // residual which uses (j_r - j_l + j_t - j_b)/dx.
+        div_Hu[k] = (flux_r - flux_l + flux_t - flux_b) * dx_inv;
     }
 
     // 2. Use the actual dH/dt passed from the caller.

@@ -223,7 +223,33 @@ $$
 
 This matches the Cartesian basal KBC exactly, yielding $\omega_b = -\dot{m}$.
 
-## 5. Synthesis: The Standard Compressible-Flow Procedure
+## 5. Computing $\omega$: The Diagnostic ODE
+
+The sigma-space continuity equation (Section 2) relates $\omega$ to the velocity field and thickness evolution:
+
+$$
+\frac{\partial \omega}{\partial \sigma} = -\left(\frac{\partial H}{\partial t} + \frac{\partial (Hu)}{\partial x} + \frac{\partial (Hv)}{\partial y}\right).
+$$
+
+This is an ordinary differential equation in $\sigma$ that can be integrated upward from the bed boundary condition $\omega_0 = -\dot{m}$:
+
+$$
+\omega(\sigma) = -\dot{m} - \int_0^{\sigma} \left(\frac{\partial H}{\partial t} + \nabla_h \cdot (H\mathbf{u})\right) d\sigma'.
+$$
+
+The right-hand side involves two quantities: the horizontal mass flux divergence $\nabla_h \cdot (H\mathbf{u})$ (which may vary with $\sigma$ if the velocity has vertical shear), and the thickness tendency $\partial H / \partial t$ (which is constant in $\sigma$).
+
+### The Consistency Requirement
+
+For the conservative enthalpy equation to preserve a uniform enthalpy field $E = E_0$ exactly, every term must cancel for this test case. The residual for uniform $E_0$ reduces to:
+
+$$
+R = \rho_i E_0 \left[\frac{\partial H}{\partial t} + \nabla_h \cdot (H\mathbf{u}) + \frac{\partial \omega}{\partial \sigma}\right] = 0
+$$
+
+which is identically zero if and only if $\omega$ satisfies the continuity equation with the **same** $\partial H / \partial t$ and $\nabla_h \cdot (H\mathbf{u})$ used by the enthalpy solver. In a coupled model where an operator-split momentum solver advances the thickness, the realized thickness change $(H^n - H^{n-1})/\Delta t$ may differ from the continuity-implied estimate $\dot{a} - \dot{m} - \overline{\nabla_h \cdot (H\mathbf{u})}$ due to the discrete mass flux stencil and solver convergence. Using the **actual** thickness change from the momentum step to compute $\omega$ eliminates this inconsistency and guarantees exact cancellation.
+
+## 6. Synthesis: The Standard Compressible-Flow Procedure
 
 We now apply the standard procedure from Section 1 to merge the advective enthalpy equation with the sigma-space continuity equation.
 
@@ -268,7 +294,7 @@ $$
 = \frac{H\Phi}{\rho} - \frac{H \rho_w}{\rho} L \, r_d \, \varpi(E).
 $$
 
-## 6. Thermodynamic Boundary Conditions in Conservative Form
+## 7. Thermodynamic Boundary Conditions in Conservative Form
 
 Because the state variable is now $HE$, the physical boundary conditions must be applied directly to the vertical fluxes, rather than as pointwise state constraints on $E$.
 
@@ -294,7 +320,7 @@ $$
 
 If basal melting occurs, the exact corresponding enthalpy leaves the system in the same mathematical step as the mass loss.
 
-## 7. Conclusion: Why This is the Desired FVM Form
+## 8. Conclusion: Why This is the Desired FVM Form
 
 We began this derivation by noting that a finite-volume solver requires the governing equation to take a strict flux-divergence form:
 

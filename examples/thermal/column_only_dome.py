@@ -29,8 +29,8 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY, E_SCALE
 # ========================================================
 # Parameters
 # ========================================================
-ny, nx = 128, 128
-dx = 1000.0             # m
+ny, nx = 512, 512
+dx = 250.0             # m
 n_levels = 3
 
 DOME_RADIUS = 50000.0   # m
@@ -55,7 +55,7 @@ N_SMOOTH = 20
 
 # Time stepping
 DT_YR = 5.0
-N_STEPS = 200
+N_STEPS = 50
 SEC_PER_YR = 365.25 * 86400.0
 
 OUT_DIR = Path('column_only_dome_output')
@@ -118,10 +118,11 @@ thermal = ThermalModel(grid, nz=NZ, n_smooth=N_SMOOTH,
                        update_rheology=True, frictional_heating=False)
 
 # phi_strain defaults to zero (no strain heating computation wired up)
-thermal.ops.term_flags.drainage = True
-
+thermal.ops.term_flags.drainage = False
+thermal.ops.term_flags.omega = True
 thermal.ops.smoother_config.report_norms = True
 thermal.ops.smoother_config.n_newton = 5
+thermal.ops.term_flags.horizontal_advection = False
 
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_init, T_field=T_INIT, Q_geo=Q_GEO)

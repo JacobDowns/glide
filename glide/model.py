@@ -181,12 +181,17 @@ class ThermalModel:
         # Sync velocity from the momentum solution.
         # SSA velocities are in m/yr; enthalpy needs m/s.
         ops.broadcast_velocity()
+
+        # Compute omega BEFORE the m/yr → m/s velocity conversion.
+        # The omega kernel evaluates div(Hu) in m/yr to match the
+        # momentum solver's float32 arithmetic exactly — this avoids
+        # catastrophic cancellation from scale-dependent rounding
+        # differences between the m/yr and m/s evaluations.
+        self._compute_omega(dt)
+
         sec_per_yr = cp.float32(self.SEC_PER_YR)
         ops.enthalpy_velocity.u3d /= sec_per_yr
         ops.enthalpy_velocity.v3d /= sec_per_yr
-
-        # Compute omega from the actual thickness change
-        self._compute_omega(dt)
 
         if self.frictional_heating:
             self._compute_frictional_heating()
@@ -229,14 +234,24 @@ class ThermalModel:
         consistency between the conservative enthalpy equation and the
         realized mass balance from the momentum step.
 
+        The computation is performed in m/yr units (the momentum solver's
+        native scale) so that the LF mass flux evaluation matches the
+        momentum solver's float32 arithmetic. The resulting omega is
+        converted to m/s for the enthalpy equation.
+
         Parameters
         ----------
         dt : float
             Time step in seconds.
         """
         ops = self.ops
-        dh_dt = (ops.grid.state.H.data - ops.H_prev) / cp.float32(dt)
-        ops.compute_omega(dh_dt)
+        sec_per_yr = cp.float32(self.SEC_PER_YR)
+        # dH/dt in m/yr (velocity is still in m/yr at this point)
+        dt_yr = cp.float32(dt / self.SEC_PER_YR)
+        dh_dt_yr = (ops.grid.state.H.data - ops.H_prev) / dt_yr
+        ops.compute_omega(dh_dt_yr)
+        # Convert omega from m/yr to m/s
+        ops.enthalpy_velocity.omega /= sec_per_yr
 
     @property
     def B_scale(self):

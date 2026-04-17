@@ -61,7 +61,7 @@ T_INIT = T_HEAD               # K (uniform initial, coldest surface T)
 N_GLEN = 3.0
 
 # Sliding
-BETA_SLIDING = 5.0          # basal friction coefficient (GLIDE head units)
+BETA_SLIDING = 2.5          # basal friction coefficient (GLIDE head units)
 
 # Thermal
 N_SMOOTH = 25                 # enthalpy smoothing sweeps

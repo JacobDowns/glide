@@ -6,40 +6,5 @@
     <DataSet timestep="175.0" group="" part="0" file="dome_0030.vti"/>
     <DataSet timestep="225.0" group="" part="0" file="dome_0040.vti"/>
     <DataSet timestep="275.0" group="" part="0" file="dome_0050.vti"/>
-    <DataSet timestep="325.0" group="" part="0" file="dome_0060.vti"/>
-    <DataSet timestep="375.0" group="" part="0" file="dome_0070.vti"/>
-    <DataSet timestep="425.0" group="" part="0" file="dome_0080.vti"/>
-    <DataSet timestep="475.0" group="" part="0" file="dome_0090.vti"/>
-    <DataSet timestep="525.0" group="" part="0" file="dome_0100.vti"/>
-    <DataSet timestep="575.0" group="" part="0" file="dome_0110.vti"/>
-    <DataSet timestep="625.0" group="" part="0" file="dome_0120.vti"/>
-    <DataSet timestep="675.0" group="" part="0" file="dome_0130.vti"/>
-    <DataSet timestep="725.0" group="" part="0" file="dome_0140.vti"/>
-    <DataSet timestep="775.0" group="" part="0" file="dome_0150.vti"/>
-    <DataSet timestep="825.0" group="" part="0" file="dome_0160.vti"/>
-    <DataSet timestep="875.0" group="" part="0" file="dome_0170.vti"/>
-    <DataSet timestep="925.0" group="" part="0" file="dome_0180.vti"/>
-    <DataSet timestep="975.0" group="" part="0" file="dome_0190.vti"/>
-    <DataSet timestep="1025.0" group="" part="0" file="dome_0200.vti"/>
-    <DataSet timestep="1075.0" group="" part="0" file="dome_0210.vti"/>
-    <DataSet timestep="1125.0" group="" part="0" file="dome_0220.vti"/>
-    <DataSet timestep="1175.0" group="" part="0" file="dome_0230.vti"/>
-    <DataSet timestep="1225.0" group="" part="0" file="dome_0240.vti"/>
-    <DataSet timestep="1275.0" group="" part="0" file="dome_0250.vti"/>
-    <DataSet timestep="1325.0" group="" part="0" file="dome_0260.vti"/>
-    <DataSet timestep="1375.0" group="" part="0" file="dome_0270.vti"/>
-    <DataSet timestep="1425.0" group="" part="0" file="dome_0280.vti"/>
-    <DataSet timestep="1475.0" group="" part="0" file="dome_0290.vti"/>
-    <DataSet timestep="1525.0" group="" part="0" file="dome_0300.vti"/>
-    <DataSet timestep="1575.0" group="" part="0" file="dome_0310.vti"/>
-    <DataSet timestep="1625.0" group="" part="0" file="dome_0320.vti"/>
-    <DataSet timestep="1675.0" group="" part="0" file="dome_0330.vti"/>
-    <DataSet timestep="1725.0" group="" part="0" file="dome_0340.vti"/>
-    <DataSet timestep="1775.0" group="" part="0" file="dome_0350.vti"/>
-    <DataSet timestep="1825.0" group="" part="0" file="dome_0360.vti"/>
-    <DataSet timestep="1875.0" group="" part="0" file="dome_0370.vti"/>
-    <DataSet timestep="1925.0" group="" part="0" file="dome_0380.vti"/>
-    <DataSet timestep="1975.0" group="" part="0" file="dome_0390.vti"/>
-    <DataSet timestep="2025.0" group="" part="0" file="dome_0400.vti"/>
   </Collection>
 </VTKFile>

@@ -41,10 +41,10 @@ V_MAX = 100.0  # m/yr at the margin
 # Forcing
 SMB_CENTER = 0.5   # m/yr
 SMB_EDGE = -2.0    # m/yr
-Q_GEO = 0.05       # W/m^2
+Q_GEO = 0.1       # W/m^2
 
 # Surface temperature
-T_SEA_LEVEL = 278.15
+T_SEA_LEVEL = 268.15
 LAPSE_RATE = -6.5e-3
 T_INIT = 253.15
 

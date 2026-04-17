@@ -133,7 +133,13 @@ The flux used here can be understood as: start from the HLLC framework (which se
 
 ### Per-Face Flux
 
-At each face and sigma level $k$, the mass flux $F^m = \tfrac{1}{2}(H_L + H_R) \, u_{\text{face},k}$ is formed from the layer velocity at that face and the arithmetic average of the two neighboring cell thicknesses. This is the same mass-flux stencil used by the thickness solver in `flux.cu`, ensuring that the energy transport is exactly consistent with the mass transport.
+At each face and sigma level $k$, the mass flux uses the same Lax-Friedrichs stencil as the thickness solver in `flux.cu`:
+
+$$
+F^m = \tfrac{1}{2}(H_L + H_R) \, u_{\text{face},k} - \tfrac{1}{2}|u_{\text{face},k}| \, (H_R - H_L)
+$$
+
+The first term is the centered mass flux; the second is the upwind dissipation on $H$, which ensures that the discrete mass flux divergence $\nabla_h \cdot (H\mathbf{u})$ is identical to that used by the momentum solver's continuity equation. This consistency is essential: if the enthalpy and thickness solvers used different mass-flux stencils, the conservative form would generate spurious enthalpy sources/sinks proportional to the stencil mismatch, even for a spatially uniform enthalpy field.
 
 The specific enthalpy is then upwinded using a **Rusanov (local Lax-Friedrichs) flux** with the mass flux as the wave speed:
 
@@ -164,7 +170,7 @@ $$
 
 where $F_R, F_L$ are the right and left x-face fluxes and $F_B, F_T$ are the bottom and top y-face fluxes (in grid index space).
 
-At domain boundaries, a free-outflow condition is applied: the exterior ghost cell is assigned $E_{\text{ghost}} = E_{\text{here}}$ and $H_{\text{ghost}} = H_{\text{here}}$, so the Lax-Friedrichs flux reduces to $F = F^m E_{\text{here}}$ (pure outflow, no artificial dissipation).
+At domain boundaries, the mass flux $F^m$ is set to zero (matching the momentum solver's zero-flux boundary condition). The enthalpy flux at boundary faces therefore vanishes regardless of the enthalpy values, ensuring no mass or energy enters or leaves through the domain edges.
 
 ### Jacobian
 
@@ -184,7 +190,7 @@ Two distinct properties are worth distinguishing:
 
 2.  **Mass-flux consistency.** The mass flux $F^m = \tfrac{1}{2}(H_L + H_R) u_{\text{face}}$ is the same stencil used by the thickness solver. This ensures that the energy crossing a face is exactly $E_{\text{upwind}}$ per unit mass transported. If the enthalpy and thickness solvers used different mass-flux stencils, total energy would still be conserved (property 1 still holds), but the energy-per-unit-mass would drift, producing non-physical temperature changes.
 
-The one place where mass-flux consistency is approximate rather than exact is across the operator split: the momentum solver advances $H^{n-1} \to H^n$ first, then the enthalpy solver uses $H^n$ for its fluxes. The mass fluxes that *produced* $H^n$ used intermediate Newton states during the momentum solve, not exactly $H^n$ itself. This is the standard $O(\Delta t)$ operator-splitting error and vanishes under time-step refinement.
+In the coupled `ThermalModel`, the `compute_omega` kernel receives the actual thickness change $(H^n - H^{n-1})/\Delta t$ from the momentum step (see Section 9). Combined with the shared LF mass-flux stencil, this ensures that a spatially uniform enthalpy field produces zero residual to machine precision — the time derivative, horizontal advection, and sigma advection terms cancel exactly.
 
 ## 5. Vertical (Sigma) Advection: Conservative Upwind
 
@@ -365,19 +371,39 @@ $$
 \frac{\partial H}{\partial t} + \frac{\partial (Hu)}{\partial x} + \frac{\partial (Hv)}{\partial y} + \frac{\partial \omega}{\partial \sigma} = 0
 $$
 
-with boundary values $\omega_0 = -\dot{m}$ (bed) and $\omega_{N_z-1} = -\dot{a}$ (surface). Any $\omega$ field satisfying this constraint is consistent with the conservative enthalpy equation.
+with boundary value $\omega_0 = -\dot{m}$ (bed). Any $\omega$ field satisfying this constraint is consistent with the conservative enthalpy equation.
+
+### The Consistency Requirement
+
+For the conservative enthalpy equation to preserve a spatially uniform enthalpy field $E = E_0$ exactly, the residual must vanish identically:
+
+$$
+R = \rho_i E_0 \left[\frac{H^n - H^{n-1}}{\Delta t} + \nabla_h \cdot (H\mathbf{u}) + \frac{\partial \omega}{\partial \sigma}\right] = 0.
+$$
+
+This requires that the $\partial H / \partial t$ used in the $\omega$ computation matches the **actual** discrete thickness change $(H^n - H^{n-1})/\Delta t$ from the momentum step, and that $\nabla_h \cdot (H\mathbf{u})$ in the $\omega$ computation uses the **same** mass flux stencil as the horizontal enthalpy flux.
+
+In a coupled operator-split model, the momentum solver advances the thickness using its own discrete mass conservation:
+
+$$
+\frac{H^n - H^{n-1}}{\Delta t} = \dot{a} - \nabla_h^{\text{mom}} \cdot (H\mathbf{u})
+$$
+
+If the $\omega$ kernel were to estimate $\partial H / \partial t$ independently (e.g., from $\dot{a} - \nabla_h \cdot (H\mathbf{u})$ using the enthalpy solver's own stencil), any stencil mismatch or convergence tolerance in the momentum solver would cause $\partial_\sigma \omega \neq -(\partial_t H + \nabla_h \cdot (H\mathbf{u}))$, producing spurious enthalpy sources proportional to the difference.
 
 ### The `compute_omega` Kernel
 
-A convenience kernel `compute_omega` is provided for the common case where $\omega$ is diagnosed from a given velocity field. It integrates the continuity equation upward from the bed:
+The `compute_omega` kernel integrates the continuity equation upward from the bed, using the **actual** $\partial H / \partial t$ passed by the caller:
 
-1.  **Layer-wise mass flux divergence.** At each sigma level $k$, the horizontal mass flux divergence $\nabla_h \cdot (H\mathbf{u})_k$ is computed using the same face-averaged stencil as the horizontal enthalpy flux — $F^m_{\text{face}} = \tfrac{1}{2}(H_L + H_R) \, u_{\text{face},k}$ — ensuring exact consistency between the enthalpy equation and mass conservation. Note that each sigma level $k$ uses its own velocity $(u_k, v_k)$, so with a non-SSA momentum model the divergence varies with depth.
-
-2.  **Column mass balance.** The vertically averaged divergence $\overline{\nabla_h \cdot (H\mathbf{u})}$ is combined with the surface and basal mass balance rates to estimate the thickness tendency:
+1.  **Layer-wise mass flux divergence.** At each sigma level $k$, the horizontal mass flux divergence $\nabla_h \cdot (H\mathbf{u})_k$ is computed using the same Lax-Friedrichs stencil as the horizontal enthalpy flux and the momentum solver:
 
 $$
-\frac{\partial H}{\partial t} \approx \dot{a} - \dot{m} - \overline{\nabla_h \cdot (H\mathbf{u})}.
+F^m_{\text{face}} = \tfrac{1}{2}(H_L + H_R) \, u_{\text{face},k} - \tfrac{1}{2}|u_{\text{face},k}|(H_R - H_L).
 $$
+
+Note that each sigma level $k$ uses its own velocity $(u_k, v_k)$, so with a non-SSA momentum model the divergence varies with depth. Boundary faces (domain edges) have zero flux.
+
+2.  **Thickness tendency.** The kernel receives a 2D field $(\partial H / \partial t)_{i,j}$ as input. In the coupled `ThermalModel`, this is computed as $(H^n - H^{n-1})/\Delta t$ from the momentum step, ensuring exact consistency. For standalone use (prescribed velocity, static geometry), the caller passes an appropriate estimate (e.g., SMB).
 
 3.  **Upward integration from the bed.** Starting from $\omega_0 = -\dot{m}$:
 
@@ -387,7 +413,7 @@ $$
 
 where $[\cdot]_{k-\tfrac{1}{2}} = \tfrac{1}{2}(\text{div}_{k-1} + \text{div}_k)$ is the half-node average.
 
-By construction, the surface value satisfies $\omega_{N_z-1} = -\dot{a}$, matching the kinematic boundary condition derived in the continuous formulation. Under SSA (depth-uniform velocities), the mass flux divergence is constant across layers, and $\omega$ is linear in $\sigma$ — the classical $\dot{\sigma} = (\dot{m} - \sigma \dot{a})/H$. Under a higher-order model with vertical shear, the layer-wise divergences differ and $\omega$ is a more general function of $\sigma$.
+Under SSA (depth-uniform velocities), the mass flux divergence is constant across layers, and $\omega$ is linear in $\sigma$. Under a higher-order model with vertical shear, the layer-wise divergences differ and $\omega$ is a more general function of $\sigma$.
 
 ## 10. The Column-Wise Newton/Thomas Smoother
 
@@ -465,6 +491,30 @@ One call to the column smoother applies the Newton solve independently to every 
 3.  Checks convergence: $\|R\|_\infty / \|R_0\|_\infty < \text{rtol}$ or $\|R\|_\infty < \text{atol}$.
 
 Because horizontal neighbors are frozen during each sweep, the smoother is a block-Jacobi iteration. Each sweep propagates information one cell horizontally, so convergence of horizontal coupling requires $O(\max(N_x, N_y))$ sweeps in the worst case. The iteration cap `n_iter` and `absolute_tolerance` act as safety nets — the solver does its best and moves on, exactly as the momentum solver does when its maximum V-cycle count is reached.
+
+## 12. Enthalpy Scaling
+
+The enthalpy solver stores a non-dimensionalized enthalpy $\hat{E} = E / E_0$, where the scale factor is:
+
+$$
+E_0 = c_i \, (T_{\text{melt}} - T_{\text{ref}}) \approx 100{,}450 \; \text{J/kg}.
+$$
+
+This makes $\hat{E}$ order unity (cold ice has $\hat{E} \approx 0$, ice at the melting point has $\hat{E} \approx 1$), improving the conditioning of the Newton/Thomas solver.
+
+### How the scaling propagates
+
+All terms that are linear in $E$ (time derivative, horizontal advection, sigma advection, diffusion) scale by $1/E_0$ automatically — no kernel changes needed. The Jacobian entries $\partial \hat{R} / \partial \hat{E}$ are invariant: the $E_0$ factors cancel between the residual and the derivative. Only two classes of terms require explicit treatment:
+
+1.  **Nonlinear helpers.** The diffusivity $K(E)$, water content $\varpi(E)$, and drainage function all depend on the physical value of $E$ (e.g., comparing against $E_{\text{pmp}}$). These helpers reconstruct the physical-scale difference $(E - E_{\text{pmp}}) \cdot E_0$ internally before evaluating the sigmoid/softplus. The helper return values (diffusivity in W/(m$\cdot$K), water content as a fraction) are physical — only the arguments are scaled.
+
+2.  **Physical forcing terms.** The geothermal and frictional heat fluxes ($Q_{\text{geo}}, Q_{\text{fh}}$) and strain heating ($\phi$) are in physical units (W/m$^2$, W/m$^3$). These are divided by $E_0$ in `set_rhs()` to match the scaled residual.
+
+The drainage residual is an exception: it is nonlinear in $E$ and produces a physical-scale value, so it is explicitly divided by $E_0$ in `get_drainage_jac()`. The corresponding Jacobian entry requires no adjustment because the $E_0$ factors cancel in the chain rule: $\partial \hat{R}^{\text{drain}} / \partial \hat{E} = \partial R^{\text{drain}} / \partial E$.
+
+### Interface
+
+Conversion between physical and scaled enthalpy happens at the Python API boundary. The methods `initialize_from_temperature`, `set_surface_enthalpy_from_temperature`, `get_temperature`, `get_water_content`, and `get_arrhenius_factor` handle the scaling transparently. The CUDA kernels work entirely in scaled units; the constant `E_SCALE` is injected as a `#define` directive at compile time from the Python-side value.
 
 ## References
 

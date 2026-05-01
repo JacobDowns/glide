@@ -117,7 +117,9 @@ where superscript $n$ denotes the current time level and $n-1$ the previous. Thi
 
 Because both $H$ and $E$ are evaluated at their respective time levels, this form conserves total energy exactly even when the ice thickness changes between time steps. If the thickness were frozen (i.e., $R^{\text{time}} = \rho_i H^n (E^n_k - E^{n-1}_k)/\Delta t$), energy would leak whenever $H$ changes — precisely the deficiency that the conservative formulation was designed to eliminate.
 
-The Jacobian contribution is purely diagonal: $$
+The Jacobian contribution is purely diagonal:
+
+$$
 \frac{\partial R^{\text{time}}}{\partial E_k} = \frac{\rho_i H}{\Delta t}.
 $$
 
@@ -151,14 +153,17 @@ This is exactly the procedure used in the derivation to convert from the advecti
 
 In compressible-flow FVM, it is well known that applying a standard Riemann solver (e.g., Rusanov/Lax-Friedrichs) independently to the conserved variable $\rho\phi$ produces spurious numerical diffusion at contact discontinuities — interfaces where $\rho$ jumps but the scalar $\phi$ is uniform. Abgrall (1996) formalized the requirement: *a uniform scalar must remain uniform regardless of what the density does*. The same issue arises here with $H$ and $E$.
 
-Two approaches are possible:
+Two approaches are possible. The first is a *naive conserved-variable approach*: treat $HE$ as a single conserved variable and apply dissipation to it directly,
 
-1.  **Naive conserved-variable approach.** Treat $HE$ as a single conserved variable and apply dissipation to it directly: $$
-    F^{\text{naive}} = \tfrac{1}{2}u(H_L E_L + H_R E_R) - \tfrac{1}{2}\alpha(H_R E_R - H_L E_L).
-    $$
-2.  **Factored mass-flux approach.** Compute the mass flux $F^m$ first, then upwind only the specific quantity $E$ using that mass flux as the wave speed: $$
-    F = F^m \cdot \hat{E}(E_L, E_R).
-    $$
+$$
+F^{\text{naive}} = \tfrac{1}{2}u(H_L E_L + H_R E_R) - \tfrac{1}{2}\alpha(H_R E_R - H_L E_L).
+$$
+
+The second is a *factored mass-flux approach*: compute the mass flux $F^m$ first, then upwind only the specific quantity $E$ using that mass flux as the wave speed,
+
+$$
+F = F^m \cdot \hat{E}(E_L, E_R).
+$$
 
 The naive approach violates Abgrall's condition. Suppose $E$ is uniform ($E_L = E_R = E_0$) but $H$ varies across a face. The naive dissipation term $-\tfrac{1}{2}\alpha(H_R E_R - H_L E_L) = -\tfrac{1}{2}\alpha E_0 (H_R - H_L)$ is nonzero — the $H$ gradient alone generates spurious numerical diffusion of enthalpy. In the factored form, $F = F^m \cdot E_0$ regardless of the thickness gradient. The dissipation acts only on $\nabla E$, never on $\nabla H$.
 
@@ -523,11 +528,15 @@ The sub-diagonal $a_k$ and super-diagonal $c_k$ carry only the vertical coupling
 
 The tridiagonal system is solved by forward elimination followed by back substitution — an $O(N_z)$ direct solve:
 
-**Forward elimination** ($k = 1, \ldots, N_z-1$): $$
+Forward elimination ($k = 1, \ldots, N_z-1$):
+
+$$
 w = a_k / b_{k-1}, \qquad b_k \leftarrow b_k - w \, c_{k-1}, \qquad \text{rhs}_k \leftarrow \text{rhs}_k - w \, \text{rhs}_{k-1}.
 $$
 
-**Back substitution** ($k = N_z - 2, \ldots, 0$): $$
+Back substitution ($k = N_z - 2, \ldots, 0$):
+
+$$
 \delta E_k = (\text{rhs}_k - c_k \, \delta E_{k+1}) / b_k.
 $$
 

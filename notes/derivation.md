@@ -158,7 +158,9 @@ $$
 
 where $E_{\text{pmp}} = c_i(T_{\text{pmp}} - T_{\text{ref}})$ is the enthalpy at the local pressure melting point (which depends on the overburden pressure via the Clausius-Clapeyron relation). Without this sink, temperate ice would accumulate unbounded water content — physically unrealistic, and not great for the solver either.
 
-To transform into sigma coordinates, we apply the chain rule for vertical derivatives ($\frac{\partial}{\partial z} = \frac{1}{H}\frac{\partial}{\partial \sigma}$), yielding the sigma-space source term: $$
+To transform into sigma coordinates, we apply the chain rule for vertical derivatives ($\frac{\partial}{\partial z} = \frac{1}{H}\frac{\partial}{\partial \sigma}$), yielding the sigma-space source term:
+
+$$
 S_{\sigma} = \frac{1}{H} \frac{\partial}{\partial \sigma} \left( \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right) + \frac{\Phi}{\rho} - \frac{\rho_w}{\rho} L \, r_d \, \varpi(E)
 $$
 
@@ -229,21 +231,27 @@ $$
 
 The physical interpretation of $\omega$ becomes clear when we evaluate it at the boundaries. In Cartesian coordinates, the kinematic boundary conditions (KBCs) are:
 
--   **Surface** ($z = h_s = b + H$): $$
-    w_s - \left(
-    \frac{\partial h_s}{\partial t}
-    + u_s \frac{\partial h_s}{\partial x}
-    + v_s \frac{\partial h_s}{\partial y}
-    \right) = -\dot{a},
-    $$ where $\dot{a}$ is surface accumulation.
+At the surface ($z = h_s = b + H$),
 
--   **Bed** ($z = b$): $$
-    w_b - \left(
-    \frac{\partial b}{\partial t}
-    + u_b \frac{\partial b}{\partial x}
-    + v_b \frac{\partial b}{\partial y}
-    \right) = -\dot{m},
-    $$ where $\dot{m}$ is basal melt.
+$$
+w_s - \left(
+\frac{\partial h_s}{\partial t}
++ u_s \frac{\partial h_s}{\partial x}
++ v_s \frac{\partial h_s}{\partial y}
+\right) = -\dot{a},
+$$
+
+where $\dot{a}$ is surface accumulation. At the bed ($z = b$),
+
+$$
+w_b - \left(
+\frac{\partial b}{\partial t}
++ u_b \frac{\partial b}{\partial x}
++ v_b \frac{\partial b}{\partial y}
+\right) = -\dot{m},
+$$
+
+where $\dot{m}$ is basal melt.
 
 ### At the Upper Surface ($\sigma = 1$)
 
@@ -388,18 +396,18 @@ $$
 \frac{\partial U}{\partial t} + \nabla_\sigma \cdot \mathbf{F} = Q.
 $$
 
-The equation we just derived satisfies this in the computational space $(x, y, \sigma)$:
+The equation we just derived satisfies this in the computational space $(x, y, \sigma)$. The conserved variable is $U = HE$. The flux vector is
 
--   The conserved variable is $U = HE$.
--   The flux vector is $$
-    \mathbf{F} = \begin{bmatrix} F_x \\ F_y \\ F_\sigma \end{bmatrix} =
-    \begin{bmatrix}
-    HEu \\
-    HEv \\
-    E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma}
-    \end{bmatrix}.
-    $$
--   The source term is $Q = \frac{H\Phi}{\rho} - \frac{H\rho_w}{\rho} L \, r_d \, \varpi(E)$, which contains strain heating and meltwater drainage.
+$$
+\mathbf{F} = \begin{bmatrix} F_x \\ F_y \\ F_\sigma \end{bmatrix} =
+\begin{bmatrix}
+HEu \\
+HEv \\
+E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma}
+\end{bmatrix}.
+$$
+
+The source term is $Q = \frac{H\Phi}{\rho} - \frac{H\rho_w}{\rho} L \, r_d \, \varpi(E)$, which contains strain heating and meltwater drainage.
 
 By absorbing the column thickness $H$ into the derivatives, the computational grid $(\Delta x, \Delta y, \Delta \sigma)$ is fixed from the FVM solver's point of view. The physical stretching of the ice column is hidden inside the flux definitions ($HEu$, $E\omega$), and the Divergence Theorem applies cleanly. Summed over the domain, all internal fluxes telescope to machine precision and only the boundary fluxes change the total.
 

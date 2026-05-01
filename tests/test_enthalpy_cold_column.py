@@ -93,7 +93,7 @@ def test_cold_column():
 
     # ---- Time stepping ----
     for step in range(n_steps):
-        ops.set_rhs(dt)
+        ops.set_rhs()
         ops.column_sweep(dt, n_smooth)
 
     # ---- Compare against analytical ----
@@ -168,7 +168,7 @@ def test_cold_column_residual_convergence():
     ops.enthalpy_velocity.omega.fill(0)
     ops.enthalpy_forcing.Q_fh.fill(0)
 
-    ops.set_rhs(dt)
+    ops.set_rhs()
 
     residuals = []
     for sweep in range(50):

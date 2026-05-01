@@ -198,7 +198,7 @@ print("-" * 62)
 for step in range(1, N_STEPS + 1):
     # Static geometry: H doesn't change, so H_prev = H always.
     # (No momentum solver — we're testing enthalpy in isolation.)
-    ops.set_rhs(dt_sec)
+    ops.set_rhs()
     ops.column_sweep(dt_sec, N_SMOOTH)
 
     t_yr += DT_YR

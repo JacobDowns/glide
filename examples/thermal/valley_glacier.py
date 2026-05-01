@@ -236,7 +236,7 @@ print(f"\n{'step':>5s}  {'t (yr)':>8s}  {'T_bed max':>10s}  "
 print("-" * 52)
 
 for step in range(1, N_STEPS + 1):
-    ops.set_rhs(DT_SEC)
+    ops.set_rhs()
     ops.column_sweep(DT_SEC, N_SMOOTH)
 
     if step % 20 == 0 or step <= 5 or step in snapshot_steps:

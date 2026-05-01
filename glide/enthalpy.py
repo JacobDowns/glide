@@ -1,25 +1,43 @@
 """
 Enthalpy model for GLIDE.
 
-Solves the enthalpy advection-diffusion equation in terrain-following
-(sigma) coordinates using a column-wise Newton/Thomas smoother
-within the multigrid framework.
+Solves the conservative form of the enthalpy equation (Aschwanden et
+al. 2012) in terrain-following (sigma) coordinates:
 
-The enthalpy equation (Aschwanden et al. 2012):
+    rho_i [d(HE)/dt + d(HuE)/dx + d(HvE)/dy + d(E*omega)/dsigma]
+        = (1/H) d/dsigma(K dE/dsigma) + H*phi - H*rho_w*L*r_d*omega(E)
 
-    rho_i (dE/dt + u dE/dx + v dE/dy + omega dE/dsigma)
-        - (1/h^2) d/dsigma(K dE/dsigma) = phi - rho_w L Dw(omega)
+where E is the specific enthalpy, H is the ice thickness, omega = H *
+sigma_dot is the scaled vertical velocity, K is the enthalpy diffusivity
+(cold/temperate transition via a sigmoid), phi is an external volumetric
+source (e.g. strain heating), and the last term is meltwater drainage.
+The conserved variable is HE; see notes/derivation.qmd for the
+derivation and notes/discretization.qmd for the discrete scheme.
 
-is discretized with:
-    - Horizontal: finite volume, upwind fluxes on MAC grid
-    - Vertical: finite differences on uniform sigma nodes
-    - Column-wise Newton/Thomas solve as multigrid smoother
+Discretization:
+    - Horizontal: Lax-Friedrichs finite-volume fluxes on a MAC grid,
+      with the mass flux Hu sharing the momentum solver's stencil so
+      div(Hu) is consistent between the two.
+    - Vertical advection: conservative upwind on the product E*omega.
+    - Vertical diffusion: centered second-order on uniform sigma nodes
+      with sigmoid-smoothed K(E).
+    - Time: implicit-Euler on HE (conservative, exact under H change).
+
+Solver:
+    - Column-wise Newton iteration with a Thomas (tridiagonal) inner
+      solve, for vertical coupling.
+    - Pointwise Jacobi layer smoother for horizontal coupling.
+    - The two are alternated in the outer iteration (column_sweep).
+
+Internally the solver works with a non-dimensionalized enthalpy
+E_hat = E / E_SCALE so that Newton corrections are O(1); conversion
+is handled at the Python API boundary.
 """
 import cupy as cp
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
-from .field import Field, Constant, GridEntity
+from .field import Constant
 
 
 # ========================================================
@@ -130,7 +148,7 @@ class EnthalpyVelocity:
     """3D velocity fields for enthalpy advection."""
     u3d: cp.ndarray | None = None       # (nz, ny, nx+1) x-velocity
     v3d: cp.ndarray | None = None       # (nz, ny+1, nx) y-velocity
-    omega: cp.ndarray | None = None     # (ny, nx, nz) omega = H*omega
+    omega: cp.ndarray | None = None     # (ny, nx, nz) omega = H * sigma_dot
 
     def __repr__(self):
         if self.u3d is not None:
@@ -169,7 +187,6 @@ class ColumnSmootherConfig:
       - relative residual < relative_tolerance
       - absolute residual < absolute_tolerance
       - iteration count reaches n_iter (passed to column_sweep)
-    This mirrors FASCDSolver.solve() in the momentum solver.
     """
     omega: cp.float32 = cp.float32(1.0)
     n_newton: int = 3
@@ -187,16 +204,17 @@ class ColumnSmootherConfig:
 # ========================================================
 class EnthalpyOperators:
     """
-    GPU-accelerated operators for the enthalpy equation.
+    GPU-accelerated operators for the conservative enthalpy equation.
 
     Provides:
-    - compute_residual: full enthalpy residual at all (i,j,k)
-    - column_smooth: column-wise Newton/Thomas smoother
-    - column_sweep: repeated smoothing with solution update
-    - omega field: set externally by the momentum/mass solver
-    - set_rhs: set forcing / previous time step data
-
-    Parallels the ForwardOperators class for the SSA solver.
+    - compute_residual: full discrete residual at all (i, j, k)
+    - column_smooth: one column-wise Newton/Thomas sweep (vertical coupling)
+    - layer_smooth: one pointwise Jacobi sweep (horizontal coupling)
+    - column_sweep: outer iteration alternating column + layer smoothers
+                    with convergence checking
+    - compute_omega: integrate sigma-space continuity to get omega from
+                     a given thickness tendency and velocity field
+    - set_rhs: precompute time-term and forcing arrays
     """
 
     def __init__(self, grid, nz=11, use_fast_math=True):
@@ -331,9 +349,9 @@ class EnthalpyOperators:
         self.r_E.fill(0)
         kernel(grid_size, block_size,
                (self.r_E,
-                self.enthalpy_state.E, self.f_E,
+                self.enthalpy_state.E, self.enthalpy_state.E_prev, self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
-                grid.state.H.data,
+                grid.state.H.data, self.H_prev,
                 self.enthalpy_forcing.E_surface,
                 grid.dx, cp.float32(dt),
                 self.enthalpy_forcing.drain_rate.value,
@@ -362,9 +380,9 @@ class EnthalpyOperators:
         self.delta_E.fill(0)
         kernel(grid_size, block_size,
                (self.delta_E,
-                self.enthalpy_state.E, self.f_E,
+                self.enthalpy_state.E, self.enthalpy_state.E_prev, self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
-                grid.state.H.data,
+                grid.state.H.data, self.H_prev,
                 self.enthalpy_forcing.E_surface,
                 grid.dx, cp.float32(dt),
                 self.enthalpy_forcing.drain_rate.value,
@@ -394,9 +412,9 @@ class EnthalpyOperators:
         self.delta_E.fill(0)
         kernel((grid_size,), (block_size,),
                (self.delta_E,
-                self.enthalpy_state.E, self.f_E,
+                self.enthalpy_state.E, self.enthalpy_state.E_prev, self.f_E,
                 vel.u3d, vel.v3d, vel.omega,
-                grid.state.H.data,
+                grid.state.H.data, self.H_prev,
                 self.enthalpy_forcing.E_surface,
                 grid.dx, cp.float32(dt),
                 self.enthalpy_forcing.drain_rate.value,
@@ -452,24 +470,22 @@ class EnthalpyOperators:
             if rel < cfg.relative_tolerance or r < cfg.absolute_tolerance:
                 break
 
-    def set_rhs(self, dt, snapshot=True):
-        """Precompute the forcing array f_E.
+    def set_rhs(self, snapshot=True):
+        """Precompute the external forcing array f_E.
 
         Optionally snapshots E_prev and H_prev from the current state,
-        then precomputes f_E which encodes all E-independent forcing:
+        then precomputes f_E with the genuinely external contributions:
 
-            f_E = rho_i * H_prev * E_prev / dt
-                + H * phi_strain
-                + (Q_geo + Q_fh) / dsig_half  [at k=0 only]
+            f_E = H * phi_strain / E_SCALE
+                + (Q_geo + Q_fh) / (dsig_half * E_SCALE)  [at k=0 only]
 
-        The residual kernel then computes R = F(E) - f_E.
-        On the finest grid, set_rhs is called once per time step.
-        On coarse grids, f_E is overwritten by the FAS defect equation.
+        The conservative time term rho_i*(H*E - H_prev*E_prev)/dt is
+        handled inside the residual kernel by get_time_jac(), so it
+        does NOT appear in f_E. The residual kernel computes
+        R = F(E, E_prev, H, H_prev, dt) - f_E.
 
         Parameters
         ----------
-        dt : float
-            Time step size.
         snapshot : bool
             If True (default), snapshot E_prev and H_prev from the
             current state before computing f_E. Set to False when
@@ -486,16 +502,15 @@ class EnthalpyOperators:
         H = self.grid.state.H.data
         forcing = self.enthalpy_forcing
 
-        # Interior and bed nodes: time forcing + strain heating.
-        # E_prev is in scaled units; phi_strain and heat fluxes are
-        # physical (W/m^2 etc.) and must be divided by E_SCALE.
+        # External forcing: strain heating + basal Neumann fluxes.
+        # The conservative time term (rho_i * H_prev * E_prev / dt) is
+        # handled inside the residual kernel via get_time_jac(), not
+        # here, so f_E carries only the genuinely external contributions.
+        # phi_strain and heat fluxes are physical (W/m^3 and W/m^2);
+        # dividing by E_SCALE matches the residual kernel's scaled units.
         e_scale = cp.float32(E_SCALE)
         for k in range(self.nz - 1):
-            self.f_E[:, :, k] = (
-                RHO_I * self.H_prev * self.enthalpy_state.E_prev[:, :, k]
-                / cp.float32(dt)
-                + H * forcing.phi_strain[:, :, k] / e_scale
-            )
+            self.f_E[:, :, k] = H * forcing.phi_strain[:, :, k] / e_scale
 
         # Bed node (k=0): add Neumann heat flux
         self.f_E[:, :, 0] += (forcing.Q_geo + forcing.Q_fh) / (cp.float32(dsig_half) * e_scale)

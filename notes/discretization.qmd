@@ -26,7 +26,7 @@ The implementation primarily lives in `enthalpy.cu`, where each physical term is
 The discrete equations use the following notation. Symbols inherited from the [derivation note](derivation.qmd) are repeated here for completeness.
 
 | Symbol | Meaning |
-|----------------|---------------------------------------------------------------|
+|-----------------|-------------------------------------------------------|
 | $i, j$ | Horizontal cell indices (cell-centered) |
 | $k$ | Sigma level index ($k=0$ at bed, $k=N_z-1$ at surface) |
 | $n$ | Time-step index |
@@ -416,7 +416,7 @@ The residual kernel returns zero for thin-ice columns so they do not contribute 
 
 ## 9. The Vertical Velocity ($\omega$)
 
-The scaled vertical velocity $\omega = H\dot{\sigma}$ is an input to the enthalpy solver, not computed by it. The enthalpy kernels receive $\omega_{i,j,k}$ as a precomputed $(N_y, N_x, N_z)$ array alongside the horizontal velocity fields $u_{i,j,k}$ and $v_{i,j,k}$. How $\omega$ is produced depends on the momentum model driving the simulation.
+The scaled vertical velocity $\omega = H\dot{\sigma}$ is computed by the enthalpy solver from the horizontal velocity field $(u, v)$ and a thickness tendency $\partial H / \partial t$. It is stored as a precomputed $(N_y, N_x, N_z)$ array, evaluated once per time step by the `compute_omega` kernel, and then read by the residual and smoother kernels alongside the horizontal velocity fields $u_{i,j,k}$ and $v_{i,j,k}$.
 
 The general requirement is that $\omega$ must satisfy the sigma-space continuity equation:
 

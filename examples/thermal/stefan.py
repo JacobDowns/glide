@@ -184,7 +184,7 @@ print(f"  {'-'*82}")
 for step in range(1, max_steps + 1):
     E_old = ops.enthalpy_state.E[i_col, j_col, :].copy()
 
-    ops.set_rhs(dt)
+    ops.set_rhs()
     ops.column_sweep(dt, n_smooth)
 
     E_new = ops.enthalpy_state.E[i_col, j_col, :]

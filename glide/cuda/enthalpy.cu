@@ -143,6 +143,73 @@ float get_v3d(const float* __restrict__ v, int k, int i, int j,
 
 
 /* ---------------------------------------------------------
+   Conservative Time Term (implicit Euler):
+     rho_i * (H * E_k - H_prev * E_prev_k) / dt
+   The Jacobian carries derivatives w.r.t. all four state inputs:
+   the current solver unknown E_k, the cached previous state E_prev_k
+   (frozen during the smoother but live for adjoints), and both
+   thicknesses H and H_prev (also frozen during the smoother).
+   --------------------------------------------------------- */
+struct TimeStencil {
+    float E_k;
+    float E_prev_k;
+    float H;
+    float H_prev;
+    float dt;
+};
+
+struct TimeStencilDual {
+    DualFloat E_k;
+    DualFloat E_prev_k;
+    DualFloat H;
+    DualFloat H_prev;
+    float dt;
+
+    __device__ __forceinline__
+    TimeStencil get_primals() const {
+        return {E_k.v, E_prev_k.v, H.v, H_prev.v, dt};
+    }
+
+    __device__ __forceinline__
+    TimeStencil get_diffs() const {
+        return {E_k.d, E_prev_k.d, H.d, H_prev.d, 0.0f};
+    }
+};
+
+struct TimeJacobian {
+    float res;
+    float d_E_k;
+    float d_E_prev_k;
+    float d_H;
+    float d_H_prev;
+
+    __device__ __forceinline__
+    float apply_jvp(const TimeStencil& dot) const {
+        return d_E_k * dot.E_k + d_E_prev_k * dot.E_prev_k
+             + d_H * dot.H + d_H_prev * dot.H_prev;
+    }
+};
+
+__device__ __forceinline__
+TimeJacobian get_time_jac(TimeStencil s) {
+    TimeJacobian jac = {0};
+    float inv_dt = 1.0f / s.dt;
+    jac.res        =  RHO_I * (s.H * s.E_k - s.H_prev * s.E_prev_k) * inv_dt;
+    jac.d_E_k      =  RHO_I * s.H * inv_dt;
+    jac.d_E_prev_k = -RHO_I * s.H_prev * inv_dt;
+    jac.d_H        =  RHO_I * s.E_k * inv_dt;
+    jac.d_H_prev   = -RHO_I * s.E_prev_k * inv_dt;
+    return jac;
+}
+
+__device__ __forceinline__
+DualFloat get_time_dual(TimeStencilDual s) {
+    TimeJacobian jac = get_time_jac(s.get_primals());
+    return {jac.res, jac.apply_jvp(s.get_diffs())};
+}
+
+
+/* ---------------------------------------------------------
    Vertical Diffusion (conservative form):
      -(1/H) d/dsigma(K dE/dsigma)
    at an interior node k with neighbors k-1, k+1.
@@ -717,12 +784,14 @@ extern "C" __global__
 void enthalpy_compute_residual(
     float* __restrict__ out,            // (ny, nx, nz) output: r_E or F_E
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
+    const float* __restrict__ E_prev,   // (ny, nx, nz) previous-step enthalpy
     const float* __restrict__ f_E,      // (ny, nx, nz) precomputed forcing
 
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity per layer
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity per layer
     const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
     const float* __restrict__ H,        // (ny, nx) ice thickness
+    const float* __restrict__ H_prev,   // (ny, nx) previous-step thickness
     const float* __restrict__ E_surface,// (ny, nx) surface enthalpy BC
     float dx, float dt, float drain_rate, float h_thin, float lf_c,
     int term_flags, int use_forcing,
@@ -758,11 +827,14 @@ void enthalpy_compute_residual(
         }
 
         float E_k = E[ijk];
+        float E_prev_k = E_prev[ijk];
+        float h_prev = H_prev[i * nx + j];
         float sigma_k = k * dsig;
         float E_pmp_k = get_E_pmp(sigma_k, h);
 
-        // --- Operator time term: rho_i * H * E / dt ---
-        float r = RHO_I * h * E_k / dt;
+        // --- Conservative time term: rho_i * (H*E - H_prev*E_prev) / dt ---
+        TimeJacobian time_jac = get_time_jac({E_k, E_prev_k, h, h_prev, dt});
+        float r = time_jac.res;
 
         // --- Horizontal advection: rho_i * div(H*u*E) ---
         if (term_flags & TERM_HORIZ_ADV) {
@@ -861,12 +933,14 @@ extern "C" __global__
 void enthalpy_column_smooth(
     float* __restrict__ delta_E,        // (ny, nx, nz) correction output
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
+    const float* __restrict__ E_prev,   // (ny, nx, nz) previous-step enthalpy
     const float* __restrict__ f_E,      // (ny, nx, nz) precomputed forcing
 
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity
     const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
     const float* __restrict__ H,        // (ny, nx) thickness
+    const float* __restrict__ H_prev,   // (ny, nx) previous-step thickness
     const float* __restrict__ E_surface,// (ny, nx) surface BC
     float dx, float dt, float drain_rate, float h_thin, float lf_c,
     int term_flags,
@@ -895,6 +969,7 @@ void enthalpy_column_smooth(
     }
 
     float h_inv = 1.0f / h;
+    float h_prev = H_prev[i * nx + j];
     float dx_inv = 1.0f / dx;
     float dsig = 1.0f / (float)(nz - 1);
     float E_s = E_surface[i * nx + j];
@@ -921,11 +996,13 @@ void enthalpy_column_smooth(
             }
 
             float E_k = E_local[k];
+            float E_prev_k = E_prev[ijk];
             float sigma_k = k * dsig;
             float E_pmp_k = get_E_pmp(sigma_k, h);
 
-            // --- Operator time term minus forcing ---
-            float r = RHO_I * h * E_k / dt - f_E[ijk];
+            // --- Conservative time term + external forcing ---
+            TimeJacobian time_jac = get_time_jac({E_k, E_prev_k, h, h_prev, dt});
+            float r = time_jac.res - f_E[ijk];
 
             // --- Horizontal advection (conservative, Vanka-style) ---
             float horiz_diag = 0.0f;
@@ -963,7 +1040,7 @@ void enthalpy_column_smooth(
                 }
 
                 a[0] = 0.0f;
-                b[0] = RHO_I * h / dt
+                b[0] = time_jac.d_E_k
                      + diff_jac.d_E_k + adv_jac.d_E_k
                      + drain_jac.d_E_k + horiz_diag;
                 c_arr[0] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
@@ -998,7 +1075,7 @@ void enthalpy_column_smooth(
                 }
 
                 a[k] = diff_jac.d_E_km1 + adv_jac.d_E_km1;
-                b[k] = RHO_I * h / dt
+                b[k] = time_jac.d_E_k
                      + diff_jac.d_E_k + adv_jac.d_E_k
                      + drain_jac.d_E_k + horiz_diag;
                 c_arr[k] = diff_jac.d_E_kp1 + adv_jac.d_E_kp1;
@@ -1052,12 +1129,14 @@ extern "C" __global__
 void enthalpy_layer_smooth(
     float* __restrict__ delta_E,        // (ny, nx, nz) correction output
     const float* __restrict__ E,        // (ny, nx, nz) current enthalpy
+    const float* __restrict__ E_prev,   // (ny, nx, nz) previous-step enthalpy
     const float* __restrict__ f_E,      // (ny, nx, nz) precomputed forcing
 
     const float* __restrict__ u3d,      // (nz, ny, nx+1) x-velocity
     const float* __restrict__ v3d,      // (nz, ny+1, nx) y-velocity
     const float* __restrict__ omega,    // (ny, nx, nz) omega = H*sigma_dot
     const float* __restrict__ H,        // (ny, nx) thickness
+    const float* __restrict__ H_prev,   // (ny, nx) previous-step thickness
     const float* __restrict__ E_surface,// (ny, nx) surface BC
     float dx, float dt, float drain_rate, float h_thin, float lf_c,
     int term_flags,
@@ -1092,12 +1171,15 @@ void enthalpy_layer_smooth(
     float dsig = 1.0f / (float)(nz - 1);
 
     float E_k = E[ijk];
+    float E_prev_k = E_prev[ijk];
+    float h_prev = H_prev[i * nx + j];
     float sigma_k = k * dsig;
     float E_pmp_k = get_E_pmp(sigma_k, h);
 
-    // --- Residual: same computation as enthalpy_compute_residual ---
-    float r = RHO_I * h * E_k / dt - f_E[ijk];
-    float diag = RHO_I * h / dt;
+    // --- Conservative time term + external forcing ---
+    TimeJacobian time_jac = get_time_jac({E_k, E_prev_k, h, h_prev, dt});
+    float r = time_jac.res - f_E[ijk];
+    float diag = time_jac.d_E_k;
 
     // Horizontal advection
     float horiz_diag = 0.0f;

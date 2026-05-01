@@ -115,7 +115,7 @@ print(f"  {'step':>5s}  {'t (yr)':>8s}  {'|r|':>10s}  "
 print(f"  {'-'*55}")
 
 for step in range(1, N_STEPS + 1):
-    ops.set_rhs(DT_SEC)
+    ops.set_rhs()
 
     # Per-sweep residuals for first and last step
     if step == 1 or step == N_STEPS:

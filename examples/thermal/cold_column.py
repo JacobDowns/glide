@@ -83,7 +83,7 @@ snapshots_T[0.0] = E_init / C_I + T_REF
 
 for target_kyr in snapshot_times_kyr[1:]:
     while time_kyr < target_kyr:
-        ops.set_rhs(dt)
+        ops.set_rhs()
         ops.column_sweep(dt, n_smooth)
         step += 1
         time_kyr += dt_kyr

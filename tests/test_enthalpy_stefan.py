@@ -71,7 +71,7 @@ def test_temperate_bed_still_applies_geothermal_flux():
     ops.enthalpy_state.E.fill(E_temperate)
     ops.enthalpy_state.E_prev.fill(E_temperate)
 
-    ops.set_rhs(dt)
+    ops.set_rhs()
     ops.compute_residual(dt)
     bed_residual = float(cp.asnumpy(ops.r_E[ny // 2, nx // 2, 0]))
     dsig_half = 0.5 * float(ops.sigma[1] - ops.sigma[0])
@@ -98,7 +98,7 @@ def test_temperate_bed_is_not_clamped_to_pmp():
     ops.enthalpy_state.E.fill(E_temperate)
     ops.enthalpy_state.E_prev.fill(E_temperate)
 
-    ops.set_rhs(dt)
+    ops.set_rhs()
     ops.column_sweep(dt, 5)
     ops.enthalpy_state.E[:] += ops.smoother_config.omega * ops.delta_E
 
@@ -161,7 +161,7 @@ def test_steady_state_polythermal_profile():
     converged = False
     for step in range(1, max_steps + 1):
         E_old = ops.enthalpy_state.E[i_col, j_col, :].copy()
-        ops.set_rhs(dt)
+        ops.set_rhs()
         ops.column_sweep(dt, 20)
 
         E_new = ops.enthalpy_state.E[i_col, j_col, :]

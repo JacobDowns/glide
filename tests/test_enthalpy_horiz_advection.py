@@ -72,14 +72,14 @@ def test_uniform_E_divergent_velocity():
         ops.enthalpy_velocity.u3d[k, :, :] = u_face_gpu
     ops.enthalpy_velocity.v3d.fill(0)
 
-    ops.set_rhs(dt)
+    ops.set_rhs()
     r0 = float(ops.compute_residual(dt))
     E0 = float(ops.enthalpy_state.E[ny // 2, nx // 2, nz // 2])
     print(f"Uniform E + divergent velocity test:")
     print(f"  E0 = {E0:.1f} J/kg")
     print(f"  Initial residual |r0| = {r0:.2e}")
 
-    ops.set_rhs(dt)
+    ops.set_rhs()
     ops.smoother_config.report_norms = True
     ops.column_sweep(dt, 5)
     ops.smoother_config.report_norms = False
@@ -123,7 +123,7 @@ def test_uniform_velocity_step_profile():
 
     # Run 3 time steps
     for step in range(3):
-        ops.set_rhs(dt)
+        ops.set_rhs()
         ops.column_sweep(dt, 20)
 
     # Check y-symmetry: all rows should be identical
@@ -200,7 +200,7 @@ def test_energy_conservation():
     energy_before = total_energy_interior()
 
     # One time step
-    ops.set_rhs(dt)
+    ops.set_rhs()
     ops.column_sweep(dt, 20)
 
     energy_after = total_energy_interior()

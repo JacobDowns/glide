@@ -197,7 +197,7 @@ class ThermalModel:
             self._compute_frictional_heating()
 
         # Precompute forcing array (E_prev and H_prev set by pre_momentum)
-        ops.set_rhs(dt, snapshot=False)
+        ops.set_rhs(snapshot=False)
 
         # Enthalpy solve
         ops.column_sweep(dt, self.n_smooth)

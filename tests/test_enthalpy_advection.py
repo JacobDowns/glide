@@ -60,7 +60,7 @@ def _run_to_steady_state(ops, max_steps=5000, conv_tol=1e-6):
 
     for step in range(1, max_steps + 1):
         E_old = ops.enthalpy_state.E[i_col, j_col, :].copy()
-        ops.set_rhs(dt)
+        ops.set_rhs()
         ops.column_sweep(dt, 20)
         E_new = ops.enthalpy_state.E[i_col, j_col, :]
         rel = float(cp.max(cp.abs(E_new - E_old))) / (float(cp.max(cp.abs(E_new))) + 1.0)

@@ -11,8 +11,8 @@ where E is the specific enthalpy, H is the ice thickness, omega = H *
 sigma_dot is the scaled vertical velocity, K is the enthalpy diffusivity
 (cold/temperate transition via a sigmoid), phi is an external volumetric
 source (e.g. strain heating), and the last term is meltwater drainage.
-The conserved variable is HE; see notes/derivation.qmd for the
-derivation and notes/discretization.qmd for the discrete scheme.
+The conserved variable is HE; see notes/derivation.md for the
+derivation and notes/discretization.md for the discrete scheme.
 
 Discretization:
     - Horizontal: Lax-Friedrichs finite-volume fluxes on a MAC grid,

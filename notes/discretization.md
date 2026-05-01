@@ -1,11 +1,6 @@
----
-title: "Discretization of the Conservative Enthalpy Equation"
-date: 2026-04-09
-categories: [glaciology, numerical methods, finite volume]
-description: "Finite-volume discretization of the conservative enthalpy equation on a MAC grid with Lax-Friedrichs horizontal fluxes, upwind vertical advection, and a column-wise Newton/Thomas smoother."
----
+# Discretization of the Conservative Enthalpy Equation
 
-This note describes the spatial and temporal discretization of the conservative enthalpy equation derived in [Deriving the Conservative Enthalpy Equation](derivation.qmd). The continuous PDE is:
+This note describes the spatial and temporal discretization of the conservative enthalpy equation derived in [Deriving the Conservative Enthalpy Equation](derivation.md). The continuous PDE is:
 
 $$
 \rho_i \left[
@@ -23,7 +18,7 @@ The implementation primarily lives in `enthalpy.cu`, where each physical term is
 
 ## Notation
 
-The discrete equations use the following notation. Symbols inherited from the [derivation note](derivation.qmd) are repeated here for completeness.
+The discrete equations use the following notation. Symbols inherited from the [derivation note](derivation.md) are repeated here for completeness.
 
 | Symbol | Meaning |
 |-----------------|-------------------------------------------------------|
@@ -70,11 +65,8 @@ The discrete equations use the following notation. Symbols inherited from the [d
 | $\nu$ | Newton iteration index |
 | $\omega_{\text{relax}}$ | Outer-iteration relaxation factor (distinct from the vertical velocity $\omega$) |
 
-::: callout-important
-## Key Design Principle
-
-Every `get_*_jac()` function returns a struct containing both a residual field (`.res`) and its partial derivatives (`.d_E_*`). The residual kernel reads only `.res`; the smoother reads both. Because both paths call the same function, the Jacobian is the exact linearization of the residual (modulo the frozen-$K$ approximation in the diffusion term).
-:::
+> [!IMPORTANT]
+> **Key Design Principle.** Every `get_*_jac()` function returns a struct containing both a residual field (`.res`) and its partial derivatives (`.d_E_*`). The residual kernel reads only `.res`; the smoother reads both. Because both paths call the same function, the Jacobian is the exact linearization of the residual (modulo the frozen-$K$ approximation in the diffusion term).
 
 ## 1. The Computational Grid
 
@@ -147,7 +139,7 @@ The depth-integrated ice sheet equations are structurally identical to the compr
 
 The continuity equation for $H$ *is* conservation of column mass, and the enthalpy equation is a passive scalar transported by that mass flux. This analogy is exact, not approximate — the mathematical structure is identical. Once we recognize this, the entire finite-volume literature for compressible flows with variable density applies directly to the choice of numerical flux.
 
-This analogy also illuminates why the conservative form derived in the [companion note](derivation.qmd) requires the product-rule synthesis of its Section 5. In a compressible flow, a passive scalar $\phi$ does not satisfy its own conservation law — it satisfies only the advective (material derivative) equation $D\phi/Dt = S$, which cannot be put into flux-divergence form. To obtain a conservation law suitable for FVM, one multiplies the scalar equation by $\rho$ and combines it with the continuity equation via the product rule:
+This analogy also illuminates why the conservative form derived in the [companion note](derivation.md) requires the product-rule synthesis of its Section 5. In a compressible flow, a passive scalar $\phi$ does not satisfy its own conservation law — it satisfies only the advective (material derivative) equation $D\phi/Dt = S$, which cannot be put into flux-divergence form. To obtain a conservation law suitable for FVM, one multiplies the scalar equation by $\rho$ and combines it with the continuity equation via the product rule:
 
 $$
 \rho \frac{D\phi}{Dt} + \phi\!\left(\frac{\partial \rho}{\partial t} + \nabla \cdot (\rho \mathbf{u})\right) = \frac{\partial(\rho\phi)}{\partial t} + \nabla \cdot (\rho \mathbf{u} \phi).

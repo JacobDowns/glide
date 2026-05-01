@@ -1,9 +1,4 @@
----
-title: "Deriving the Conservative Enthalpy Equation in Sigma Coordinates"
-date: 2026-04-09
-categories: [glaciology, numerical methods, finite volume]
-description: "A derivation of the conservative enthalpy equation in sigma coordinates, motivated by the analogy to compressible-flow tracer transport and the requirements of the finite-volume method."
----
+# Deriving the Conservative Enthalpy Equation in Sigma Coordinates
 
 This note derives a flux-divergence form of the enthalpy equation in terrain-following sigma coordinates. The motivation is straightforward: ice sheets need a vertical coordinate that follows the moving free surface, but the natural change of variables breaks the conservation property of the enthalpy equation. To put it back, we borrow a standard procedure from compressible-flow finite-volume methods that promotes a specific (per-unit-mass) scalar into a conserved (density-weighted) quantity via the continuity equation. In the ice-sheet context, the ice thickness $H$ plays the role of density and the specific enthalpy $E$ plays the role of a passive tracer carried by the flow.
 
@@ -33,19 +28,16 @@ The following symbols recur throughout this note:
 | $\varpi(E)$ | Water content (liquid mass fraction in temperate ice) | – |
 | $E_{\text{pmp}}(\sigma)$ | Enthalpy at the pressure melting point | J/kg |
 
-::: callout-important
-## Key Result
-
-To guarantee energy conservation on a moving grid, the conserved FVM quantity is not the specific enthalpy $E$, but the thickness-weighted quantity $HE$. The resulting conservative equation is:
-
-$$
-\frac{\partial (HE)}{\partial t}
-+ \frac{\partial (HEu)}{\partial x}
-+ \frac{\partial (HEv)}{\partial y}
-+ \frac{\partial}{\partial \sigma} \left( E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right)
-= \frac{H\Phi}{\rho} - \frac{H \rho_w}{\rho} L \, r_d \, \varpi(E).
-$$
-:::
+> [!IMPORTANT]
+> **Key Result.** To guarantee energy conservation on a moving grid, the conserved FVM quantity is not the specific enthalpy $E$, but the thickness-weighted quantity $HE$. The resulting conservative equation is:
+>
+> $$
+> \frac{\partial (HE)}{\partial t}
+> + \frac{\partial (HEu)}{\partial x}
+> + \frac{\partial (HEv)}{\partial y}
+> + \frac{\partial}{\partial \sigma} \left( E\omega - \frac{\kappa}{H} \frac{\partial E}{\partial \sigma} \right)
+> = \frac{H\Phi}{\rho} - \frac{H \rho_w}{\rho} L \, r_d \, \varpi(E).
+> $$
 
 ## 1. Motivation: Sigma Coordinates and the Conservation Problem
 
@@ -413,7 +405,7 @@ By absorbing the column thickness $H$ into the derivatives, the computational gr
 
 It's worth emphasizing that the connection to compressible flow is useful in two distinct ways. First, it gives us a clean derivation: the same product-rule trick that promotes a specific scalar to a conserved one in compressible CFD works here for promoting $E$ to $HE$, and it tells us what the right conservation variable is. Second, and just as importantly, it lets us reach for off-the-shelf numerical methods.
 
-Once the equation is in the same form as a passive scalar transported by a compressible flow, we can use the discretization techniques developed for that setting — particularly the factored mass-flux form of the numerical flux, where the mass flux $Hu$ acts as the wave speed for upwinding $E$. This is the standard structure of an HLLC-type Riemann solver for a passive scalar. The constraint that the numerical dissipation should act on $E$ alone, not on the product $HE$, was formalized by Abgrall (1996); see the [companion discretization note](discretization.qmd) for how it shapes the implementation.
+Once the equation is in the same form as a passive scalar transported by a compressible flow, we can use the discretization techniques developed for that setting — particularly the factored mass-flux form of the numerical flux, where the mass flux $Hu$ acts as the wave speed for upwinding $E$. This is the standard structure of an HLLC-type Riemann solver for a passive scalar. The constraint that the numerical dissipation should act on $E$ alone, not on the product $HE$, was formalized by Abgrall (1996); see the [companion discretization note](discretization.md) for how it shapes the implementation.
 
 The sigma-coordinate machinery in Sections 3–4 is the glaciology-specific part of the derivation; the algebraic move in Section 6 and the discretization that follows are both inherited from the compressible-flow literature.
 

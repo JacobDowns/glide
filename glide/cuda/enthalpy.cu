@@ -12,7 +12,7 @@
 
    The conservative form tracks depth-integrated enthalpy HE,
    ensuring exact energy conservation under grid deformation.
-   See notes/derivation.qmd for the derivation and notes/discretization.qmd
+   See notes/derivation.md for the derivation and notes/discretization.md
    for the discretization details.
 
    Discretization:

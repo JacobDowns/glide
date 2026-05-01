@@ -1,16 +1,11 @@
----
-title: "Verification Tests for the Enthalpy Solver"
-date: 2026-05-01
-categories: [glaciology, numerical methods, verification]
-description: "Analytical and semi-analytical reference solutions used to verify the conservative enthalpy solver. Covers cold-column diffusion, advection-diffusion column, polythermal Stefan, horizontal advection, and conservation tests."
----
+# Verification Tests for the Enthalpy Solver
 
 This note documents the verification tests in `tests/`. Each test reduces a piece of the conservative enthalpy equation to a controlled setting where an analytical (or semi-analytical) reference solution exists, and compares the solver output against it.
 
 The tests fall into four categories:
 
 | Category | Test file | What it verifies |
-|----------|-----------|-------------------|
+|------------------|--------------------|----------------------------------|
 | Pure diffusion | `test_enthalpy_cold_column.py` | Vertical diffusion + Neumann bed BC |
 | Advection–diffusion | `test_enthalpy_advection.py` | Sigma advection + diffusion column |
 | Polythermal | `test_enthalpy_stefan.py` | Cold/temperate transition, drainage, latent heat |
@@ -57,7 +52,7 @@ The temperature increases linearly from the surface down to the bed, with slope 
 
 ### What the Test Verifies
 
-1.  **Steady-state diffusion accuracy.** Run the column smoother forward in time until convergence and compare the final $E(\sigma)$ against the linear analytical profile. Tolerance: relative error < 5×10⁻³ in enthalpy.
+1.  **Steady-state diffusion accuracy.** Run the column smoother forward in time until convergence and compare the final $E(\sigma)$ against the linear analytical profile. Tolerance: relative error \< 5×10⁻³ in enthalpy.
 
 2.  **Residual convergence.** A second test (`test_cold_column_residual_convergence`) confirms that the residual $\|R\|_\infty$ decreases by at least 100× over 50 smoothing sweeps from a uniform initial condition. This validates the column smoother as a convergent iterative solver.
 
@@ -108,17 +103,7 @@ For $Pe = -5$ (downward advection), the profile is exponential: warm at the bed,
 
 ### What the Test Verifies
 
-The model is run with the prescribed constant $\omega$ to steady state, and the converged column profile is compared against the analytical exponential. Tolerance: relative enthalpy error < 2%, max temperature error consistent with the discretization order.
-
-### Skipped: Robin / Error-Function Profile
-
-A second test (`test_robin_advection_diffusion`) is documented but skipped. It prescribes $\dot{\sigma}(\sigma) = -(SMB/H)\sigma$, which has the analytical solution
-
-$$
-E(\sigma) = E_s + \frac{H\, Q_{\text{geo}}}{K_{\text{cold}}} \sqrt{\frac{\pi}{2\, Pe_R}}\,\bigl[\mathrm{erf}(\sqrt{Pe_R/2}) - \mathrm{erf}(\sigma\sqrt{Pe_R/2})\bigr]
-$$
-
-with $Pe_R = \rho_i\, SMB\, H / K_{\text{cold}}$. The test is skipped because the prescribed $\omega$ has $d\omega/d\sigma \neq 0$, which is inconsistent with the conservative continuity equation under constant $H$ — the conservative form correctly captures this inconsistency via the $E\,d\omega/d\sigma$ term, so the comparison is not meaningful without an evolving-$H$ benchmark.
+The model is run with the prescribed constant $\omega$ to steady state, and the converged column profile is compared against the analytical exponential. Tolerance: relative enthalpy error \< 2%, max temperature error consistent with the discretization order.
 
 ## 3. Polythermal Stefan Column
 
@@ -165,9 +150,9 @@ The full test suite contains three checks:
 
 1.  **Geothermal flux is preserved at temperate base** (`test_temperate_bed_still_applies_geothermal_flux`). With $E$ uniform and above $E_{\text{pmp}}$ everywhere, the only nonzero residual at the bed should equal the Neumann flux contribution $-Q_{\text{geo}}/(\Delta\sigma_{\text{half}}\, E_{\text{SCALE}})$. This validates that the bed BC is applied even when the basal ice is temperate.
 
-2.  **No hard clamping at $E_{\text{pmp}}$** (`test_temperate_bed_is_not_clamped_to_pmp`). After smoothing from a temperate state with continued heating, the basal $E$ must remain *above* $E_{\text{pmp}}$. This confirms that the solver tracks latent heat (water content) rather than truncating at the melting point.
+2.  **No hard clamping at** $E_{\text{pmp}}$ (`test_temperate_bed_is_not_clamped_to_pmp`). After smoothing from a temperate state with continued heating, the basal $E$ must remain *above* $E_{\text{pmp}}$. This confirms that the solver tracks latent heat (water content) rather than truncating at the melting point.
 
-3.  **Steady-state polythermal profile** (`test_steady_state_polythermal_profile`). Run with adaptive $\Delta t$ to convergence and compare against the semi-analytical two-zone profile and basal water content. Tolerances: temperature error < 0.1 K, enthalpy relative error < 2%, basal water content relative error < 2%.
+3.  **Steady-state polythermal profile** (`test_steady_state_polythermal_profile`). Run with adaptive $\Delta t$ to convergence and compare against the semi-analytical two-zone profile and basal water content. Tolerances: temperature error \< 0.1 K, enthalpy relative error \< 2%, basal water content relative error \< 2%.
 
 ## 4. Horizontal Advection
 
@@ -191,7 +176,7 @@ This is **physically correct**: it captures the fact that the control volume cha
 
 ### 4.2 y-Symmetry Preservation
 
-Initialize a 1D step profile $E(x) = E_{\text{cold}}$ for $x < x_{\text{step}}$, $E_{\text{warm}}$ otherwise, with uniform rightward velocity $u > 0$ and $v = 0$. The setup is invariant in $y$, so all rows must remain identical at all times. After three time steps, the test asserts that the maximum spread across rows of any column is < 1 J/kg.
+Initialize a 1D step profile $E(x) = E_{\text{cold}}$ for $x < x_{\text{step}}$, $E_{\text{warm}}$ otherwise, with uniform rightward velocity $u > 0$ and $v = 0$. The setup is invariant in $y$, so all rows must remain identical at all times. After three time steps, the test asserts that the maximum spread across rows of any column is \< 1 J/kg.
 
 This is sensitive to any directional bias in the discretization: if the y-flux convention or the column-smoother sweep order treats rows asymmetrically, the test fails.
 
@@ -199,7 +184,7 @@ This is sensitive to any directional bias in the discretization: if the y-flux c
 
 For uniform $H$, uniform $u$, no sources, and a smooth sinusoidal $E(x)$, the conservative form $\partial_t(HE) + \partial_x(HuE) = 0$ guarantees that internal fluxes telescope: the flux leaving cell $i$ at face $i + 1/2$ equals the flux entering cell $i+1$ at the same face. Summed over interior cells, only boundary fluxes contribute to the change in total energy.
 
-The test measures $\sum_{\text{interior}} H_{i,j}\, E_{i,j,k}$ before and after one time step (excluding the first/last two rows and columns to avoid boundary effects, and the surface Dirichlet layer). Tolerance: relative change < 1% (the residual comes from boundary effects and the LF dissipation, not from the divergence operator itself, which conserves to machine precision).
+The test measures $\sum_{\text{interior}} H_{i,j}\, E_{i,j,k}$ before and after one time step (excluding the first/last two rows and columns to avoid boundary effects, and the surface Dirichlet layer). Tolerance: relative change \< 1% (the residual comes from boundary effects and the LF dissipation, not from the divergence operator itself, which conserves to machine precision).
 
 ## 5. Pre-Momentum Snapshot Consistency
 
@@ -227,7 +212,7 @@ This guards against an easy-to-miss bug: if the snapshot is taken *after* the mo
 
 The tests are standalone scripts (not pytest fixtures). Run individually:
 
-```bash
+``` bash
 python tests/test_enthalpy_cold_column.py
 python tests/test_enthalpy_advection.py
 python tests/test_enthalpy_stefan.py

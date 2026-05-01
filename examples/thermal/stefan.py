@@ -22,6 +22,7 @@ temperate layer.
 import cupy as cp
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from scipy.optimize import brentq
 from glide.grid import Grid
 from glide.enthalpy import (
@@ -46,6 +47,9 @@ max_steps = 50000       # upper bound on total steps
 log_interval = 500      # print every N steps
 
 SEC_PER_KYR = 1000.0 * 365.25 * 86400.0
+
+OUT_DIR = Path(__file__).parent / 'stefan_output'
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========================================================
 # Grid and operator setup
@@ -273,6 +277,7 @@ fig.suptitle(f'Polythermal Column: Steady State  |  '
              f'max T err = {max_T_err:.2e} K, max E rel err = {max_E_rel:.2e}',
              fontsize=12)
 plt.tight_layout()
-plt.savefig('examples/thermal/stefan.png', dpi=150)
+out = OUT_DIR / 'stefan.png'
+plt.savefig(out, dpi=150)
 plt.show()
-print(f"\nSaved: examples/thermal/stefan.png")
+print(f"\nSaved: {out}")

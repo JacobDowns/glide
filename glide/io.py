@@ -20,9 +20,16 @@ def _pretty_xml(element):
     return minidom.parseString(ET.tostring(element)).toprettyxml(indent="  ")
 
 
-def write_vti(filename, data, dx, dy=None, origin=(0.0, 0.0), time_value=None, flip_y=True):
+def write_vti(filename, data, dx, dy=None, dz=None, origin=(0.0, 0.0),
+              time_value=None, flip_y=True):
     """
     Write fields to VTI (VTK ImageData) binary format.
+
+    Supports both 2D and 3D fields. The dimensionality is detected from
+    the first field's array shape: 2D arrays of shape ``(ny, nx)`` produce
+    a flat ImageData (z-extent 0); 3D arrays of shape ``(ny, nx, nz)``
+    produce a full 3D ImageData. All fields in a single call must have
+    the same dimensionality.
 
     Parameters
     ----------
@@ -30,14 +37,16 @@ def write_vti(filename, data, dx, dy=None, origin=(0.0, 0.0), time_value=None, f
         Output filename
     data : dict
         Dictionary mapping field names to data. Values can be:
-        - CuPy/NumPy array: scalar field
-        - List of arrays: vector field components
+        - CuPy/NumPy array: scalar field, 2D ``(ny, nx)`` or 3D ``(ny, nx, nz)``
+        - List of arrays: vector field components (2D only)
     dx : float
         Grid spacing in x
     dy : float, optional
         Grid spacing in y (defaults to dx)
+    dz : float, optional
+        Grid spacing in z; required for 3D output
     origin : tuple
-        Grid origin (x, y)
+        Grid origin: ``(x, y)`` for 2D or ``(x, y, z)`` for 3D
     time_value : float, optional
         Time value for this snapshot
     flip_y : bool
@@ -64,20 +73,49 @@ def write_vti(filename, data, dx, dy=None, origin=(0.0, 0.0), time_value=None, f
                 arr = np.flip(arr, axis=0)
             scalars[name] = arr
 
-    # Get grid dimensions
+    # Determine dimensionality from the first field
     if scalars:
         first_field = next(iter(scalars.values()))
     else:
         first_field = next(iter(vectors.values()))[0]
-    ny, nx = first_field.shape
+
+    if first_field.ndim == 2:
+        is_3d = False
+        ny, nx = first_field.shape
+        nz = 1
+    elif first_field.ndim == 3:
+        is_3d = True
+        ny, nx, nz = first_field.shape
+        if dz is None:
+            raise ValueError("dz must be provided for 3D output (got 3D field with shape "
+                             f"{first_field.shape})")
+        if vectors:
+            raise NotImplementedError("Vector fields are only supported in 2D mode.")
+    else:
+        raise ValueError(f"Field arrays must be 2D or 3D; got shape {first_field.shape}")
+
+    # Validate all fields have the same dimensionality
+    for name, arr in scalars.items():
+        if arr.ndim != first_field.ndim:
+            raise ValueError(f"Field '{name}' has shape {arr.shape}; expected "
+                             f"{'3D' if is_3d else '2D'} like the first field.")
+
+    # Normalize origin to a 3-tuple
+    if len(origin) == 2:
+        origin3 = (float(origin[0]), float(origin[1]), 0.0)
+    else:
+        origin3 = (float(origin[0]), float(origin[1]), float(origin[2]))
+
+    extent = f"0 {nx-1} 0 {ny-1} 0 {nz-1}"
+    spacing = f"{dx} {dy} {dz if is_3d else 1.0}"
 
     # Build XML
     root = ET.Element("VTKFile", type="ImageData", version="1.0", byte_order="LittleEndian")
     img = ET.SubElement(root, "ImageData",
-                        WholeExtent=f"0 {nx-1} 0 {ny-1} 0 0",
-                        Origin=f"{origin[0]} {origin[1]} 0",
-                        Spacing=f"{dx} {dy} 1.0")
-    piece = ET.SubElement(img, "Piece", Extent=f"0 {nx-1} 0 {ny-1} 0 0")
+                        WholeExtent=extent,
+                        Origin=f"{origin3[0]} {origin3[1]} {origin3[2]}",
+                        Spacing=spacing)
+    piece = ET.SubElement(img, "Piece", Extent=extent)
 
     if time_value is not None:
         fd = ET.SubElement(piece, "FieldData")
@@ -99,6 +137,12 @@ def write_vti(filename, data, dx, dy=None, origin=(0.0, 0.0), time_value=None, f
     offset = 0
 
     for name, arr in scalars.items():
+        # ParaView ImageData expects x-fastest ordering (loop z outermost,
+        # then y, then x). Our 3D arrays are stored as (ny, nx, nz) in
+        # C-order (z fastest); transpose to (nz, ny, nx) so C-order ravel
+        # produces the right layout.
+        if arr.ndim == 3:
+            arr = arr.transpose(2, 0, 1)
         arr_bytes = arr.ravel(order='C').tobytes()
         ET.SubElement(pd, "DataArray",
                       type="Float32", Name=name,
@@ -152,10 +196,19 @@ class VTIWriter:
     - call :meth:`initialize` once
     - call :meth:`append` for each dynamic snapshot
 
-    Field mappings may contain either scalar fields/constants or vectors. Vectors
-    are specified as lists/tuples of fields, e.g. ``{"U": [grid.state.u,
-    grid.state.v]}``. Vector components are collocated to cell centers via each
-    field's ``to_cell()`` method before writing.
+    Field mappings may contain scalar fields/constants, vectors, or callables.
+    Vectors are specified as lists/tuples of fields, e.g.
+    ``{"U": [grid.state.u, grid.state.v]}``; vector components are collocated to
+    cell centers via each field's ``to_cell()`` method before writing.
+    Callables (e.g. ``{"T": lambda: thermal.temperature}``) are evaluated at
+    write time, which is convenient for derived quantities that produce a fresh
+    array on each access.
+
+    Both 2D and 3D fields are supported; the dimensionality is inferred from
+    the field shapes at write time. For 3D output (fields of shape
+    ``(ny, nx, nz)``), the writer requires ``dz`` to be set. All fields in a
+    single writer must have the same dimensionality — to write both surface
+    (2D) and volumetric (3D) data, create two writers.
     """
 
     out_dir: str | Path
@@ -164,7 +217,8 @@ class VTIWriter:
     base: str = "output"
     dx: float = 1.0
     dy: float | None = None
-    origin: tuple[float, float] = (0.0, 0.0)
+    dz: float | None = None
+    origin: tuple = (0.0, 0.0)
     flip_y: bool = True
 
     _step_idx: int = field(default=0, init=False, repr=False)
@@ -236,8 +290,9 @@ class VTIWriter:
             fpath,
             data,
             self.dx,
-            self.dy,
-            self.origin,
+            dy=self.dy,
+            dz=self.dz,
+            origin=self.origin,
             time_value=None,
             flip_y=self.flip_y,
         )
@@ -263,8 +318,9 @@ class VTIWriter:
             fpath,
             data,
             self.dx,
-            self.dy,
-            self.origin,
+            dy=self.dy,
+            dz=self.dz,
+            origin=self.origin,
             time_value=time_value,
             flip_y=self.flip_y,
         )
@@ -308,6 +364,13 @@ class VTIWriter:
         return self._coerce_scalar_value(value)
 
     def _coerce_scalar_value(self, value: Any) -> Any:
+        # Callables are evaluated at write time. This lets users pass
+        # derived quantities (e.g. lambda: thermal.temperature) that
+        # produce a fresh array each call rather than a stale reference.
+        if callable(value) and not hasattr(value, "data"):
+            value = value()
+        if isinstance(value, (np.ndarray, cp.ndarray)):
+            return value
         if hasattr(value, "to_cell"):
             return value.to_cell().data
         if hasattr(value, "data"):
@@ -315,6 +378,10 @@ class VTIWriter:
         return value
 
     def _coerce_vector_component(self, value: Any) -> Any:
+        if callable(value) and not hasattr(value, "data"):
+            value = value()
+        if isinstance(value, (np.ndarray, cp.ndarray)):
+            return value
         if hasattr(value, "to_cell"):
             return value.to_cell().data
         if hasattr(value, "data"):

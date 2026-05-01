@@ -64,7 +64,8 @@ N_SMOOTH = 20
 SEC_PER_YR = 365.25 * 86400.0
 DT_SEC = DT_YR * SEC_PER_YR
 
-OUT_DIR = Path('examples/thermal')
+OUT_DIR = Path(__file__).parent / 'valley_glacier_output'
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========================================================
 # Build valley bed topography

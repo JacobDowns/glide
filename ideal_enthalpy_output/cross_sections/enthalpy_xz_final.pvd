@@ -1,6 +1,0 @@
-<?xml version="1.0" ?>
-<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">
-  <Collection>
-    <DataSet timestep="1000000.0" group="" part="0" file="enthalpy_xz_final_0000.vts"/>
-  </Collection>
-</VTKFile>

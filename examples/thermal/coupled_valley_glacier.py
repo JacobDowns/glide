@@ -71,7 +71,8 @@ DT_YR = 5.0
 N_STEPS = 100              
 SEC_PER_YR = 365.25 * 86400.0
 
-OUT_DIR = Path('examples/thermal')
+OUT_DIR = Path(__file__).parent / 'coupled_valley_glacier_output'
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========================================================
 # Build valley bed topography

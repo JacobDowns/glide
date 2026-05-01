@@ -13,6 +13,7 @@ profile for both temperature and enthalpy.
 import cupy as cp
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 from glide.grid import Grid
 from glide.enthalpy import (
@@ -32,6 +33,9 @@ nz = 21
 dt = 1000.0 * 365.25 * 86400.0   # 1000 yr in seconds
 n_smooth = 20
 snapshot_times_kyr = [0, 5, 20, 50, 100, 200]  # kyr
+
+OUT_DIR = Path(__file__).parent / 'cold_column_output'
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========================================================
 # Grid and operator setup
@@ -151,6 +155,7 @@ ax_E_err.text(0.95, 0.05, f'Max error: {max_E_err:.2f} J/kg',
 
 fig.suptitle('Cold Column: Steady-State Diffusion', fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('examples/thermal/cold_column.png', dpi=150)
+out = OUT_DIR / 'cold_column.png'
+plt.savefig(out, dpi=150)
 plt.show()
-print(f"\nSaved: examples/thermal/cold_column.png")
+print(f"\nSaved: {out}")

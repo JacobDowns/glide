@@ -58,7 +58,7 @@ DT_YR = 5.0
 N_STEPS = 50
 SEC_PER_YR = 365.25 * 86400.0
 
-OUT_DIR = Path('column_only_dome_output')
+OUT_DIR = Path(__file__).parent / 'column_only_dome_output'
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ========================================================

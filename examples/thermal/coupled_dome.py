@@ -70,7 +70,7 @@ N_STEPS = 50
 SEC_PER_YR = 365.25 * 86400.0
 
 # Output
-OUT_DIR = Path('coupled_dome_output')
+OUT_DIR = Path(__file__).parent / 'coupled_dome_output'
 
 # ========================================================
 # Build dome geometry
@@ -171,13 +171,42 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 if HAS_VTI:
     origin = (float(x[0]), float(y[0]))
-    vti_writer = VTIWriter(
-        out_dir=str(OUT_DIR / 'vti'),
+
+    # 2D: surface / depth-averaged fields. Mirrors the momentum-solver
+    # pattern used in examples/bitterroot, examples/antarctica, etc.
+    vti_2d = VTIWriter(
+        out_dir=str(OUT_DIR / 'vti_2d'),
         base='dome',
         dx=dx,
         origin=origin,
+        static_fields={
+            'bed': grid.geometry.bed,
+        },
+        dynamic_fields={
+            'H': grid.state.H,
+            'U': [grid.state.u, grid.state.v],
+            'B': grid.rheology.B,
+            'T_bed': lambda: thermal.temperature[:, :, 0],
+        },
     )
-    (OUT_DIR / 'vti').mkdir(parents=True, exist_ok=True)
+    vti_2d.initialize(grid)
+
+    # 3D: volumetric thermal fields. Sigma is the third axis with
+    # uniform spacing dz = 1/(NZ-1). Origin z=0 is the bed.
+    vti_3d = VTIWriter(
+        out_dir=str(OUT_DIR / 'vti_3d'),
+        base='dome_thermal',
+        dx=dx,
+        dz=1.0 / (NZ - 1),
+        origin=(*origin, 0.0),
+        dynamic_fields={
+            'E': thermal.ops.enthalpy_state.E,
+            'T': lambda: thermal.temperature,
+            'omega_3d': thermal.ops.enthalpy_velocity.omega,
+            'water_content': lambda: thermal.water_content,
+        },
+    )
+    vti_3d.initialize(None)
 
 # ========================================================
 # Time stepping
@@ -323,18 +352,12 @@ for step in range(N_STEPS):
             'v': cp.asnumpy(grid.state.v.data).copy(),
         }
 
-    # --- Write VTI snapshot ---
+    # --- Write VTI snapshots ---
     if (step + 1) % 10 == 0 and HAS_VTI:
-        T_bed_2d = cp.asnumpy(thermal.temperature[:, :, 0])
-        B_2d = cp.asnumpy(grid.rheology.B.data)
-        snapshot = {
-            'H': H_np,
-            'speed': speed,
-            'T_bed': T_bed_2d,
-            'B': B_2d,
-        }
-        vti_writer.write_step(step + 1, t_yr, snapshot)
-        vti_writer.write_pvd()
+        vti_2d.append(grid, time=t_yr)
+        vti_2d.write_pvd()
+        vti_3d.append(None, time=t_yr)
+        vti_3d.write_pvd()
 
 print(f"\n  Done. {N_STEPS} steps, final t = {t_yr:.0f} yr")
 

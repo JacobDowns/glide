@@ -47,6 +47,9 @@ DT_SEC = DT_YR * SEC_PER_YR
 N_STEPS = 100
 N_SMOOTH = 20
 
+OUT_DIR = Path(__file__).parent / 'horizontal_advection_output'
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
 # ========================================================
 # Grid and operator setup
 # ========================================================
@@ -187,7 +190,7 @@ fig.suptitle(f'Horizontal Advection: u = {U_MYR} m/yr, '
              fontsize=13, fontweight='bold')
 plt.tight_layout()
 
-out = Path('examples/thermal/horizontal_advection.png')
+out = OUT_DIR / 'horizontal_advection.png'
 plt.savefig(out, dpi=150)
 plt.show()
 print(f"  Saved: {out}")

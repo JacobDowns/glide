@@ -1,8 +1,8 @@
 """
-Generate the column discretization diagram for column_smoother.md.
+Generate the column discretization diagram for the discretization note.
 
 Run:
-    cd docs/figures && python column_grid.py
+    cd notes/figures && python column_grid.py
 """
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches

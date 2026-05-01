@@ -12,7 +12,8 @@
 
    The conservative form tracks depth-integrated enthalpy HE,
    ensuring exact energy conservation under grid deformation.
-   See docs/conservation.md for the derivation.
+   See notes/derivation.qmd for the derivation and notes/discretization.qmd
+   for the discretization details.
 
    Discretization:
    - Horizontal: Lax-Friedrichs finite volume on MAC grid

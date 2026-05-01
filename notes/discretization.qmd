@@ -1,6 +1,11 @@
-# Discretization of the Conservative Enthalpy Equation
+---
+title: "Discretization of the Conservative Enthalpy Equation"
+date: 2026-04-09
+categories: [glaciology, numerical methods, finite volume]
+description: "Finite-volume discretization of the conservative enthalpy equation on a MAC grid with Lax-Friedrichs horizontal fluxes, upwind vertical advection, and a column-wise Newton/Thomas smoother."
+---
 
-This note describes the spatial and temporal discretization of the conservative enthalpy equation derived in [Deriving the Conservative Enthalpy Equation](derivation.md). The continuous PDE is:
+This note describes the spatial and temporal discretization of the conservative enthalpy equation derived in [Deriving the Conservative Enthalpy Equation](derivation.qmd). The continuous PDE is:
 
 $$
 \rho_i \left[
@@ -18,7 +23,7 @@ The implementation primarily lives in `enthalpy.cu`, where each physical term is
 
 ## Notation
 
-The discrete equations use the following notation. Symbols inherited from the [derivation note](derivation.md) are repeated here for completeness.
+The discrete equations use the following notation. Symbols inherited from the [derivation note](derivation.qmd) are repeated here for completeness.
 
 | Symbol | Meaning |
 |-----------------|-------------------------------------------------------|
@@ -65,8 +70,11 @@ The discrete equations use the following notation. Symbols inherited from the [d
 | $\nu$ | Newton iteration index |
 | $\omega_{\text{relax}}$ | Outer-iteration relaxation factor (distinct from the vertical velocity $\omega$) |
 
-> [!IMPORTANT]
-> **Key Design Principle.** Every `get_*_jac()` function returns a struct containing both a residual field (`.res`) and its partial derivatives (`.d_E_*`). The residual kernel reads only `.res`; the smoother reads both. Because both paths call the same function, the Jacobian is the exact linearization of the residual (modulo the frozen-$K$ approximation in the diffusion term).
+::: callout-important
+## Key Design Principle
+
+Every `get_*_jac()` function returns a struct containing both a residual field (`.res`) and its partial derivatives (`.d_E_*`). The residual kernel reads only `.res`; the smoother reads both. Because both paths call the same function, the Jacobian is the exact linearization of the residual (modulo the frozen-$K$ approximation in the diffusion term).
+:::
 
 ## 1. The Computational Grid
 
@@ -117,9 +125,7 @@ where superscript $n$ denotes the current time level and $n-1$ the previous. Thi
 
 Because both $H$ and $E$ are evaluated at their respective time levels, this form conserves total energy exactly even when the ice thickness changes between time steps. If the thickness were frozen (i.e., $R^{\text{time}} = \rho_i H^n (E^n_k - E^{n-1}_k)/\Delta t$), energy would leak whenever $H$ changes — precisely the deficiency that the conservative formulation was designed to eliminate.
 
-The Jacobian contribution is purely diagonal:
-
-$$
+The Jacobian contribution is purely diagonal: $$
 \frac{\partial R^{\text{time}}}{\partial E_k} = \frac{\rho_i H}{\Delta t}.
 $$
 
@@ -141,7 +147,7 @@ The depth-integrated ice sheet equations are structurally identical to the compr
 
 The continuity equation for $H$ *is* conservation of column mass, and the enthalpy equation is a passive scalar transported by that mass flux. This analogy is exact, not approximate — the mathematical structure is identical. Once we recognize this, the entire finite-volume literature for compressible flows with variable density applies directly to the choice of numerical flux.
 
-This analogy also illuminates why the conservative form derived in the [companion note](derivation.md) requires the product-rule synthesis of its Section 5. In a compressible flow, a passive scalar $\phi$ does not satisfy its own conservation law — it satisfies only the advective (material derivative) equation $D\phi/Dt = S$, which cannot be put into flux-divergence form. To obtain a conservation law suitable for FVM, one multiplies the scalar equation by $\rho$ and combines it with the continuity equation via the product rule:
+This analogy also illuminates why the conservative form derived in the [companion note](derivation.qmd) requires the product-rule synthesis of its Section 5. In a compressible flow, a passive scalar $\phi$ does not satisfy its own conservation law — it satisfies only the advective (material derivative) equation $D\phi/Dt = S$, which cannot be put into flux-divergence form. To obtain a conservation law suitable for FVM, one multiplies the scalar equation by $\rho$ and combines it with the continuity equation via the product rule:
 
 $$
 \rho \frac{D\phi}{Dt} + \phi\!\left(\frac{\partial \rho}{\partial t} + \nabla \cdot (\rho \mathbf{u})\right) = \frac{\partial(\rho\phi)}{\partial t} + \nabla \cdot (\rho \mathbf{u} \phi).
@@ -153,17 +159,14 @@ This is exactly the procedure used in the derivation to convert from the advecti
 
 In compressible-flow FVM, it is well known that applying a standard Riemann solver (e.g., Rusanov/Lax-Friedrichs) independently to the conserved variable $\rho\phi$ produces spurious numerical diffusion at contact discontinuities — interfaces where $\rho$ jumps but the scalar $\phi$ is uniform. Abgrall (1996) formalized the requirement: *a uniform scalar must remain uniform regardless of what the density does*. The same issue arises here with $H$ and $E$.
 
-Two approaches are possible. The first is a *naive conserved-variable approach*: treat $HE$ as a single conserved variable and apply dissipation to it directly,
+Two approaches are possible:
 
-$$
-F^{\text{naive}} = \tfrac{1}{2}u(H_L E_L + H_R E_R) - \tfrac{1}{2}\alpha(H_R E_R - H_L E_L).
-$$
-
-The second is a *factored mass-flux approach*: compute the mass flux $F^m$ first, then upwind only the specific quantity $E$ using that mass flux as the wave speed,
-
-$$
-F = F^m \cdot \hat{E}(E_L, E_R).
-$$
+1.  **Naive conserved-variable approach.** Treat $HE$ as a single conserved variable and apply dissipation to it directly: $$
+    F^{\text{naive}} = \tfrac{1}{2}u(H_L E_L + H_R E_R) - \tfrac{1}{2}\alpha(H_R E_R - H_L E_L).
+    $$
+2.  **Factored mass-flux approach.** Compute the mass flux $F^m$ first, then upwind only the specific quantity $E$ using that mass flux as the wave speed: $$
+    F = F^m \cdot \hat{E}(E_L, E_R).
+    $$
 
 The naive approach violates Abgrall's condition. Suppose $E$ is uniform ($E_L = E_R = E_0$) but $H$ varies across a face. The naive dissipation term $-\tfrac{1}{2}\alpha(H_R E_R - H_L E_L) = -\tfrac{1}{2}\alpha E_0 (H_R - H_L)$ is nonzero — the $H$ gradient alone generates spurious numerical diffusion of enthalpy. In the factored form, $F = F^m \cdot E_0$ regardless of the thickness gradient. The dissipation acts only on $\nabla E$, never on $\nabla H$.
 
@@ -528,15 +531,11 @@ The sub-diagonal $a_k$ and super-diagonal $c_k$ carry only the vertical coupling
 
 The tridiagonal system is solved by forward elimination followed by back substitution — an $O(N_z)$ direct solve:
 
-Forward elimination ($k = 1, \ldots, N_z-1$):
-
-$$
+**Forward elimination** ($k = 1, \ldots, N_z-1$): $$
 w = a_k / b_{k-1}, \qquad b_k \leftarrow b_k - w \, c_{k-1}, \qquad \text{rhs}_k \leftarrow \text{rhs}_k - w \, \text{rhs}_{k-1}.
 $$
 
-Back substitution ($k = N_z - 2, \ldots, 0$):
-
-$$
+**Back substitution** ($k = N_z - 2, \ldots, 0$): $$
 \delta E_k = (\text{rhs}_k - c_k \, \delta E_{k+1}) / b_k.
 $$
 

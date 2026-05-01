@@ -53,7 +53,7 @@ $$
 
 Ice sheets sit on bedrock with a free upper surface that rises and falls as the ice flows and melts. To work with this geometry cleanly on a regular computational grid, models sometimes adopt a terrain-following coordinate $\sigma = (z - b)/H$, scaled so the bed is at $\sigma = 0$ and the surface at $\sigma = 1$. The grid index space is fixed as the column thickens or thins; the physical grid stretches with the ice.
 
-This is a natural fit for ice sheets, but the change of variables comes with a cost. The advective form of the enthalpy equation maps cleanly into sigma coordinates, but doing so
+This is a natural fit for ice sheets, but the change of variables comes with a cost. The advective form of the enthalpy equation maps cleanly into sigma coordinates, but doing so renders it in a form unsuitable for finite volume methods.
 
 ### The finite-volume requirement
 

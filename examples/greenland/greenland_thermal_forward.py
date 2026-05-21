@@ -44,19 +44,20 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
 # Parameters
 # ========================================================
 # Thermal forcing
-T_SEA_LEVEL = 268.15      # K  (~ -5 C at sea level)
+T_SEA_LEVEL = 278.15      # K  
 LAPSE_RATE  = -6.5e-3     # K/m (atmospheric lapse rate)
-Q_GEO       = 0.05        # W/m^2 (uniform geothermal flux, ~Greenland mean)
+Q_GEO       = 0.01        # W/m^2 (uniform geothermal flux, ~Greenland mean)
 
 # Enthalpy solver
-NZ          = 11          # sigma levels
-N_SMOOTH    = 20          # max column-sweep iterations per step
+NZ          = 9          # sigma levels
+N_SMOOTH    = 30          # max column-sweep iterations per step
 H_THIN      = 25.0        # m, columns thinner than this are clamped to T_surf
 
 # Spin-up / time stepping
 N_SPINUP    = 5           # momentum-only steps before thermal coupling
 DT_YR       = 10.0        # years per step (start small; can be made dynamic later)
-T_END       = 1000.0      # years
+T_END       = 2000.0      # years
+VTI_INTERVAL_YR = 100.0   # write VTI output every N years
 SEC_PER_YR  = 365.25 * 86400.0
 
 # Path to optimized beta (set to None to use a uniform value)
@@ -169,7 +170,8 @@ vti_2d = VTIWriter('thermal_forward/vti_2d/', base='greenland', dx=mg[0].dx,
                         'mask': mg[0].state.mask,
                         'B': mg[0].rheology.B,
                         'T_bed':  lambda: thermal.temperature[:, :, 0],
-                        'T_surf': lambda: thermal.temperature[:, :, -1]})
+                        'T_surf': lambda: thermal.temperature[:, :, -1],
+                        'T_avg':  lambda: thermal.temperature.mean(axis=2)})
 vti_2d.initialize(mg[0])
 
 vti_3d = VTIWriter('thermal_forward/vti_3d/', base='greenland_thermal',
@@ -308,7 +310,7 @@ axes[1, 1].grid(True, alpha=0.3)
 
 fig.suptitle('Coupled Greenland Forward Run', fontsize=14, fontweight='bold')
 plt.tight_layout()
-fig.savefig(out_dir / 'summary_timeseries.png', dpi=150)
+fig.savefig(out_dir / 'summary_timeseries.png', dpi=300)
 print(f"Saved: {out_dir / 'summary_timeseries.png'}")
 
 # --- Final-state maps ---
@@ -323,6 +325,9 @@ ice_mask = H_np < 1.0
 T_bed_np = np.where(ice_mask, np.nan, T_bed_np)
 speed_plot = np.where(ice_mask, np.nan, speed_np)
 
+T_vmin = float(np.nanmin(T_bed_np))
+T_vmax = float(np.nanmax(T_bed_np))
+
 fig2, axes2 = plt.subplots(2, 2, figsize=(12, 10))
 for ax, data, title, cmap in [
     (axes2[0, 0], H_np,       'Thickness (m)',      'cividis'),
@@ -332,15 +337,18 @@ for ax, data, title, cmap in [
 ]:
     if 'log' in title:
         from matplotlib.colors import LogNorm
-        im = ax.imshow(np.maximum(data, 1.0), origin='lower', cmap=cmap,
+        im = ax.imshow(np.maximum(data, 1.0), origin='upper', cmap=cmap,
                        norm=LogNorm(vmin=1.0, vmax=max(10.0, np.nanmax(data))))
+    elif 'Basal temperature' in title:
+        im = ax.imshow(data, origin='upper', cmap=cmap,
+                       vmin=T_vmin, vmax=T_vmax)
     else:
-        im = ax.imshow(data, origin='lower', cmap=cmap)
+        im = ax.imshow(data, origin='upper', cmap=cmap)
     fig2.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     ax.set_title(title)
     ax.set_aspect('equal')
 
 fig2.suptitle(f'Final state at t = {float(t):.0f} yr', fontsize=14, fontweight='bold')
 plt.tight_layout()
-fig2.savefig(out_dir / 'summary_final_maps.png', dpi=150)
+fig2.savefig(out_dir / 'summary_final_maps.png', dpi=300)
 print(f"Saved: {out_dir / 'summary_final_maps.png'}")

@@ -42,6 +42,13 @@ viz/
 inverse_output/
 inverse_results/
 
+# Simulation result directories
+inverse/
+thermal_forward/
+forward/
+*.zarr/
+*.pvd
+
 # Data files (download separately)
 *.nc
 *.tif

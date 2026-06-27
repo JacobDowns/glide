@@ -46,7 +46,7 @@ from glide.enthalpy import T_MELT, BETA_CC, RHO_I, GRAVITY
 # Thermal forcing
 T_SEA_LEVEL = 278.15      # K  
 LAPSE_RATE  = -6.5e-3     # K/m (atmospheric lapse rate)
-Q_GEO       = 0.01        # W/m^2 (uniform geothermal flux, ~Greenland mean)
+Q_GEO       = 0.005        # W/m^2 (uniform geothermal flux, ~Greenland mean)
 
 # Enthalpy solver
 NZ          = 9          # sigma levels

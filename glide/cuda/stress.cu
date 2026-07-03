@@ -237,6 +237,7 @@ struct TauBxJacobian {
     float d_v_tl,d_v_tr,d_v_bl,d_v_br;
     float d_H_l, d_H_r;
     float d_beta_l, d_beta_r;
+    float d_m;
 
     __device__ __forceinline__
     float apply_jvp(const TauBxStencil& dot) const {
@@ -275,6 +276,8 @@ TauBxJacobian get_tau_bx_jac(
     jac.d_v_br = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_br);
     jac.d_beta_l = -0.5f * grounded_l * unorm_sq_pow * s.u;
     jac.d_beta_r = -0.5f * grounded_r * unorm_sq_pow * s.u;
+    // d(tau_bx^slide)/dm; the water_drag term has no m-dependence.
+    jac.d_m = -beta_eff * unorm_sq_pow * s.u * 0.5f * logf(unorm_sq + s.u_reg);
     return jac;
 }
 
@@ -325,6 +328,7 @@ struct TauByJacobian {
     float d_u_tl,d_u_tr,d_u_bl,d_u_br;
     float d_H_t, d_H_b;
     float d_beta_t, d_beta_b;
+    float d_m;
 
     __device__ __forceinline__
     float apply_jvp(const TauByStencil& dot) const {
@@ -364,6 +368,8 @@ TauByJacobian get_tau_by_jac(
     jac.d_u_br = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_br);
     jac.d_beta_t = -0.5f * grounded_t * unorm_sq_pow * s.v;
     jac.d_beta_b = -0.5f * grounded_b * unorm_sq_pow * s.v;
+    // d(tau_by^slide)/dm; the water_drag term has no m-dependence.
+    jac.d_m = -beta_eff * unorm_sq_pow * s.v * 0.5f * logf(unorm_sq + s.u_reg);
 
     return jac;
 }

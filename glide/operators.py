@@ -539,7 +539,41 @@ class AdjointOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value,
                 calving.calving_rate.value, calving.flotation_reg_calving.value,
                 grid.dx, cp.float32(0.0),
-                grid.ny, grid.nx, stride, halo)) 
+                grid.ny, grid.nx, stride, halo))
+
+    def compute_gradient_m(self):
+        """Gradient w.r.t. the global Weertman exponent m (a single scalar).
+        Contracts the adjoint state with d(tau_b)/dm over all momentum facets and
+        stores the reduced value on sliding.m.grad."""
+        kernel = self.kernels.get_function('compute_gradient_m')
+        grid_size, block_size, stride, halo = self._kernel_config
+
+        grid = self.grid
+        state = grid.state
+        adjoint = grid.adjoint
+        geometry = grid.geometry
+        rheology = grid.rheology
+        sliding = grid.sliding
+        calving = grid.calving
+
+        grad_m = cp.zeros(1, dtype=cp.float32)
+        kernel(grid_size, block_size,
+               (grad_m,
+                state.u.data, state.v.data, state.H.data,
+                adjoint.lambda_u.data, adjoint.lambda_v.data, adjoint.lambda_H.data,
+                state.phi.data, state.mask.data,
+                geometry.bed.data,
+                rheology.B.data,
+                sliding.beta.data,
+                self.gamma,
+                rheology.n.value, rheology.eps_reg.value,
+                geometry.sigmoid_c.value,
+                sliding.m.value, sliding.u_reg.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                calving.calving_rate.value, calving.flotation_reg_calving.value,
+                grid.dx, cp.float32(0.0),
+                grid.ny, grid.nx, stride, halo))
+        sliding.m.grad = float(grad_m[0])
 
     def compute_gradient_bed(self):
         kernel = self.kernels.get_function('compute_gradient_bed')

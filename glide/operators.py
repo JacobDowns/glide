@@ -106,13 +106,13 @@ class ForwardOperators:
                 self.f_u, self.f_v, self.f_H,
                 geometry.bed.data, 
                 rheology.B.data, 
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 use_forcing,use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
@@ -153,13 +153,13 @@ class ForwardOperators:
                 self.f_u, self.f_v, self.f_H,
                 geometry.bed.data, 
                 rheology.B.data, 
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
@@ -210,13 +210,13 @@ class ForwardOperators:
                 state.u.data, state.v.data, state.H.data, 
                 state.phi.data,
                 self.f_u, self.f_v, self.f_H,
-                geometry.bed.data, rheology.B.data, sliding.beta.data, 
+                geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data, 
                 self.gamma,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
                 sliding.water_drag.value, 
-                sliding.flotation_reg_sliding.value,
+                sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, 
                 calving.flotation_reg_calving.value,
                 grid.dx, dt,
@@ -248,9 +248,9 @@ class ForwardOperators:
                (J,r,
                 grid.state.u.data, grid.state.v.data, grid.state.H.data, grid.state.phi.data,
                 self.f_u, self.f_v, self.f_H,
-                grid.geometry.bed.data, grid.rheology.B.data, grid.sliding.beta.data, self.gamma,
+                grid.geometry.bed.data, grid.rheology.B.data, grid.sliding.beta.data, grid.sliding.u_c.data, self.gamma,
                 grid.rheology.n.value, grid.rheology.eps_reg.value, grid.geometry.sigmoid_c.value,
-                grid.sliding.m.value, grid.sliding.u_reg.value, grid.sliding.water_drag.value, grid.sliding.flotation_reg_sliding.value,
+                grid.sliding.m.value, grid.sliding.u_reg.value, grid.sliding.water_drag.value, grid.sliding.flotation_reg_sliding.value, grid.sliding.sliding_law.value,
                 grid.calving.calving_rate.value, grid.calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo,
@@ -397,13 +397,13 @@ class AdjointOperators:
                 self.f_u, self.f_v, self.f_H,
                 geometry.bed.data, 
                 rheology.B.data, 
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 use_forcing, use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
@@ -447,13 +447,13 @@ class AdjointOperators:
                 self.f_u, self.f_v, self.f_H,
                 geometry.bed.data, 
                 rheology.B.data, 
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 use_forcing, use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
@@ -486,13 +486,13 @@ class AdjointOperators:
                 state.u.data, state.v.data, state.H.data, 
                 state.phi.data, state.mask.data,
                 self.r_u, self.r_v, self.r_H,
-                geometry.bed.data, rheology.B.data, sliding.beta.data, 
+                geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data, 
                 self.gamma,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
                 sliding.water_drag.value, 
-                sliding.flotation_reg_sliding.value,
+                sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, 
                 calving.flotation_reg_calving.value,
                 grid.dx, dt,
@@ -531,12 +531,12 @@ class AdjointOperators:
                 state.phi.data, state.mask.data,
                 geometry.bed.data, 
                 rheology.B.data, 
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving.calving_rate.value, calving.flotation_reg_calving.value,
                 grid.dx, cp.float32(0.0),
                 grid.ny, grid.nx, stride, halo))
@@ -564,16 +564,47 @@ class AdjointOperators:
                 state.phi.data, state.mask.data,
                 geometry.bed.data,
                 rheology.B.data,
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 rheology.n.value, rheology.eps_reg.value,
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value,
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving.calving_rate.value, calving.flotation_reg_calving.value,
                 grid.dx, cp.float32(0.0),
                 grid.ny, grid.nx, stride, halo))
         sliding.m.grad = float(grad_m[0])
+
+    def compute_gradient_u_c(self):
+        kernel = self.kernels.get_function('compute_gradient_u_c')
+        grid_size, block_size, stride, halo = self._kernel_config
+
+        grid = self.grid
+        state = grid.state
+        adjoint = grid.adjoint
+        geometry = grid.geometry        
+        rheology = grid.rheology
+        sliding = grid.sliding
+        calving = grid.calving
+        forcing = grid.forcing
+
+        sliding.u_c.grad.fill(0)
+        kernel(grid_size, block_size,
+               (sliding.u_c.grad,
+                state.u.data, state.v.data, state.H.data, 
+                adjoint.lambda_u.data, adjoint.lambda_v.data, adjoint.lambda_H.data, 
+                state.phi.data, state.mask.data,
+                geometry.bed.data, 
+                rheology.B.data, 
+                sliding.beta.data, sliding.u_c.data,
+                self.gamma,
+                rheology.n.value, rheology.eps_reg.value, 
+                geometry.sigmoid_c.value,
+                sliding.m.value, sliding.u_reg.value, 
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
+                calving.calving_rate.value, calving.flotation_reg_calving.value,
+                grid.dx, cp.float32(0.0),
+                grid.ny, grid.nx, stride, halo))
 
     def compute_gradient_bed(self):
         kernel = self.kernels.get_function('compute_gradient_bed')
@@ -596,12 +627,12 @@ class AdjointOperators:
                 state.phi.data, state.mask.data,
                 geometry.bed.data, 
                 rheology.B.data, 
-                sliding.beta.data,
+                sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, sliding.flotation_reg_sliding.value,
+                sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving.calving_rate.value, calving.flotation_reg_calving.value,
                 grid.dx, cp.float32(0.0),
                 grid.ny, grid.nx, stride, halo)) 

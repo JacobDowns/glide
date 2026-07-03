@@ -206,6 +206,8 @@ struct TauBxStencil {
     float u_reg;
     float water_drag;
     float flotation_reg_sliding;
+    float u_c_l, u_c_r;
+    float sliding_law;
 };
 
 struct TauBxStencilDual {
@@ -218,15 +220,17 @@ struct TauBxStencilDual {
     float u_reg;
     float water_drag;
     float flotation_reg_sliding;
+    float u_c_l, u_c_r;
+    float sliding_law;
 
     __device__ __forceinline__
     TauBxStencil get_primals() const {
-        return {u.v,v_tl.v,v_tr.v,v_bl.v,v_br.v,H_l.v,H_r.v,phi_l,phi_r,beta_l,beta_r,m,u_reg,water_drag,flotation_reg_sliding};
+        return {u.v,v_tl.v,v_tr.v,v_bl.v,v_br.v,H_l.v,H_r.v,phi_l,phi_r,beta_l,beta_r,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_r,sliding_law};
     }
 
     __device__ __forceinline__
     TauBxStencil get_diffs() const {
-        return {u.d,v_tl.d,v_tr.d,v_bl.d,v_br.d,H_l.d,H_r.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        return {u.d,v_tl.d,v_tr.d,v_bl.d,v_br.d,H_l.d,H_r.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
     }
 
 };
@@ -238,6 +242,7 @@ struct TauBxJacobian {
     float d_H_l, d_H_r;
     float d_beta_l, d_beta_r;
     float d_m;
+    float d_u_c_l, d_u_c_r;
 
     __device__ __forceinline__
     float apply_jvp(const TauBxStencil& dot) const {
@@ -265,19 +270,41 @@ TauBxJacobian get_tau_bx_jac(
     float beta_eff = 0.5f*(beta_eff_l + beta_eff_r);
 
     float unorm_sq = s.u * s.u + 0.25f*(s.v_tl * s.v_tl + s.v_tr * s.v_tr + s.v_bl * s.v_bl + s.v_br * s.v_br);
-    float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
-    float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
 
-    jac.res = -(beta_eff * unorm_sq_pow + s.water_drag)* s.u;
-    jac.d_u = -(beta_eff * (2.0f * unorm_sq_deriv * s.u * s.u + unorm_sq_pow) + s.water_drag);
-    jac.d_v_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tl);
-    jac.d_v_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tr);
-    jac.d_v_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_bl);
-    jac.d_v_br = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_br);
-    jac.d_beta_l = -0.5f * grounded_l * unorm_sq_pow * s.u;
-    jac.d_beta_r = -0.5f * grounded_r * unorm_sq_pow * s.u;
-    // d(tau_bx^slide)/dm; the water_drag term has no m-dependence.
-    jac.d_m = -beta_eff * unorm_sq_pow * s.u * 0.5f * logf(unorm_sq + s.u_reg);
+    if (s.sliding_law < 0.5f) {
+        // ---- Weertman power law (default; unchanged) ----
+        float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
+        float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
+
+        jac.res = -(beta_eff * unorm_sq_pow + s.water_drag)* s.u;
+        jac.d_u = -(beta_eff * (2.0f * unorm_sq_deriv * s.u * s.u + unorm_sq_pow) + s.water_drag);
+        jac.d_v_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tl);
+        jac.d_v_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_tr);
+        jac.d_v_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_bl);
+        jac.d_v_br = -beta_eff * (0.5f * unorm_sq_deriv * s.u * s.v_br);
+        jac.d_beta_l = -0.5f * grounded_l * unorm_sq_pow * s.u;
+        jac.d_beta_r = -0.5f * grounded_r * unorm_sq_pow * s.u;
+        // d(tau_bx^slide)/dm; the water_drag term has no m-dependence.
+        jac.d_m = -beta_eff * unorm_sq_pow * s.u * 0.5f * logf(unorm_sq + s.u_reg);
+    } else {
+        // ---- Regularized Coulomb: |tau_b| = tau_max*|u|/(|u|+u_c), tau_max = beta ----
+        float speed = sqrtf(unorm_sq + s.u_reg);
+        float u_c = 0.5f*(s.u_c_l + s.u_c_r);
+        float D = speed + u_c;
+        float C = beta_eff / D;
+        float f = beta_eff / (D * D * speed);          // shared factor for velocity derivs
+
+        jac.res = -(C + s.water_drag) * s.u;
+        jac.d_u = -(C + s.water_drag) + f * s.u * s.u;
+        jac.d_v_tl = f * s.u * 0.25f * s.v_tl;
+        jac.d_v_tr = f * s.u * 0.25f * s.v_tr;
+        jac.d_v_bl = f * s.u * 0.25f * s.v_bl;
+        jac.d_v_br = f * s.u * 0.25f * s.v_br;
+        jac.d_beta_l = -0.5f * grounded_l * s.u / D;    // d/d(tau_max)
+        jac.d_beta_r = -0.5f * grounded_r * s.u / D;
+        jac.d_u_c_l = 0.5f * beta_eff * s.u / (D * D);
+        jac.d_u_c_r = 0.5f * beta_eff * s.u / (D * D);
+    }
     return jac;
 }
 
@@ -297,6 +324,8 @@ struct TauByStencil {
     float u_reg;
     float water_drag;
     float flotation_reg_sliding;
+    float u_c_t, u_c_b;
+    float sliding_law;
 };
 
 struct TauByStencilDual {
@@ -309,15 +338,17 @@ struct TauByStencilDual {
     float u_reg;
     float water_drag;
     float flotation_reg_sliding;
+    float u_c_t, u_c_b;
+    float sliding_law;
 
     __device__ __forceinline__
     TauByStencil get_primals() const {
-        return {v.v,u_tl.v,u_tr.v,u_bl.v,u_br.v,H_t.v,H_b.v,phi_t,phi_b,beta_t,beta_b,m,u_reg,water_drag,flotation_reg_sliding};
+        return {v.v,u_tl.v,u_tr.v,u_bl.v,u_br.v,H_t.v,H_b.v,phi_t,phi_b,beta_t,beta_b,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_b,sliding_law};
     }
 
     __device__ __forceinline__
     TauByStencil get_diffs() const {
-        return {v.d,u_tl.d,u_tr.d,u_bl.d,u_br.d,H_t.d,H_t.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+        return {v.d,u_tl.d,u_tr.d,u_bl.d,u_br.d,H_t.d,H_t.d,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
     }
 
 };
@@ -329,6 +360,7 @@ struct TauByJacobian {
     float d_H_t, d_H_b;
     float d_beta_t, d_beta_b;
     float d_m;
+    float d_u_c_t, d_u_c_b;
 
     __device__ __forceinline__
     float apply_jvp(const TauByStencil& dot) const {
@@ -357,19 +389,41 @@ TauByJacobian get_tau_by_jac(
     float beta_eff = 0.5f*(beta_eff_t + beta_eff_b);
 
     float unorm_sq = s.v * s.v + 0.25f*(s.u_tl * s.u_tl + s.u_tr * s.u_tr + s.u_bl * s.u_bl + s.u_br * s.u_br);
-    float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
-    float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
 
-    jac.res = -(beta_eff * unorm_sq_pow + s.water_drag) * s.v;
-    jac.d_v = -(beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow) + s.water_drag);
-    jac.d_u_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tl);
-    jac.d_u_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tr);
-    jac.d_u_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_bl);
-    jac.d_u_br = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_br);
-    jac.d_beta_t = -0.5f * grounded_t * unorm_sq_pow * s.v;
-    jac.d_beta_b = -0.5f * grounded_b * unorm_sq_pow * s.v;
-    // d(tau_by^slide)/dm; the water_drag term has no m-dependence.
-    jac.d_m = -beta_eff * unorm_sq_pow * s.v * 0.5f * logf(unorm_sq + s.u_reg);
+    if (s.sliding_law < 0.5f) {
+        // ---- Weertman power law (default; unchanged) ----
+        float unorm_sq_pow = __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f);
+        float unorm_sq_deriv = (s.m - 1.0f)/2.0f * __powf(unorm_sq + s.u_reg,(s.m - 1.0f)/2.0f - 1.0f);
+
+        jac.res = -(beta_eff * unorm_sq_pow + s.water_drag) * s.v;
+        jac.d_v = -(beta_eff * (2.0f * unorm_sq_deriv * s.v * s.v + unorm_sq_pow) + s.water_drag);
+        jac.d_u_tl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tl);
+        jac.d_u_tr = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_tr);
+        jac.d_u_bl = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_bl);
+        jac.d_u_br = -beta_eff * (0.5f * unorm_sq_deriv * s.v * s.u_br);
+        jac.d_beta_t = -0.5f * grounded_t * unorm_sq_pow * s.v;
+        jac.d_beta_b = -0.5f * grounded_b * unorm_sq_pow * s.v;
+        // d(tau_by^slide)/dm; the water_drag term has no m-dependence.
+        jac.d_m = -beta_eff * unorm_sq_pow * s.v * 0.5f * logf(unorm_sq + s.u_reg);
+    } else {
+        // ---- Regularized Coulomb: |tau_b| = tau_max*|u|/(|u|+u_c), tau_max = beta ----
+        float speed = sqrtf(unorm_sq + s.u_reg);
+        float u_c = 0.5f*(s.u_c_t + s.u_c_b);
+        float D = speed + u_c;
+        float C = beta_eff / D;
+        float f = beta_eff / (D * D * speed);
+
+        jac.res = -(C + s.water_drag) * s.v;
+        jac.d_v = -(C + s.water_drag) + f * s.v * s.v;
+        jac.d_u_tl = f * s.v * 0.25f * s.u_tl;
+        jac.d_u_tr = f * s.v * 0.25f * s.u_tr;
+        jac.d_u_bl = f * s.v * 0.25f * s.u_bl;
+        jac.d_u_br = f * s.v * 0.25f * s.u_br;
+        jac.d_beta_t = -0.5f * grounded_t * s.v / D;
+        jac.d_beta_b = -0.5f * grounded_b * s.v / D;
+        jac.d_u_c_t = 0.5f * beta_eff * s.v / (D * D);
+        jac.d_u_c_b = 0.5f * beta_eff * s.v / (D * D);
+    }
 
     return jac;
 }

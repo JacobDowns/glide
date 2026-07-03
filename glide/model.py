@@ -62,7 +62,7 @@ class IceDynamics:
     def backward(self,t,dt,dJdu=None,dJdv=None,dJdH=None,
             compute_beta_grad=True,compute_bed_grad=True,
             compute_H_prev_grad=True,compute_smb_grad=True,
-            compute_m_grad=False):
+            compute_m_grad=False,compute_u_c_grad=False):
         if dJdu is not None:
             self.mg.levels[self.top_level].adjoint_operators.f_u[:,:] = -dJdu
         else:
@@ -83,6 +83,8 @@ class IceDynamics:
         self.mg.levels[self.top_level].adjoint_operators.compute_gradient_smb()
         if compute_m_grad:
             self.mg.levels[self.top_level].adjoint_operators.compute_gradient_m()
+        if compute_u_c_grad:
+            self.mg.levels[self.top_level].adjoint_operators.compute_gradient_u_c()
 
         return converged
         

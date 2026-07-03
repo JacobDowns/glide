@@ -87,6 +87,14 @@ class Rheology:
 @dataclass
 class Sliding:
     beta: Field | None = None
+    u_c: Field | None = None          # regularized-Coulomb rate-transition speed (unused by Weertman)
+    sliding_law: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(0.0),
+            name='sliding_law',
+            units='',
+            attrs={'long_name':'0 = Weertman power law, 1 = regularized Coulomb'})
+        )
     m: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(1.0),
@@ -122,7 +130,7 @@ class Sliding:
 
 
     def __repr__(self):
-        return f'{self.beta.compact_string}\n{self.m}\n{self.u_reg}\n{self.water_drag}\n{self.flotation_reg_sliding}'
+        return f'{self.beta.compact_string}\n{self.sliding_law}\n{self.m}\n{self.u_reg}\n{self.water_drag}\n{self.flotation_reg_sliding}'
 
 @dataclass
 class Calving:
@@ -374,9 +382,18 @@ class Grid:
             grid=self,
             name='beta',
             units='?',
-            attrs={'long_name':'Basal sliding coefficient'})
+            attrs={'long_name':'Basal sliding coefficient (Weertman beta / Coulomb tau_max)'})
 
-        return Sliding(beta=beta)
+        u_c = Field(
+            data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=self.dx,
+            grid=self,
+            name='u_c',
+            units='m a^{-1}',
+            attrs={'long_name':'Regularized-Coulomb rate-transition speed'})
+
+        return Sliding(beta=beta, u_c=u_c)
 
     def _allocate_calving(self):
         return Calving()

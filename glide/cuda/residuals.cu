@@ -18,10 +18,11 @@ void compute_residual(
     const float* __restrict__ bed,
     const float* __restrict__ B,
     const float* __restrict__ beta,
+    const float* __restrict__ u_c,
     const float* __restrict__ gamma,
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
-    float m, float u_reg, float water_drag, float flotation_reg_sliding,     
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
@@ -196,8 +197,10 @@ void compute_residual(
 	    float phi_l = get_cell(phi,i,j-1,ny,nx);
 	    float phi_c = get_cell(phi,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
+	    float u_c_l = get_cell(u_c,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
+	    float u_c_c = get_cell(u_c,i,j,ny,nx);
+	    TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
 	    ru_l += tau_bx.res;
 	    }
 
@@ -305,9 +308,11 @@ void compute_residual(
 	    float phi_t = get_cell(phi,i-1,j,ny,nx);
 	    float phi_c = get_cell(phi,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
+	    float u_c_t = get_cell(u_c,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
+	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
-	    TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
+	    TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
 	    rv_t += tau_by.res;
 	    }
 
@@ -356,10 +361,11 @@ void compute_jvp(
     const float* __restrict__ bed,
     const float* __restrict__ B,
     const float* __restrict__ beta,
+    const float* __restrict__ u_c,
     const float* __restrict__ gamma,
     bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
-    float m, float u_reg, float water_drag, float flotation_reg_sliding,     
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
@@ -527,8 +533,10 @@ void compute_jvp(
 	    float phi_l  = get_cell(phi,i,j-1,ny,nx);
 	    float phi_c  = get_cell(phi,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
+	    float u_c_l = get_cell(u_c,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
+	    float u_c_c = get_cell(u_c,i,j,ny,nx);
+	    DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
 	    d_ru_l += tau_bx.d;
 	    }
 
@@ -634,9 +642,11 @@ void compute_jvp(
 	    float phi_t      = get_cell(phi,i-1,j,ny,nx);
 	    float phi_c      = get_cell(phi,i,j,ny,nx);
 	    float beta_t     = get_cell(beta,i-1,j,ny,nx);
+	    float u_c_t = get_cell(u_c,i-1,j,ny,nx);
 	    float beta_c     = get_cell(beta,i,j,ny,nx);
+	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
-	    DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
+	    DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
 	    d_rv_t += tau_by.d;
 	    }
 
@@ -682,10 +692,11 @@ void compute_vjp(
     const float* __restrict__ bed,
     const float* __restrict__ B,
     const float* __restrict__ beta,
+    const float* __restrict__ u_c,
     const float* __restrict__ gamma,
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
-    float m, float u_reg, float water_drag, float flotation_reg_sliding,     
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
@@ -918,8 +929,10 @@ void compute_vjp(
 	    float phi_l  = get_cell(phi,i,j-1,ny,nx);
 	    float phi_c  = get_cell(phi,i,j,ny,nx);
 	    float beta_l = get_cell(beta,i,j-1,ny,nx);
+	    float u_c_l = get_cell(u_c,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
-	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
+	    float u_c_c = get_cell(u_c,i,j,ny,nx);
+	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
 
 
 	    float lambda_u_l = get_vfacet(lambda_u,i,j,ny,nx);
@@ -1077,9 +1090,11 @@ void compute_vjp(
 	    float phi_t  = get_cell(phi,i-1,j,ny,nx);
 	    float phi_c  = get_cell(phi,i,j,ny,nx);
 	    float beta_t = get_cell(beta,i-1,j,ny,nx);
+	    float u_c_t = get_cell(u_c,i-1,j,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
+	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
-	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
+	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
 	    
 	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
 	    

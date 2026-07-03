@@ -435,6 +435,20 @@ class MGSlidingManager:
             name="beta",
         )
 
+        self.u_c = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.u_c,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="u_c",
+        )
+
+        self.sliding_law = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.sliding_law,
+            restrict=lambda f,c: c.set(f.value),
+            name="sliding_law",
+        )
+
         self.m = HierarchyFieldManager(
             mg.levels,
             getter=lambda g: g.sliding.m,

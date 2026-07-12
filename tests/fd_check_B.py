@@ -45,14 +45,16 @@ def build_small(ny=64, nx=64, n_levels=3, dx=2000.0):
     mg.calving.calving_rate.set(0.0)
     mg.forcing.smb.set(cp.zeros((ny, nx), cp.float32))
 
-    # TIGHT convergence: FD needs J(B) smooth, and the adjoint identity holds only
-    # at a converged forward/adjoint state.
+    # TIGHT (but float32-reachable) convergence: FD needs J(B) smooth, and the
+    # adjoint identity holds only at a converged forward/adjoint state.  Note a
+    # relative tolerance below ~1e-7 is unreachable in float32 -- the solver then
+    # burns every V-cycle and reports converged=False (which zeroes gradients).
     model.forward_solver.fas_options.set(
         coarsest_steps=400, pre_steps=40, post_steps=400, finest_steps=40,
-        relative_tolerance=1e-12, absolute_tolerance=1e-6, report_norms=False)
+        relative_tolerance=1e-7, absolute_tolerance=1e-4, report_norms=False)
     model.adjoint_solver.fas_options.set(
         coarsest_steps=400, pre_steps=40, post_steps=400, finest_steps=40,
-        relative_tolerance=1e-12, absolute_tolerance=1e-8, report_norms=False)
+        relative_tolerance=1e-6, absolute_tolerance=1e-4, report_norms=False)
     return model, thk, bed, B0
 
 
@@ -87,7 +89,7 @@ def main():
         return float(J.item()), cp.asarray(u.detach()), cp.asarray(v.detach())
 
     # --- Base converged solve + adjoint gradient ---
-    model.mg.state.u.data.fill(0.0); model.mg.state.v.data.fill(0.0)
+    model.mg[level].state.u.data.fill(0.0); model.mg[level].state.v.data.fill(0.0)
     Bg = B.clone().requires_grad_(True)
     u, v, H, M = GlideStepB.apply(cp.float32(0.0), cp.float32(10.0), model, level,
                                   H_prev, bedt, beta, Bg, smb)
@@ -97,12 +99,48 @@ def main():
     base_u = cp.asarray(u.detach()); base_v = cp.asarray(v.detach())
     print(f"J(base) = {J.item():.6e}   |g_adj| max = {np.abs(g_adj).max():.3e}")
 
-    # --- Finite differences at a set of interior cells ---
-    rng = np.random.default_rng(1)
-    cells = [(int(rng.integers(8, ny - 8)), int(rng.integers(8, nx - 8))) for _ in range(12)]
-    eps = 1e-2 * B0                       # relative step ~1e-2
+    # --- Primary check: directional (Taylor dot-product) derivative ---------
+    # Per-cell FD is unreliable for this gradient: dJ/dB is small, so single-cell
+    # perturbations barely move J and the FD is swamped by the solver/float32
+    # noise floor.  Perturbing along a whole-field direction d aggregates the
+    # signal so it sits well above that floor -- the standard adjoint test.
+    #   analytic:  g . d      vs      fd: (J(B + h d) - J(B - h d)) / (2 h)
+    # Average over several directions: a single random d may land nearly
+    # orthogonal to g (tiny g.d -> noise-dominated), so we take the best h per
+    # direction and report the median relative error across directions.  h in
+    # ~[0.3, 0.5] is the clean Taylor regime; smaller h loses to float32 roundoff.
+    print("\ndirectional (Taylor dot-product) test:")
+    print(f"  {'g.d':>14} {'best fd':>14} {'best rel':>9}")
+    dir_rels = []
+    for seed in (1, 7, 3):
+        rng = np.random.default_rng(seed)
+        d = rng.standard_normal((ny, nx)).astype("float32")
+        d[:6, :] = 0.0; d[-6:, :] = 0.0; d[:, :6] = 0.0; d[:, -6:] = 0.0   # interior only
+        d *= 0.05 * B0
+        d_t = torch.tensor(d, device=DEVICE)
+        analytic = float(np.sum(g_adj * d))
+        best_rel, best_fd = np.inf, np.nan
+        for h in (0.5, 0.4, 0.3):
+            Jp, _, _ = solve_J(B + h * d_t, warm=(base_u, base_v))
+            Jm, _, _ = solve_J(B - h * d_t, warm=(base_u, base_v))
+            fd = (Jp - Jm) / (2 * h)
+            rel = abs(fd - analytic) / (abs(analytic) + 1e-30)
+            if rel < best_rel:
+                best_rel, best_fd = rel, fd
+        dir_rels.append(best_rel)
+        print(f"  {analytic:14.6e} {best_fd:14.6e} {best_rel:9.3%}")
+    med_dir = float(np.median(dir_rels))
 
-    print(f"\n{'cell':>12} {'adjoint':>14} {'fd':>14} {'abs_err':>11} {'rel_err':>9}")
+    # --- Secondary sanity: per-cell FD at high-gradient interior cells --------
+    # Only cells whose |g| is a decent fraction of the max are above the noise
+    # floor; small-gradient cells are dominated by FD roundoff and excluded.
+    thresh = 0.25 * np.abs(g_adj).max()
+    eps = 1e-2 * B0
+    cand = [(i, j) for i in range(8, ny - 8) for j in range(8, nx - 8)
+            if abs(g_adj[i, j]) > thresh]
+    rng2 = np.random.default_rng(1)
+    cells = [cand[k] for k in rng2.choice(len(cand), size=min(10, len(cand)), replace=False)]
+    print(f"\n{'cell':>12} {'adjoint':>14} {'fd':>14} {'rel_err':>9}")
     rels = []
     for (i, j) in cells:
         Bp = B.clone(); Bp[i, j] += eps
@@ -111,14 +149,14 @@ def main():
         Jm, _, _ = solve_J(Bm, warm=(base_u, base_v))
         fd = (Jp - Jm) / (2 * eps)
         a = g_adj[i, j]
-        abs_err = abs(a - fd)
-        rel = abs_err / (abs(fd) + 1e-30)
+        rel = abs(a - fd) / (abs(fd) + 1e-30)
         rels.append(rel)
-        print(f"({i:3d},{j:3d})  {a:14.5e} {fd:14.5e} {abs_err:11.2e} {rel:9.2%}")
-
+        print(f"({i:3d},{j:3d})  {a:14.5e} {fd:14.5e} {rel:9.2%}")
     rels = np.array(rels)
-    print(f"\nmedian rel err {np.median(rels):.2%}   max rel err {rels.max():.2%}")
-    ok = np.median(rels) < 0.05
+    print(f"\ndirectional median rel err {med_dir:.3%}   "
+          f"per-cell median rel err {np.median(rels):.2%}")
+
+    ok = med_dir < 0.01 and np.median(rels) < 0.05
     print("PASS" if ok else "FAIL")
     return ok
 

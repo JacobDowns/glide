@@ -9,7 +9,10 @@ the way the physics requires, rather than against a stored regression:
     sliding, so the depth-averaged velocity can only increase;
   * 0 <= u_b <= |ubar| everywhere -- the closure splits the depth-averaged motion
     into sliding plus deformation, so the basal speed cannot exceed the mean;
-  * F2 > 0 wherever there is ice, and the solve is deterministic.
+  * F2 > 0 wherever there is ice, and the solve is deterministic;
+  * the answer does not depend on multigrid depth -- the coarse-grid correction has to
+    be consistent with the DIVA operator, since each level diagnoses its own
+    eta_bar/F2/beta_eff from its own restricted state.
 
     uv run python tests/diva_solve_test.py
 """
@@ -30,7 +33,7 @@ RHO_I = cp.float32(917.0)
 GRAV = cp.float32(9.81)
 
 
-def solve(stress_balance, vcycles=15):
+def solve(stress_balance, vcycles=15, levels=None):
     """Cold-started, converged solve under the requested stress balance."""
     x = cp.arange(nx, dtype=cp.float32) * dx
     y = cp.arange(ny, dtype=cp.float32) * dx
@@ -42,7 +45,7 @@ def solve(stress_balance, vcycles=15):
     B = cp.ones((ny, nx), dtype=cp.float32)
     B.fill((1e-16 ** -(1. / 3)) / (RHO_I * GRAV))
 
-    mg = Multigrid(n_levels, ny=ny, nx=nx, dx=dx)
+    mg = Multigrid(levels or n_levels, ny=ny, nx=nx, dx=dx)
     mg.geometry.bed.set(bed)
     mg.rheology.B.set(B)
     mg.state.H.set(thk)
@@ -107,6 +110,18 @@ def main():
     repeat = solve(1.0)
     assert np.array_equal(diva['u'], repeat['u']), "DIVA solve must be deterministic"
     print("      repeat solve bit-identical: True")
+
+    # Multigrid is only the solver: every depth must reach the same solution, which
+    # is what shows the coarse-grid correction is consistent with the DIVA operator.
+    print("\nDIVA across multigrid depths:")
+    single = solve(1.0, levels=1)
+    for depth in (1, 3, 5):
+        got = solve(1.0, levels=depth)
+        rel = np.abs(got['u'] - single['u']).max() / max(np.abs(single['u']).max(), 1e-30)
+        print(f"  n_levels={depth}: |r|/|r0| = {got['residual']:.2e}, "
+              f"max|u| = {np.abs(got['u']).max():.4f}, rel diff vs single grid = {rel:.2e}")
+        assert got['residual'] < 1e-2, f"n_levels={depth} did not converge"
+        assert rel < 2e-3, f"n_levels={depth} disagrees with the single-grid solution"
 
     print("\nOK: DIVA forward solve converges and is physically consistent")
 

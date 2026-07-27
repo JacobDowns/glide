@@ -105,6 +105,7 @@ class Rheology:
 class Sliding:
     beta: Field | None = None
     u_c: Field | None = None          # regularized-Coulomb rate-transition speed (unused by Weertman)
+    beta_eff: Field | None = None     # DIVA secant drag c/(1 + c*F2); grounding already applied
     sliding_law: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(0.0),
@@ -437,7 +438,16 @@ class Grid:
             units='m a^{-1}',
             attrs={'long_name':'Regularized-Coulomb rate-transition speed'})
 
-        return Sliding(beta=beta, u_c=u_c)
+        beta_eff = Field(
+            data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=self.dx,
+            grid=self,
+            name='beta_eff',
+            units='?',
+            attrs={'long_name':'DIVA effective (secant) basal drag coefficient'})
+
+        return Sliding(beta=beta, u_c=u_c, beta_eff=beta_eff)
 
     def _allocate_calving(self):
         return Calving()

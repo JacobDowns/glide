@@ -12,8 +12,10 @@ class ForwardOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu']
+        # diva.cu is last so the DIVA kernels can use every helper above them
+        # (stress/flux stencils, lu_6x6_solve); nothing above depends on DIVA.
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
+                          'residuals.cu', 'vanka.cu', 'grad.cu', 'diva.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:
@@ -192,6 +194,7 @@ class ForwardOperators:
 
         kernel(grid_size, block_size,
                    (rheology.eta_bar.data, rheology.F2.data, state.u_b.data,
+                    sliding.beta_eff.data,
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data,
                     sliding.m.value, sliding.u_reg.value,
@@ -346,8 +349,10 @@ class AdjointOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu']
+        # diva.cu is last so the DIVA kernels can use every helper above them
+        # (stress/flux stencils, lu_6x6_solve); nothing above depends on DIVA.
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
+                          'residuals.cu', 'vanka.cu', 'grad.cu', 'diva.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:

@@ -47,6 +47,58 @@ __device__ void lu_5x5_solve(
     x[0] = (y[0] - LU[0][1]*x[1] - LU[0][2]*x[2] - LU[0][3]*x[3] - LU[0][4]*x[4]) / LU[0][0];
 }
 
+// ============================================================
+// LU Solve for 6x6 Systems (DIVA Vanka smoother)
+// ============================================================
+// Identical scheme to lu_5x5_solve, one row wider: DIVA augments the local system
+// with the basal speed U_b and its closure row.
+__device__ void lu_6x6_solve(
+    const float* A,  // 36 entries: full 6x6 row-major
+    const float* b,  // 6 entries
+    float* x)        // 6 entries (output)
+{
+    float LU[6][6];
+
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        #pragma unroll
+        for (int j = 0; j < 6; j++) {
+            LU[i][j] = A[i * 6 + j];
+        }
+    }
+
+    // LU factorization (Doolittle, no pivoting)
+    #pragma unroll
+    for (int k = 0; k < 6; k++) {
+        float inv_diag = 1.0f / LU[k][k];
+        #pragma unroll
+        for (int i = k + 1; i < 6; i++) {
+            LU[i][k] *= inv_diag;
+            #pragma unroll
+            for (int j = k + 1; j < 6; j++) {
+                LU[i][j] -= LU[i][k] * LU[k][j];
+            }
+        }
+    }
+
+    // Forward solve: L*y = b
+    float y[6];
+    y[0] = b[0];
+    y[1] = b[1] - LU[1][0]*y[0];
+    y[2] = b[2] - LU[2][0]*y[0] - LU[2][1]*y[1];
+    y[3] = b[3] - LU[3][0]*y[0] - LU[3][1]*y[1] - LU[3][2]*y[2];
+    y[4] = b[4] - LU[4][0]*y[0] - LU[4][1]*y[1] - LU[4][2]*y[2] - LU[4][3]*y[3];
+    y[5] = b[5] - LU[5][0]*y[0] - LU[5][1]*y[1] - LU[5][2]*y[2] - LU[5][3]*y[3] - LU[5][4]*y[4];
+
+    // Backward solve: U*x = y
+    x[5] = y[5] / LU[5][5];
+    x[4] = (y[4] - LU[4][5]*x[5]) / LU[4][4];
+    x[3] = (y[3] - LU[3][4]*x[4] - LU[3][5]*x[5]) / LU[3][3];
+    x[2] = (y[2] - LU[2][3]*x[3] - LU[2][4]*x[4] - LU[2][5]*x[5]) / LU[2][2];
+    x[1] = (y[1] - LU[1][2]*x[2] - LU[1][3]*x[3] - LU[1][4]*x[4] - LU[1][5]*x[5]) / LU[1][1];
+    x[0] = (y[0] - LU[0][1]*x[1] - LU[0][2]*x[2] - LU[0][3]*x[3] - LU[0][4]*x[4] - LU[0][5]*x[5]) / LU[0][0];
+}
+
 __device__ __forceinline__
 void mat5x5_mat(const float* __restrict__ A,
                 const float* __restrict__ B,

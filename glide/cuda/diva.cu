@@ -77,30 +77,33 @@ float get_membrane_eps_sq(
 }
 
 __device__ __forceinline__
-DualFloat get_diva_drag(
+DualFloat get_diva_drag_coeff(
     DualFloat U,
-    float beta_eff, float m, float u_reg, float water_drag,
+    float beta_grounded, float m, float u_reg, float water_drag,
     float u_c, float sliding_law){
 
-    // Basal drag magnitude |tau_b| = f(U) as a function of the basal SPEED, returned
-    // as a dual number so f'(U) -- needed by the closure Newton below, and later by
-    // the augmented Jacobian and its transpose -- falls out of the same evaluation
-    // instead of being hand-derived per law.
+    // Basal drag COEFFICIENT c(U), i.e. |tau_b| = c(U)*U, as a function of the basal
+    // speed, returned as a dual number so c'(U) -- and hence f'(U) by the product
+    // rule -- falls out of the same evaluation instead of being hand-derived per law.
+    // The same helper therefore serves the closure Newton here and, later, the
+    // augmented Jacobian and its transpose, for every sliding law.
     //
-    // The drag coefficients mirror get_tau_bx_jac / get_tau_by_jac (stress.cu):
-    //   Weertman            C = beta_eff*(U^2 + u_reg)^((m-1)/2)
-    //   regularized Coulomb C = beta_eff/(sqrt(U^2 + u_reg) + u_c)
-    // with |tau_b| = (C + water_drag)*U in both cases.
+    // Returning the coefficient rather than the drag keeps the effective drag free of
+    // a 0/0: beta_eff = c/(1 + c*F2) (Goldberg eq 41) needs no division by the speed.
+    //
+    // Mirrors the coefficients in get_tau_bx_jac / get_tau_by_jac (stress.cu):
+    //   Weertman            c = beta*(U^2 + u_reg)^((m-1)/2) + water_drag
+    //   regularized Coulomb c = beta/(sqrt(U^2 + u_reg) + u_c) + water_drag
     DualFloat U_sq_reg = U*U + u_reg;
 
-    DualFloat C;
+    DualFloat c;
     if (sliding_law < 0.5f) {
-        C = beta_eff * __powf(U_sq_reg, 0.5f*(m - 1.0f));
+        c = beta_grounded * __powf(U_sq_reg, 0.5f*(m - 1.0f));
     } else {
-        C = beta_eff / (sqrtf(U_sq_reg) + u_c);
+        c = beta_grounded / (sqrtf(U_sq_reg) + u_c);
     }
 
-    return (C + water_drag) * U;
+    return c + water_drag;
 }
 
 extern "C" __global__
@@ -108,6 +111,7 @@ void compute_diva_coeffs(
     float* __restrict__ eta_bar,
     float* __restrict__ F2,
     float* __restrict__ u_b,
+    float* __restrict__ beta_eff,
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
@@ -151,7 +155,9 @@ void compute_diva_coeffs(
     float H_c = get_cell(H, i, j, ny, nx);
     float B_c = get_cell(B, i, j, ny, nx);
     float grounded = get_cell(phi, i, j, ny, nx);
-    float beta_eff = get_cell(beta, i, j, ny, nx) * grounded;
+    // Grounding is folded in here, so beta_eff already carries it and the momentum
+    // kernels must not apply the grounded factor a second time.
+    float beta_grounded = get_cell(beta, i, j, ny, nx) * grounded;
     float u_c_c = get_cell(u_c, i, j, ny, nx);
 
     int idx = i * nx + j;
@@ -159,8 +165,8 @@ void compute_diva_coeffs(
     // Warm start from the stored basal speed, bounded by the depth-averaged speed:
     // deformation can only add to sliding, so 0 <= U_b <= U_bar.
     float U_b = fminf(fmaxf(u_b[idx], 0.0f), U_bar);
-    DualFloat drag = get_diva_drag({U_b, 1.0f}, beta_eff, m, u_reg, water_drag, u_c_c, sliding_law);
-    float tau_b = drag.v;
+    DualFloat coeff = get_diva_drag_coeff({U_b, 1.0f}, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+    float tau_b = coeff.v * U_b;
 
     // Fixed iteration counts (no per-cell convergence test) keep the cost uniform
     // across threads and avoid divergence; the outer nonlinear iteration that calls
@@ -196,21 +202,26 @@ void compute_diva_coeffs(
         }
         F2_c *= H_c;
 
-        // Closure: Newton on R(U_b) = U_b + f(U_b)*F2 - U_bar, with R' = 1 + f'(U_b)*F2.
+        // Closure: Newton on R(U_b) = U_b + f(U_b)*F2 - U_bar, where f(U) = c(U)*U, so
+        // R' = 1 + f'(U_b)*F2 with f and f' both read off the dual product c(U)*U.
         for (int it = 0; it < newton_iters; ++it) {
-            drag = get_diva_drag({U_b, 1.0f}, beta_eff, m, u_reg, water_drag, u_c_c, sliding_law);
-            float R = U_b + drag.v*F2_c - U_bar;
-            float dR = 1.0f + drag.d*F2_c;
+            coeff = get_diva_drag_coeff({U_b, 1.0f}, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+            DualFloat f = coeff * DualFloat{U_b, 1.0f};
+            float R = U_b + f.v*F2_c - U_bar;
+            float dR = 1.0f + f.d*F2_c;
             U_b = fmaxf(U_b - R/dR, 0.0f);
         }
 
-        drag = get_diva_drag({U_b, 1.0f}, beta_eff, m, u_reg, water_drag, u_c_c, sliding_law);
-        tau_b = drag.v;
+        coeff = get_diva_drag_coeff({U_b, 1.0f}, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+        tau_b = coeff.v * U_b;
     }
 
     if (is_active) {
         eta_bar[idx] = eta_avg;
         F2[idx] = F2_c;
         u_b[idx] = U_b;
+        // Goldberg eq 41: the secant drag the 2D momentum solve sees, tau_b = beta_eff*U_bar.
+        // Strictly non-negative, and finite at rest (no division by the speed).
+        beta_eff[idx] = coeff.v/(1.0f + coeff.v*F2_c);
     }
 }

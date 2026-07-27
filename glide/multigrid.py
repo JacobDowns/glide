@@ -105,6 +105,7 @@ class Multigrid:
     
     def restrict_sliding(self,fine_grid,coarse_grid):
         self.restrict_cell(fine_grid.sliding.beta.data,coarse_grid.sliding.beta.data)
+        self.restrict_cell(fine_grid.sliding.beta_eff.data,coarse_grid.sliding.beta_eff.data)
         coarse_grid.sliding.m.set(fine_grid.sliding.m.value)
         coarse_grid.sliding.u_reg.set(fine_grid.sliding.u_reg.value)
         coarse_grid.sliding.water_drag.set(fine_grid.sliding.water_drag.value)
@@ -480,6 +481,13 @@ class MGSlidingManager:
             getter=lambda g: g.sliding.u_c,
             restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
             name="u_c",
+        )
+
+        self.beta_eff = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.beta_eff,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="beta_eff",
         )
 
         self.sliding_law = HierarchyFieldManager(

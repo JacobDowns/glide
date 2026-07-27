@@ -605,6 +605,8 @@ __device__ void vanka_smooth_body(
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,     // DIVA only
     const float* __restrict__ beta_eff,    // DIVA only
+    const float* __restrict__ u_b,         // DIVA only
+    const float* __restrict__ F2,          // DIVA only
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
@@ -678,6 +680,62 @@ __device__ void vanka_smooth_body(
 	    r[2] -= get_hfacet(f_v,i,j,ny,nx);
 	    r[3] -= get_hfacet(f_v,i+1,j,ny,nx);
 	    r[4] -= get_hfacet(f_H,i,j,ny,nx);
+
+	    if (DIVA) {
+		// Augmented basal-speed unknown, eliminated exactly.  Carrying U_b as a
+		// sixth unknown gives the local system
+		//     [ A    b ] [ du   ]   [ r    ]
+		//     [ c^T  d ] [ dU_b ] = [ r_Ub ] ,
+		// whose (2,2) block is the scalar d = dR_Ub/dU_b = 1 + f'(U_b)*F2 >= 1.
+		// Being 1x1 and never singular, U_b can be condensed out analytically:
+		//     (A - b c^T/d) du = r - b*r_Ub/d,
+		// which is algebraically identical to solving the 6x6 but leaves the 5x5
+		// layout (and lu_5x5_solve) untouched.  This is what upgrades the secant
+		// drag that build_5x5_vanka assembled into the tangent the Newton step
+		// needs -- the two differ for any nonlinear sliding law.
+		//
+		// U_b itself is not updated here: compute_diva_coeffs re-solves the closure
+		// exactly before the next sweep, which is at least as good as taking one
+		// Newton step on it.
+		float phi_cc  = get_cell(phi,i,j,ny,nx);
+		float U_b_c   = get_cell(u_b,i,j,ny,nx);
+		float F2_c    = get_cell(F2,i,j,ny,nx);
+		float beta_g  = get_cell(beta,i,j,ny,nx)*phi_cc;
+		float u_c_cc  = get_cell(u_c,i,j,ny,nx);
+
+		DualFloat coeff = get_diva_drag_coeff({U_b_c,1.0f},beta_g,m,u_reg,water_drag,u_c_cc,sliding_law);
+		DualFloat f_b   = coeff * DualFloat{U_b_c,1.0f};       // f = c*U, f' = f_b.d
+		float d_diag    = 1.0f + f_b.d*F2_c;
+
+		float dbe = get_diva_dbeta_eff_du_b(U_b_c,F2_c,beta_g,m,u_reg,water_drag,u_c_cc,sliding_law);
+
+		float u_ctr = 0.5f*(u_l + u_r);
+		float v_ctr = 0.5f*(v_t + v_b);
+		float U_bar = sqrtf(u_ctr*u_ctr + v_ctr*v_ctr);
+		float inv_U = U_bar > 1e-6f ? 1.0f/U_bar : 0.0f;
+
+		// b = dr/dU_b, through beta_eff of this cell.
+		float bvec[5];
+		for (int a=0;a<4;a++) bvec[a] = dr_dbeta_eff[a]*dbe;
+		bvec[4] = 0.0f;
+
+		// c = dR_Ub/d(unknowns), through U_bar = |ubar|.  F2 is held fixed with
+		// respect to H inside the block, consistent with the lagged viscosity.
+		float cvec[5];
+		cvec[0] = -0.5f*u_ctr*inv_U;
+		cvec[1] = cvec[0];
+		cvec[2] = -0.5f*v_ctr*inv_U;
+		cvec[3] = cvec[2];
+		cvec[4] = 0.0f;
+
+		float r_Ub  = U_b_c + f_b.v*F2_c - U_bar;
+		float inv_d = 1.0f/d_diag;
+
+		for (int a=0;a<5;a++) {
+		    r[a] -= bvec[a]*r_Ub*inv_d;
+		    for (int b2=0;b2<5;b2++) J[a*5 + b2] -= bvec[a]*cvec[b2]*inv_d;
+		}
+	    }
 
             J[0]  -= ssa_damping;
             J[6]  -= ssa_damping;
@@ -806,7 +864,7 @@ void vanka_smooth(
     )
 {
     vanka_smooth_body<false>(delta_u,delta_v,delta_H,mask,u,v,H,phi,f_u,f_v,f_H,
-	    bed,B,beta,u_c,gamma,nullptr,nullptr,
+	    bed,B,beta,u_c,gamma,nullptr,nullptr,nullptr,nullptr,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
@@ -833,6 +891,8 @@ void vanka_smooth_diva(
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,
     const float* __restrict__ beta_eff,
+    const float* __restrict__ u_b,
+    const float* __restrict__ F2,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
@@ -843,7 +903,7 @@ void vanka_smooth_diva(
     )
 {
     vanka_smooth_body<true>(delta_u,delta_v,delta_H,mask,u,v,H,phi,f_u,f_v,f_H,
-	    bed,B,beta,u_c,gamma,eta_bar,beta_eff,
+	    bed,B,beta,u_c,gamma,eta_bar,beta_eff,u_b,F2,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,

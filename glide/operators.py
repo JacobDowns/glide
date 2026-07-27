@@ -256,7 +256,8 @@ class ForwardOperators:
                 geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data,
                 self.gamma)
         if diva:
-            args += (rheology.eta_bar.data, sliding.beta_eff.data)
+            args += (rheology.eta_bar.data, sliding.beta_eff.data,
+                     state.u_b.data, rheology.F2.data)
         args += (rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 

@@ -12,7 +12,7 @@ class ForwardOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
                           'residuals.cu', 'vanka.cu', 'grad.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
@@ -178,6 +178,29 @@ class ForwardOperators:
                     grid.ny, grid.nx, 
                     stride, halo))
 
+    def compute_diva_coeffs(self):
+        """Diagnose the DIVA coefficients (eta_bar, F2) and the basal speed u_b from
+        the current state.  Only meaningful when rheology.stress_balance = 1; the SSA
+        path never calls this."""
+        kernel = self.kernels.get_function('compute_diva_coeffs')
+        grid_size, block_size, stride, halo = self._kernel_config
+
+        grid = self.grid
+        state = grid.state
+        rheology = grid.rheology
+        sliding = grid.sliding
+
+        kernel(grid_size, block_size,
+                   (rheology.eta_bar.data, rheology.F2.data, state.u_b.data,
+                    state.u.data, state.v.data, state.H.data, state.phi.data,
+                    rheology.B.data, sliding.beta.data, sliding.u_c.data,
+                    sliding.m.value, sliding.u_reg.value,
+                    sliding.water_drag.value, sliding.sliding_law.value,
+                    rheology.n.value, rheology.eps_reg.value, grid.dx,
+                    int(rheology.n_sigma.value),
+                    grid.ny, grid.nx,
+                    stride, halo))
+
     def vanka_smooth(self, dt,
             freeze_calving=False,
             freeze_phi=False):
@@ -323,7 +346,7 @@ class AdjointOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
                           'residuals.cu', 'vanka.cu', 'grad.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         

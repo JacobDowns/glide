@@ -434,6 +434,112 @@ DualFloat get_tau_by_dual(TauByStencilDual s) {
     return {jac.res,jac.apply_jvp(s.get_diffs())};
 }
 /*=========================================================
+  ============ Basal Stress: DIVA (stress_balance = 1) ====
+  =========================================================*/
+/*
+  Under DIVA the momentum balance sees the depth-averaged velocity resisted by an
+  *effective* drag rather than by the sliding law directly:
+
+      tau_b = -beta_eff * ubar,     beta_eff = c(U_b)/(1 + c(U_b)*F2)
+
+  (Goldberg 2011 eq 41).  beta_eff and the basal speed U_b are diagnosed per cell by
+  compute_diva_coeffs (diva.cu), with the grounded factor already folded into
+  beta_eff -- so unlike the SSA stencils above, these must NOT apply it again.
+
+  The result is linear in the velocity, so these stencils are far simpler than their
+  SSA counterparts: all of the velocity dependence of the real sliding law has moved
+  into the closure that produces U_b.  The extra derivative the augmented block needs,
+  d(beta_eff)/d(U_b), is get_diva_dbeta_eff_du_b below.
+*/
+
+__device__ __forceinline__
+DualFloat get_diva_drag_coeff(
+    DualFloat U,
+    float beta_grounded, float m, float u_reg, float water_drag,
+    float u_c, float sliding_law){
+
+    // Basal drag COEFFICIENT c(U), i.e. |tau_b| = c(U)*U, as a function of the basal
+    // speed, returned as a dual number so c'(U) -- and hence f'(U) by the product
+    // rule -- falls out of the same evaluation instead of being hand-derived per law.
+    // The same helper therefore serves the closure Newton in compute_diva_coeffs and
+    // the augmented Jacobian and its transpose, for every sliding law.
+    //
+    // Returning the coefficient rather than the drag keeps the effective drag free of
+    // a 0/0: beta_eff = c/(1 + c*F2) needs no division by the speed.
+    //
+    // Mirrors the coefficients in get_tau_bx_jac / get_tau_by_jac above:
+    //   Weertman            c = beta*(U^2 + u_reg)^((m-1)/2) + water_drag
+    //   regularized Coulomb c = beta/(sqrt(U^2 + u_reg) + u_c) + water_drag
+    DualFloat U_sq_reg = U*U + u_reg;
+
+    DualFloat c;
+    if (sliding_law < 0.5f) {
+        c = beta_grounded * __powf(U_sq_reg, 0.5f*(m - 1.0f));
+    } else {
+        c = beta_grounded / (sqrtf(U_sq_reg) + u_c);
+    }
+
+    return c + water_drag;
+}
+
+__device__ __forceinline__
+float get_diva_dbeta_eff_du_b(
+    float U_b, float F2,
+    float beta_grounded, float m, float u_reg, float water_drag,
+    float u_c, float sliding_law){
+
+    // d(beta_eff)/d(U_b) for beta_eff = c/(1 + c*F2): the quotient rule collapses to
+    // c'/(1 + c*F2)^2, with c' supplied by the dual evaluation.
+    DualFloat c = get_diva_drag_coeff({U_b,1.0f},beta_grounded,m,u_reg,water_drag,u_c,sliding_law);
+    float denom = 1.0f + c.v*F2;
+    return c.d/(denom*denom);
+}
+
+struct TauBxDivaJacobian {
+    float res;
+    float d_u;
+    float d_beta_eff_l, d_beta_eff_r;
+};
+
+__device__ __forceinline__
+TauBxDivaJacobian get_tau_bx_diva_jac(
+    float u, float beta_eff_l, float beta_eff_r)
+{
+    TauBxDivaJacobian jac;
+
+    float beta_eff = 0.5f*(beta_eff_l + beta_eff_r);
+
+    jac.res = -beta_eff * u;
+    jac.d_u = -beta_eff;
+    jac.d_beta_eff_l = -0.5f * u;
+    jac.d_beta_eff_r = -0.5f * u;
+
+    return jac;
+}
+
+struct TauByDivaJacobian {
+    float res;
+    float d_v;
+    float d_beta_eff_t, d_beta_eff_b;
+};
+
+__device__ __forceinline__
+TauByDivaJacobian get_tau_by_diva_jac(
+    float v, float beta_eff_t, float beta_eff_b)
+{
+    TauByDivaJacobian jac;
+
+    float beta_eff = 0.5f*(beta_eff_t + beta_eff_b);
+
+    jac.res = -beta_eff * v;
+    jac.d_v = -beta_eff;
+    jac.d_beta_eff_t = -0.5f * v;
+    jac.d_beta_eff_b = -0.5f * v;
+
+    return jac;
+}
+
+/*=========================================================
   ==================== Driving Stress =====================
   =========================================================*/
 

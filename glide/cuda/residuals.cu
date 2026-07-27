@@ -2,8 +2,13 @@
   ================= Residual Computation ==================
   =========================================================*/
 
-extern "C" __global__
-void compute_residual(
+// Shared body for the SSA and DIVA residuals.  The two schemes differ in exactly two
+// places -- where the membrane viscosity comes from, and what basal drag the momentum
+// balance sees -- so they share this body rather than a second copy of every stencil.
+// DIVA is a compile-time flag, so each instantiation keeps only its own branch and the
+// SSA kernel below is unchanged.
+template <bool DIVA>
+__device__ void residual_body(
     float* __restrict__ r_u,
     float* __restrict__ r_v,
     float* __restrict__ r_H,
@@ -20,9 +25,11 @@ void compute_residual(
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,     // DIVA only: depth-averaged viscosity
+    const float* __restrict__ beta_eff,    // DIVA only: effective (secant) basal drag
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
-    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo)
@@ -40,7 +47,14 @@ void compute_residual(
 
     if (i > ny || j > nx) return;
 
-    populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+    if (DIVA) {
+	// The vertical quadrature cannot live inside a per-stencil call, so DIVA reads
+	// the depth-averaged viscosity diagnosed by compute_diva_coeffs instead of
+	// forming eta inline.  It must therefore be refreshed before each evaluation.
+	eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);
+    } else {
+	populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+    }
 
     __syncthreads();
 
@@ -200,8 +214,18 @@ void compute_residual(
 	    float u_c_l = get_cell(u_c,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
-	    TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
-	    ru_l += tau_bx.res;
+	    if (DIVA) {
+		// tau_b = -beta_eff*ubar; the grounded factor and water_drag are already
+		// inside beta_eff, and the sliding law's velocity dependence now lives in
+		// the closure that produced it.
+		float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
+		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+		TauBxDivaJacobian tau_bx = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
+		ru_l += tau_bx.res;
+	    } else {
+		TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
+		ru_l += tau_bx.res;
+	    }
 	    }
 
 	    {
@@ -312,8 +336,15 @@ void compute_residual(
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
-	    TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
-	    rv_t += tau_by.res;
+	    if (DIVA) {
+		float beta_eff_t = get_cell(beta_eff,i-1,j,ny,nx);
+		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+		TauByDivaJacobian tau_by = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
+		rv_t += tau_by.res;
+	    } else {
+		TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
+		rv_t += tau_by.res;
+	    }
 	    }
 
 	    {
@@ -335,6 +366,72 @@ void compute_residual(
 	    r_v[i * nx + j] = rv_t;
 	}
     }
+}
+
+extern "C" __global__
+void compute_residual(
+    float* __restrict__ r_u,
+    float* __restrict__ r_v,
+    float* __restrict__ r_H,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    bool use_forcing, bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo)
+{
+    residual_body<false>(r_u,r_v,r_H,u,v,H,phi,mask,f_u,f_v,f_H,bed,B,beta,u_c,gamma,
+	    nullptr,nullptr,
+	    use_forcing,use_mask,n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
+}
+
+extern "C" __global__
+void compute_residual_diva(
+    float* __restrict__ r_u,
+    float* __restrict__ r_v,
+    float* __restrict__ r_H,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,
+    const float* __restrict__ beta_eff,
+    bool use_forcing, bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo)
+{
+    residual_body<true>(r_u,r_v,r_H,u,v,H,phi,mask,f_u,f_v,f_H,bed,B,beta,u_c,gamma,
+	    eta_bar,beta_eff,
+	    use_forcing,use_mask,n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
 }
 
 

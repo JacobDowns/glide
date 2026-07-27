@@ -71,16 +71,18 @@ class ForwardOperators:
             freeze_phi=False,
             return_norms=False):
 
-        kernel = self.kernels.get_function('compute_residual')
-        grid_size, block_size, stride, halo = self._kernel_config
-  
         grid = self.grid
         state = grid.state
-        geometry = grid.geometry        
+        geometry = grid.geometry
         rheology = grid.rheology
         sliding = grid.sliding
         calving = grid.calving
         forcing = grid.forcing
+
+        diva = float(rheology.stress_balance.value) > 0.5
+        kernel = self.kernels.get_function('compute_residual_diva' if diva
+                                           else 'compute_residual')
+        grid_size, block_size, stride, halo = self._kernel_config
 
         if freeze_calving:
             calving_rate = cp.float32(0.0)
@@ -89,6 +91,12 @@ class ForwardOperators:
 
         if not freeze_phi:
             self.compute_phi()
+
+        if diva:
+            # eta_bar/beta_eff are lagged fields, so they must be refreshed against the
+            # current state before the residual is formed (Goldberg's iteration on
+            # viscosity); SSA gets this for free by computing eta inline.
+            self.compute_diva_coeffs()
 
         if operator_only:
             out_u = self.F_u
@@ -101,23 +109,26 @@ class ForwardOperators:
             out_H = self.r_H
             use_forcing = True
 
-        kernel(grid_size, block_size,
-               (out_u, out_v, out_H,
-                state.u.data, state.v.data, state.H.data, 
+        args = (out_u, out_v, out_H,
+                state.u.data, state.v.data, state.H.data,
                 state.phi.data, state.mask.data,
                 self.f_u, self.f_v, self.f_H,
-                geometry.bed.data, 
-                rheology.B.data, 
+                geometry.bed.data,
+                rheology.B.data,
                 sliding.beta.data, sliding.u_c.data,
-                self.gamma,
-                use_forcing,use_mask,
-                rheology.n.value, rheology.eps_reg.value, 
+                self.gamma)
+        if diva:
+            args += (rheology.eta_bar.data, sliding.beta_eff.data)
+        args += (use_forcing,use_mask,
+                rheology.n.value, rheology.eps_reg.value,
                 geometry.sigmoid_c.value,
-                sliding.m.value, sliding.u_reg.value, 
+                sliding.m.value, sliding.u_reg.value,
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
-                grid.ny, grid.nx, stride, halo)) 
+                grid.ny, grid.nx, stride, halo)
+
+        kernel(grid_size, block_size, args)
 
         if return_norms:
             return cp.linalg.norm(out_u),cp.linalg.norm(out_v),cp.linalg.norm(out_H)

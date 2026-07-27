@@ -139,22 +139,29 @@ void mat5x5_vec(const float* __restrict__ A,
     }
 }
 	
-template <int height, int width>
+// Shared local-block assembly for the SSA and DIVA smoothers.  As in residual_body,
+// DIVA is a compile-time flag and the two schemes differ only in the basal stress:
+// SSA evaluates the sliding law, DIVA uses the effective drag beta_eff.  When DIVA is
+// set, dr_dU_b receives d(r)/d(beta_eff of this cell) for the four momentum rows --
+// the coupling the augmented block needs; it is left untouched for SSA.
+template <bool DIVA, int height, int width>
 __device__ void build_5x5_vanka(
     float* __restrict__ J,
     float* __restrict__ r,
+    float* __restrict__ dr_dbeta_eff,
     float u_l, float u_r,
     float v_t, float v_b,
     float H_c,
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
-    const float (&eta_local)[height][width], 
+    const float (&eta_local)[height][width],
     const float* __restrict__ phi,
     const float* __restrict__ bed,
     const float* __restrict__ B,
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
+    const float* __restrict__ beta_eff,
     const float* __restrict__ gamma,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law, 
@@ -168,6 +175,7 @@ __device__ void build_5x5_vanka(
 
     for (int k=0;k<25;k++) J[k] = 0.0f;
     for (int k=0;k<5;k++) r[k] = 0.0f;
+    if (DIVA) { for (int k=0;k<5;k++) dr_dbeta_eff[k] = 0.0f; }
 
     float phi_c = get_cell(phi,i,j,ny,nx);
     float phi_l = get_cell(phi,i,j-1,ny,nx);
@@ -432,12 +440,23 @@ __device__ void build_5x5_vanka(
     float u_c_l = get_cell(u_c,i,j-1,ny,nx);
     float beta_c = get_cell(beta,i,j,ny,nx);
     float u_c_c = get_cell(u_c,i,j,ny,nx);
-    TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
-    r[0] += tau_bx_l.res;
-    J[0] += tau_bx_l.d_u;
-    J[2] += tau_bx_l.d_v_tr;
-    J[3] += tau_bx_l.d_v_br;
-    J[4] += tau_bx_l.d_H_r;
+    if (DIVA) {
+	// This facet's cells are (i,j-1) and (i,j); the block owns (i,j), so it is the
+	// "r" side whose beta_eff carries the in-block U_b dependence.
+	float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
+	float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+	TauBxDivaJacobian tau_bx_l = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
+	r[0] += tau_bx_l.res;
+	J[0] += tau_bx_l.d_u;
+	dr_dbeta_eff[0] += tau_bx_l.d_beta_eff_r;
+    } else {
+	TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
+	r[0] += tau_bx_l.res;
+	J[0] += tau_bx_l.d_u;
+	J[2] += tau_bx_l.d_v_tr;
+	J[3] += tau_bx_l.d_v_br;
+	J[4] += tau_bx_l.d_H_r;
+    }
     }
 
     // Basal shear stress for right momentum
@@ -450,12 +469,22 @@ __device__ void build_5x5_vanka(
     float u_c_c = get_cell(u_c,i,j,ny,nx);
     float beta_r = get_cell(beta,i,j+1,ny,nx);
     float u_c_r = get_cell(u_c,i,j+1,ny,nx);
-    TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,phi_c,phi_r,beta_c,beta_r,m,u_reg,water_drag,flotation_reg_sliding,u_c_c,u_c_r,sliding_law});
-    r[1] += tau_bx_r.res;
-    J[6] += tau_bx_r.d_u;
-    J[7] += tau_bx_r.d_v_tl;
-    J[8] += tau_bx_r.d_v_bl;
-    J[9] += tau_bx_r.d_H_l;
+    if (DIVA) {
+	// Cells (i,j) and (i,j+1): the block owns the "l" side here.
+	float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+	float beta_eff_r = get_cell(beta_eff,i,j+1,ny,nx);
+	TauBxDivaJacobian tau_bx_r = get_tau_bx_diva_jac(u_r,beta_eff_c,beta_eff_r);
+	r[1] += tau_bx_r.res;
+	J[6] += tau_bx_r.d_u;
+	dr_dbeta_eff[1] += tau_bx_r.d_beta_eff_l;
+    } else {
+	TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,phi_c,phi_r,beta_c,beta_r,m,u_reg,water_drag,flotation_reg_sliding,u_c_c,u_c_r,sliding_law});
+	r[1] += tau_bx_r.res;
+	J[6] += tau_bx_r.d_u;
+	J[7] += tau_bx_r.d_v_tl;
+	J[8] += tau_bx_r.d_v_bl;
+	J[9] += tau_bx_r.d_H_l;
+    }
     }
 
     // Basal shear stress for top momentum
@@ -468,12 +497,22 @@ __device__ void build_5x5_vanka(
     float u_c_t = get_cell(u_c,i-1,j,ny,nx);
     float beta_c = get_cell(beta,i,j,ny,nx);
     float u_c_c = get_cell(u_c,i,j,ny,nx);
-    TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
-    r[2]  += tau_by_t.res;
-    J[12] += tau_by_t.d_v;
-    J[10] += tau_by_t.d_u_bl;
-    J[11] += tau_by_t.d_u_br;
-    J[14] += tau_by_t.d_H_b;
+    if (DIVA) {
+	// Cells (i-1,j) and (i,j): the block owns the "b" side here.
+	float beta_eff_t = get_cell(beta_eff,i-1,j,ny,nx);
+	float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+	TauByDivaJacobian tau_by_t = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
+	r[2]  += tau_by_t.res;
+	J[12] += tau_by_t.d_v;
+	dr_dbeta_eff[2] += tau_by_t.d_beta_eff_b;
+    } else {
+	TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
+	r[2]  += tau_by_t.res;
+	J[12] += tau_by_t.d_v;
+	J[10] += tau_by_t.d_u_bl;
+	J[11] += tau_by_t.d_u_br;
+	J[14] += tau_by_t.d_H_b;
+    }
     }
 
     // Basal shear stress for bottom momentum
@@ -486,12 +525,22 @@ __device__ void build_5x5_vanka(
     float u_c_c = get_cell(u_c,i,j,ny,nx);
     float beta_b = get_cell(beta,i+1,j,ny,nx);
     float u_c_b = get_cell(u_c,i+1,j,ny,nx);
-    TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,phi_c,phi_b,beta_c,beta_b,m,u_reg,water_drag,flotation_reg_sliding,u_c_c,u_c_b,sliding_law});
-    r[3]  += tau_by_b.res;
-    J[18] += tau_by_b.d_v;
-    J[15] += tau_by_b.d_u_tl;
-    J[16] += tau_by_b.d_u_tr;
-    J[19] += tau_by_b.d_H_t;
+    if (DIVA) {
+	// Cells (i,j) and (i+1,j): the block owns the "t" side here.
+	float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+	float beta_eff_b = get_cell(beta_eff,i+1,j,ny,nx);
+	TauByDivaJacobian tau_by_b = get_tau_by_diva_jac(v_b,beta_eff_c,beta_eff_b);
+	r[3]  += tau_by_b.res;
+	J[18] += tau_by_b.d_v;
+	dr_dbeta_eff[3] += tau_by_b.d_beta_eff_t;
+    } else {
+	TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,phi_c,phi_b,beta_c,beta_b,m,u_reg,water_drag,flotation_reg_sliding,u_c_c,u_c_b,sliding_law});
+	r[3]  += tau_by_b.res;
+	J[18] += tau_by_b.d_v;
+	J[15] += tau_by_b.d_u_tl;
+	J[16] += tau_by_b.d_u_tr;
+	J[19] += tau_by_b.d_H_t;
+    }
     }
     
     // Driving stress for left momentum (u)
@@ -535,8 +584,9 @@ __device__ void build_5x5_vanka(
     }
 }
 
-extern "C" __global__
-void vanka_smooth(
+// Shared body for the SSA and DIVA Vanka smoothers; see build_5x5_vanka above.
+template <bool DIVA>
+__device__ void vanka_smooth_body(
     float* __restrict__ delta_u,
     float* __restrict__ delta_v,
     float* __restrict__ delta_H,
@@ -553,6 +603,8 @@ void vanka_smooth(
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,     // DIVA only
+    const float* __restrict__ beta_eff,    // DIVA only
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
@@ -575,7 +627,11 @@ void vanka_smooth(
 
     if (i < 0 || i >= ny || j<0 || j >= nx) return;
 
-    populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+    if (DIVA) {
+	eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);
+    } else {
+	populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+    }
     __syncthreads();
 
     bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
@@ -583,6 +639,7 @@ void vanka_smooth(
 
     if ( is_active ) {
 	float dx_inv = 1.0f/dx;
+	float dr_dbeta_eff[5] = {0};
 
 	float masked = get_cell(mask, i, j, ny, nx);
 	float u_l = get_vfacet(u, i, j, ny, nx);
@@ -607,10 +664,10 @@ void vanka_smooth(
 
 	while (k<newton_steps && rnorm>tol){
 
-	    build_5x5_vanka(J, r,
+	    build_5x5_vanka<DIVA>(J, r, dr_dbeta_eff,
 		    u_l, u_r, v_t, v_b, H_c,
 		    u, v, H, eta_local, phi,
-                    bed, B, beta, u_c, gamma,
+                    bed, B, beta, u_c, beta_eff, gamma,
 		    n, eps_reg, flotation_reg_driving,
                     m, u_reg, water_drag, flotation_reg_sliding, sliding_law,
 		    calving_rate, flotation_reg_calving,
@@ -722,6 +779,78 @@ void vanka_smooth(
 }
 
 extern "C" __global__
+void vanka_smooth(
+    float* __restrict__ delta_u,
+    float* __restrict__ delta_v,
+    float* __restrict__ delta_H,
+    float* __restrict__ mask,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo,
+    int newton_steps, float relaxation,
+    float ssa_damping, float mc_damping
+    )
+{
+    vanka_smooth_body<false>(delta_u,delta_v,delta_H,mask,u,v,H,phi,f_u,f_v,f_H,
+	    bed,B,beta,u_c,gamma,nullptr,nullptr,
+	    n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
+	    newton_steps,relaxation,ssa_damping,mc_damping);
+}
+
+extern "C" __global__
+void vanka_smooth_diva(
+    float* __restrict__ delta_u,
+    float* __restrict__ delta_v,
+    float* __restrict__ delta_H,
+    float* __restrict__ mask,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,
+    const float* __restrict__ beta_eff,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo,
+    int newton_steps, float relaxation,
+    float ssa_damping, float mc_damping
+    )
+{
+    vanka_smooth_body<true>(delta_u,delta_v,delta_H,mask,u,v,H,phi,f_u,f_v,f_H,
+	    bed,B,beta,u_c,gamma,eta_bar,beta_eff,
+	    n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
+	    newton_steps,relaxation,ssa_damping,mc_damping);
+}
+
+extern "C" __global__
 void vanka_smooth_adjoint(
     float* __restrict__ lambda_u_out,
     float* __restrict__ lambda_v_out,
@@ -782,10 +911,10 @@ void vanka_smooth_adjoint(
 	float rhs[5] = {0};
 	// Note that the adjoint assembles a forward problem rhs, but it's 
 	// discarded.  
-	build_5x5_vanka(J, rhs,
+	build_5x5_vanka<false>(J, rhs, nullptr,
 		u_l, u_r, v_t, v_b, H_c,
 		u, v, H, eta_local, phi,
-		bed, B, beta, u_c, gamma,
+		bed, B, beta, u_c, nullptr, gamma,
 		n, eps_reg, flotation_reg_driving,
 		m, u_reg, water_drag, flotation_reg_sliding, sliding_law,
 		calving_rate, flotation_reg_calving,
@@ -914,10 +1043,10 @@ void vanka_dump(
 	float J[25] = {0};
         float r[5] = {0};
 
-        build_5x5_vanka(J, r,
+        build_5x5_vanka<false>(J, r, nullptr,
 	    u_l, u_r, v_t, v_b, H_c,
 	    u, v, H, eta_local, phi,
-	    bed, B, beta, u_c, gamma,
+	    bed, B, beta, u_c, nullptr, gamma,
 	    n, eps_reg, flotation_reg_driving,
 	    m, u_reg, water_drag, flotation_reg_sliding, sliding_law,
 	    calving_rate, flotation_reg_calving,

@@ -219,16 +219,18 @@ class ForwardOperators:
             freeze_calving=False,
             freeze_phi=False):
 
-        kernel = self.kernels.get_function('vanka_smooth')
-        grid_size, block_size, stride, halo = self._kernel_config
-
         grid = self.grid
         state = grid.state
-        geometry = grid.geometry        
+        geometry = grid.geometry
         rheology = grid.rheology
         sliding = grid.sliding
         calving = grid.calving
         forcing = grid.forcing
+
+        diva = float(rheology.stress_balance.value) > 0.5
+        kernel = self.kernels.get_function('vanka_smooth_diva' if diva
+                                           else 'vanka_smooth')
+        grid_size, block_size, stride, halo = self._kernel_config
 
         if freeze_calving:
             calving_rate = cp.float32(0.0)
@@ -238,18 +240,24 @@ class ForwardOperators:
         if not freeze_phi:
             self.compute_phi(relaxation=self.vanka_config.relax_phi)
 
+        if diva:
+            # Refresh the lagged coefficients against the current state before the
+            # block solve -- Goldberg's iteration on viscosity (his eqs 41-44).
+            self.compute_diva_coeffs()
+
         self.delta_u.fill(0.0)
         self.delta_v.fill(0.0)
         self.delta_H.fill(0.0)
-        kernel(grid_size, block_size,
-               (self.delta_u, self.delta_v, self.delta_H, 
+        args = (self.delta_u, self.delta_v, self.delta_H,
                 state.mask.data,
-                state.u.data, state.v.data, state.H.data, 
+                state.u.data, state.v.data, state.H.data,
                 state.phi.data,
                 self.f_u, self.f_v, self.f_H,
-                geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data, 
-                self.gamma,
-                rheology.n.value, rheology.eps_reg.value, 
+                geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data,
+                self.gamma)
+        if diva:
+            args += (rheology.eta_bar.data, sliding.beta_eff.data)
+        args += (rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
                 sliding.water_drag.value, 
@@ -262,7 +270,8 @@ class ForwardOperators:
                 self.vanka_config.newton_config.relaxation,
                 self.vanka_config.newton_config.ssa_damping,
                 self.vanka_config.newton_config.mc_damping)
-        )
+
+        kernel(grid_size, block_size, args)
 
     def vanka_sweep(self, dt, n_iter, 
             freeze_calving=False,

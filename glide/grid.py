@@ -80,9 +80,16 @@ class Rheology:
             units='s^{-2}',
             attrs={'long_name':'Strain invariant squared regularizer'})
         )
-    
+    stress_balance: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(0.0),
+            name='stress_balance',
+            units='',
+            attrs={'long_name':'0 = SSA (default), 1 = DIVA'})
+        )
+
     def __repr__(self):
-        return f'{self.B.compact_string}\n{self.n}\n{self.eps_reg}'
+        return f'{self.B.compact_string}\n{self.n}\n{self.eps_reg}\n{self.stress_balance}'
     
 @dataclass
 class Sliding:

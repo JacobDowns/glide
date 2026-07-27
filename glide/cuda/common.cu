@@ -50,6 +50,18 @@ struct DualFloat {
 	return {a.v * inv_s, a.d * inv_s};
     }
 
+    // Division: (u / v, (du*v - u*dv) / v^2)
+    __device__ __forceinline__ friend DualFloat operator/(DualFloat a, DualFloat b) {
+	float inv_b = 1.0f / b.v;
+	return {a.v * inv_b, (a.d * b.v - a.v * b.d) * inv_b * inv_b};
+    }
+
+    // Scalar over dual: (s / v, -s*dv / v^2)
+    __device__ __forceinline__ friend DualFloat operator/(float s, DualFloat a) {
+	float inv_a = 1.0f / a.v;
+	return {s * inv_a, -s * a.d * inv_a * inv_a};
+    }
+
 };
 
 __device__ __forceinline__ DualFloat __powf(DualFloat u, float p) {
@@ -61,6 +73,14 @@ __device__ __forceinline__ DualFloat __powf(DualFloat u, float p) {
     float deriv = p * __powf(u.v, p - 1.0f) * u.d;
 
     return {val, deriv};
+}
+
+__device__ __forceinline__ DualFloat sqrtf(DualFloat u) {
+    // Hardware intrinsic sqrt; d/dx(sqrt(u)) = du / (2*sqrt(u))
+    // If u.v is zero the derivative is singular; callers regularize (e.g. eps_reg).
+    float val = sqrtf(u.v);
+
+    return {val, u.d / (2.0f * val)};
 }
 
 __device__ __forceinline__ float sigmoid(const float z, const float c) {

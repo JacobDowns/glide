@@ -13,9 +13,10 @@ class State:
     H_prev: Field | None = None
     phi: Field | None = None
     mask: Field | None = None
+    u_b: Field | None = None          # DIVA basal sliding speed |u_b| (unused / zero in SSA)
 
     def __repr__(self):
-        return f'{self.u.compact_string}\n{self.v.compact_string}\n{self.H.compact_string}\n{self.H_prev.compact_string}\n{self.phi.compact_string}\n{self.mask.compact_string}'
+        return f'{self.u.compact_string}\n{self.v.compact_string}\n{self.H.compact_string}\n{self.H_prev.compact_string}\n{self.phi.compact_string}\n{self.mask.compact_string}\n{self.u_b.compact_string}'
 
 @dataclass
 class AdjointState:
@@ -66,6 +67,8 @@ class Geometry:
 @dataclass
 class Rheology:
     B: Field | None = None
+    eta_bar: Field | None = None      # DIVA depth-averaged effective viscosity (diagnostic)
+    F2: Field | None = None           # DIVA vertical shear integral F2 = int eta^-1 ((s-z)/H)^2 dz
     n: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(3.0),
@@ -87,9 +90,16 @@ class Rheology:
             units='',
             attrs={'long_name':'0 = SSA (default), 1 = DIVA'})
         )
+    n_sigma: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(8.0),
+            name='n_sigma',
+            units='',
+            attrs={'long_name':'DIVA number of vertical sigma levels (quadrature)'})
+        )
 
     def __repr__(self):
-        return f'{self.B.compact_string}\n{self.n}\n{self.eps_reg}\n{self.stress_balance}'
+        return f'{self.B.compact_string}\n{self.n}\n{self.eps_reg}\n{self.stress_balance}\n{self.n_sigma}'
     
 @dataclass
 class Sliding:
@@ -314,10 +324,19 @@ class Grid:
             grid=self,
             name='mask',
             units='',
-            attrs={'long_name':'''Active set mask - if unity, thickness is 
+            attrs={'long_name':'''Active set mask - if unity, thickness is
                          set to thklim in Dirichlet BC fashion'''})
 
-        return State(u=u,v=v,H=H,H_prev=H_prev,phi=phi,mask=mask)
+        u_b = Field(
+            data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=self.dx,
+            grid=self,
+            name='u_b',
+            units='m a^{-1}',
+            attrs={'long_name':'DIVA basal sliding speed |u_b| (zero in SSA)'})
+
+        return State(u=u,v=v,H=H,H_prev=H_prev,phi=phi,mask=mask,u_b=u_b)
 
     def _allocate_adjoint_state(self):
         lambda_u = Field(
@@ -379,7 +398,25 @@ class Grid:
             units='m',
             attrs={'long_name':'Rheologic prefactor.  B=A^{-1/n}'})
 
-        return Rheology(B=B)
+        eta_bar = Field(
+            data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=self.dx,
+            grid=self,
+            name='eta_bar',
+            units='Pa a',
+            attrs={'long_name':'DIVA depth-averaged effective viscosity'})
+
+        F2 = Field(
+            data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=self.dx,
+            grid=self,
+            name='F2',
+            units='m Pa^{-1} a^{-1}',
+            attrs={'long_name':'DIVA vertical shear integral F2'})
+
+        return Rheology(B=B, eta_bar=eta_bar, F2=F2)
 
     def _allocate_sliding(self):
         beta = Field(

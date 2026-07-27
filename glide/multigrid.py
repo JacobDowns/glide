@@ -85,6 +85,7 @@ class Multigrid:
         self.restrict_cell(fine_grid.state.H_prev.data,coarse_grid.state.H_prev.data)
         self.restrict_cell(fine_grid.state.phi.data,coarse_grid.state.phi.data)
         self.restrict_cell(fine_grid.state.mask.data,coarse_grid.state.mask.data,method='max')
+        self.restrict_cell(fine_grid.state.u_b.data,coarse_grid.state.u_b.data)
 
     def restrict_geometry(self,fine_grid,coarse_grid):
         self.restrict_cell(fine_grid.geometry.bed.data,coarse_grid.geometry.bed.data)
@@ -95,9 +96,12 @@ class Multigrid:
 
     def restrict_rheology(self,fine_grid,coarse_grid):
         self.restrict_cell(fine_grid.rheology.B.data,coarse_grid.rheology.B.data)
+        self.restrict_cell(fine_grid.rheology.eta_bar.data,coarse_grid.rheology.eta_bar.data)
+        self.restrict_cell(fine_grid.rheology.F2.data,coarse_grid.rheology.F2.data)
         coarse_grid.rheology.n.set(fine_grid.rheology.n.value)
         coarse_grid.rheology.eps_reg.set(fine_grid.rheology.eps_reg.value)
         coarse_grid.rheology.stress_balance.set(fine_grid.rheology.stress_balance.value)
+        coarse_grid.rheology.n_sigma.set(fine_grid.rheology.n_sigma.value)
     
     def restrict_sliding(self,fine_grid,coarse_grid):
         self.restrict_cell(fine_grid.sliding.beta.data,coarse_grid.sliding.beta.data)
@@ -330,6 +334,13 @@ class MGStateManager:
             name="mask",
         )
 
+        self.u_b = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.state.u_b,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="u_b",
+        )
+
     def __repr__(self):
         return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].state.__repr__()
 
@@ -410,6 +421,20 @@ class MGRheologyManager:
             name="B",
         )
 
+        self.eta_bar = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.eta_bar,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="eta_bar",
+        )
+
+        self.F2 = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.F2,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="F2",
+        )
+
         self.n = HierarchyFieldManager(
             mg.levels,
             getter=lambda g: g.rheology.n,
@@ -429,6 +454,13 @@ class MGRheologyManager:
             getter=lambda g: g.rheology.stress_balance,
             restrict=lambda f,c: c.set(f.value),
             name="stress_balance",
+        )
+
+        self.n_sigma = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.n_sigma,
+            restrict=lambda f,c: c.set(f.value),
+            name="n_sigma",
         )
     def __repr__(self):
         return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].rheology.__repr__()

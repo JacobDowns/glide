@@ -31,14 +31,13 @@ or inverse work. The standard ladder of approximations is:
 The first-order (Blatter–Pattyn) equations are
 
 $$
-\partial_x\!\big[\nu(4u_x + 2v_y)\big] + \partial_y\!\big[\nu(v_x+u_y)\big] + \partial_z(\nu u_z) = \rho g s_x
+\partial_x\big[\nu(4u_x + 2v_y)\big] + \partial_y\big[\nu(v_x+u_y)\big] + \partial_z(\nu u_z) = \rho g s_x
 $$
 
-and its $y$ counterpart (G-1,2), with
+and its $y$ counterpart (G-1,2), with the effective viscosity (G-3)
 
 $$
-\nu = \frac{B}{2}\Big[u_x^2 + v_y^2 + u_xv_y + \tfrac14(u_y+v_x)^2 + \tfrac14 u_z^2 + \tfrac14 v_z^2\Big]^{\frac{1-n}{2n}} .
-\tag{G-3}
+\nu = \frac{B}{2}\Big[u_x^2 + v_y^2 + u_xv_y + \tfrac14(u_y+v_x)^2 + \tfrac14 u_z^2 + \tfrac14 v_z^2\Big]^{\frac{1-n}{2n}}
 $$
 
 Solving this needs a 3-D PDE system because the **horizontal** stress terms
@@ -65,13 +64,12 @@ the equations follow as its Euler–Lagrange equations. Two consequences matter 
 
 ### 2.1 Momentum
 
-Identical in form to SSA — this is the reason DIVA fits GLIDE so cheaply:
+Identical in form to SSA — this is the reason DIVA fits GLIDE so cheaply (G-43):
 
 $$
-\partial_x\!\big[H\bar\eta(4\bar u_x + 2\bar v_y)\big]
-+ \partial_y\!\big[H\bar\eta(\bar v_x + \bar u_y)\big]
+\partial_x\big[H\bar\eta(4\bar u_x + 2\bar v_y)\big]
++ \partial_y\big[H\bar\eta(\bar v_x + \bar u_y)\big]
 - \tau_{bx} = \rho g H s_x
-\tag{G-43}
 $$
 
 Only two coefficients change meaning: the viscosity $\bar\eta$ is now a **depth
@@ -82,12 +80,14 @@ is SSA's.
 ### 2.2 Depth-varying viscosity
 
 With the horizontal terms depth-averaged, the effective strain-rate invariant gains
-the vertical shear contributions:
+the vertical shear contributions (G-16):
 
 $$
-\eta(z) = \frac{B}{2}\Big[\underbrace{\bar u_x^2 + \bar v_y^2 + \bar u_x\bar v_y + \tfrac14(\bar u_y+\bar v_x)^2}_{\textstyle \dot\varepsilon^2_{\rm mem}\ \text{(SSA has only this)}} + \;\dot\varepsilon_{xz}^2 + \dot\varepsilon_{yz}^2 + \varepsilon_{\rm reg}\Big]^{\frac{1-n}{2n}}
-\tag{G-16}
+\eta(z) = \frac{B}{2}\Big[\underbrace{\bar u_x^2 + \bar v_y^2 + \bar u_x\bar v_y + \tfrac14(\bar u_y+\bar v_x)^2}_{\dot\varepsilon^2_{\mathrm{mem}}} + \dot\varepsilon_{xz}^2 + \dot\varepsilon_{yz}^2 + \varepsilon_{\mathrm{reg}}\Big]^{\frac{1-n}{2n}}
 $$
+
+The braced group is the membrane invariant $\dot\varepsilon^2_{\mathrm{mem}}$ — all that
+SSA has. The two shear terms are what DIVA adds.
 
 ### 2.3 The shear ansatz
 
@@ -111,16 +111,18 @@ Integrating a second time and depth-averaging relates the depth-averaged and bas
 velocities (G-32–35):
 
 $$
-\boxed{\;\bar{\mathbf u} = \mathbf u_b + \tau_b F_2\;}
-\qquad
+\bar{\mathbf u} = \mathbf u_b + \tau_b F_2
+$$
+
+$$
 F_2 \equiv \int_b^s \frac{1}{\eta}\Big(\frac{s-z}{H}\Big)^2 dz
-= H\!\int_0^1 \frac{\zeta^2}{\eta}\,d\zeta = \frac{\omega}{H_{\phantom{|}}}\Big|_{\rm G\text{-}35}
+= H\int_0^1 \frac{\zeta^2}{\eta}\,d\zeta
 $$
 
 In words: **depth-averaged velocity = sliding + internal deformation**, with the
 deformation proportional to the basal drag through $F_2$. Goldberg writes this with
-$\omega=\int\!\!\int (s-z')/(H\eta)$, and $\omega = HF_2$ — this identity pins our
-convention with no stray factors. This relation is **independent of the sliding law**.
+$\omega$ (G-35), the double integral of $(s-z')/(H\eta)$. The two are related by
+$\omega = H F_2$, and that identity pins our convention with no stray factors. This relation is **independent of the sliding law**.
 
 ### 2.5 The sliding closure
 
@@ -130,8 +132,8 @@ $|\tau_b| = f(U_b) = c(U_b)\,U_b$, where $U_b=|\mathbf u_b|$ and $c$ is the drag
 
 | law | $c(U)$ |
 |---|---|
-| Weertman | $\beta\,(U^2+u_{\rm reg})^{(m-1)/2} + w_d$ |
-| regularized Coulomb | $\beta/(\sqrt{U^2+u_{\rm reg}}+u_c) + w_d$ |
+| Weertman | $\beta\,(U^2+u_{\mathrm{reg}})^{(m-1)/2} + w_d$ |
+| regularized Coulomb | $\beta/(\sqrt{U^2+u_{\mathrm{reg}}}+u_c) + w_d$ |
 
 Because drag and viscosity are isotropic, $\tau_b \parallel \mathbf u_b \parallel
 \bar{\mathbf u}$ (Goldberg: *"$\vec\tau$ will always be in the same direction as
@@ -139,7 +141,7 @@ $(\bar u,\bar v)$"*), so the vector relation collapses to a **scalar equation fo
 basal speed**:
 
 $$
-\boxed{\;R(U_b) \;=\; U_b + f(U_b)\,F_2 - \bar U \;=\; 0\;}
+R(U_b) = U_b + f(U_b)\,F_2 - \bar U = 0
 $$
 
 - **Linear** $f$: closed form, $U_b = \bar U/(1+\beta F_2)$.
@@ -153,9 +155,10 @@ few iterations from any start.
 ### 2.6 The effective drag
 
 $$
-\boxed{\;\tau_b = \beta_{\rm eff}\,\bar U,\qquad
-\beta_{\rm eff} = \frac{c(U_b)}{1 + c(U_b)F_2}\;}
-\tag{G-41}
+\tau_b = \beta_{\mathrm{eff}}\,\bar U,
+\qquad
+\beta_{\mathrm{eff}} = \frac{c(U_b)}{1 + c(U_b)F_2}
+\qquad \text{(G-41)}
 $$
 
 Three properties worth noting:
@@ -164,11 +167,11 @@ Three properties worth noting:
 - it is **strictly non-negative**, so the drag remains a dissipative (coercive) term
   in the elliptic operator — the property the momentum solve depends on;
 - in the **frozen-bed limit** $U_b\to0$ it tends to $1/F_2 = H/\omega$ (G-40), a
-  *finite* deformational resistance, where SSA would give $\beta_{\rm eff}=0$ and lose
+  *finite* deformational resistance, where SSA would give $\beta_{\mathrm{eff}}=0$ and lose
   all interior traction. This is the main physical gain of DIVA over SSA.
 
 **Implementation note.** We work with the coefficient $c(U)$ rather than the drag
-$f(U)=c U$ precisely so that $\beta_{\rm eff}$ needs no division by $\bar U$, which
+$f(U)=c U$ precisely so that $\beta_{\mathrm{eff}}$ needs no division by $\bar U$, which
 would be $0/0$ in every stagnant or ice-free cell.
 
 ### 2.7 Secant versus tangent
@@ -178,7 +181,7 @@ The residual uses the **secant** drag above. The Jacobian needs the **tangent**:
 $$
 \frac{\partial\tau_b}{\partial\bar U} = \frac{f'(U_b)}{1+f'(U_b)F_2}
 \qquad\text{vs.}\qquad
-\beta_{\rm eff} = \frac{c(U_b)}{1+c(U_b)F_2}.
+\beta_{\mathrm{eff}} = \frac{c(U_b)}{1+c(U_b)F_2}.
 $$
 
 They coincide for a linear law ($c$ constant $\Rightarrow f'=c$) and differ for any
@@ -195,7 +198,7 @@ nonlinear one. Getting this right is the single most error-prone part of the sch
 | operator stencil / sparsity | 5-point membrane + drag | **unchanged** |
 | viscosity | $\eta(\bar u)$, explicit formula, computed **inline** | $\bar\eta$: depth average of an **implicit** $\eta(z)$, computed by a **separate kernel** and read as a field |
 | vertical structure | none (plug flow) | $N_\sigma$ sigma levels, integrated away per cell |
-| basal drag | sliding law evaluated on $\bar u$ | effective drag $\beta_{\rm eff}$ from the closure, evaluated on $\bar u$ |
+| basal drag | sliding law evaluated on $\bar u$ | effective drag $\beta_{\mathrm{eff}}$ from the closure, evaluated on $\bar u$ |
 | basal speed | $=\bar u$ by assumption | separate quantity $U_b\le\bar U$ from the closure |
 | extra state | — | `u_b`, `eta_bar`, `F2`, `beta_eff` (all cell-centred 2-D) |
 | block size | 5 ($u_l,u_r,v_t,v_b,H$) | 6 (adds $U_b$), condensed back to 5 |
@@ -221,7 +224,7 @@ $\dot\varepsilon_{xz} = \tau_b\zeta/(2\eta)$, so $\eta$ appears inside the expre
 for its own argument:
 
 $$
-\eta_k = \tfrac12 B\Big[\dot\varepsilon^2_{\rm mem} + \big(\tfrac{\tau_b \zeta_k}{2\eta_k}\big)^2 + \varepsilon_{\rm reg}\Big]^{\frac{1-n}{2n}} .
+\eta_k = \tfrac12 B\Big[\dot\varepsilon^2_{\mathrm{mem}} + \big(\tfrac{\tau_b \zeta_k}{2\eta_k}\big)^2 + \varepsilon_{\mathrm{reg}}\Big]^{\frac{1-n}{2n}} .
 $$
 
 There is no closed form for $n=3$, so this needs a local fixed-point iteration. SSA has
@@ -304,7 +307,7 @@ exactly two places:
 
 1. the $\eta$ tile is read from `eta_bar` instead of `populate_viscosity`;
 2. the basal term uses `get_tau_bx_diva_jac` / `get_tau_by_diva_jac`
-   ($\tau_b=-\beta_{\rm eff}\bar u$, linear in velocity) instead of the sliding-law
+   ($\tau_b=-\beta_{\mathrm{eff}}\bar u$, linear in velocity) instead of the sliding-law
    stencil.
 
 ### 5.5 The smoother
@@ -326,7 +329,7 @@ $$
 =\begin{bmatrix} \mathbf r \\ r_{U_b}\end{bmatrix},
 \qquad
 \begin{aligned}
-b_a &= \frac{\partial r_a}{\partial\beta_{\rm eff}}\cdot\frac{c'}{(1+cF_2)^2}\\
+b_a &= \frac{\partial r_a}{\partial\beta_{\mathrm{eff}}}\cdot\frac{c'}{(1+cF_2)^2}\\
 c_a &= -\frac{\partial \bar U}{\partial x_a}\\
 d &= 1 + f'(U_b)F_2 \;\ge\; 1
 \end{aligned}
@@ -335,7 +338,7 @@ $$
 Because $d$ is a **scalar and never singular**, $U_b$ is eliminated *analytically*:
 
 $$
-\Big(A - \frac{\mathbf b\mathbf c^{\mathsf T}}{d}\Big)\delta\mathbf x
+\left(A - \frac{\mathbf b\,\mathbf c^{\mathsf T}}{d}\right)\delta\mathbf x
 = \mathbf r - \frac{\mathbf b\, r_{U_b}}{d},
 \qquad
 \delta U_b = \frac{r_{U_b} - \mathbf c\cdot\delta\mathbf x}{d}.
@@ -363,7 +366,7 @@ explicit $6\times6$ on random systems.
 ### 5.7 Multigrid
 
 Nothing in the FAS cycle changes. Each level diagnoses its own $\bar\eta, F_2,
-\beta_{\rm eff}$ from its own restricted state, including for the coarse-grid operator
+\beta_{\mathrm{eff}}$ from its own restricted state, including for the coarse-grid operator
 evaluations $F_c(I u_h)$, so the coarse-grid correction is consistent. `u_b` is
 restricted with the rest of the state (giving the coarse closure a good warm start) and
 needs no prolongation, since it is diagnosed rather than corrected. The DIVA
@@ -376,7 +379,7 @@ auxiliaries are all cell-local, so no new transfer operator is required.
 | test | what it establishes |
 |---|---|
 | `ssa_regression_test.py` | SSA (both sliding laws) is **bit-identical** to the pre-DIVA reference. Run after every commit on this branch; it is what makes the shared-body refactors provably safe. |
-| `diva_closure_test.py` | $\bar\eta$ collapses onto the analytic SSA viscosity with no shear; $F_2$ matches the quadrature to 1e-6; the Newton reproduces the linear closed form to 6 digits; the Coulomb closure residual is 2e-7; $\beta_{\rm eff}$ matches (G-41) and $\tau_b=\beta_{\rm eff}\bar U$ holds. |
+| `diva_closure_test.py` | $\bar\eta$ collapses onto the analytic SSA viscosity with no shear; $F_2$ matches the quadrature to 1e-6; the Newton reproduces the linear closed form to 6 digits; the Coulomb closure residual is 2e-7; $\beta_{\mathrm{eff}}$ matches (G-41) and $\tau_b=\beta_{\mathrm{eff}}\bar U$ holds. |
 | `diva_residual_test.py` | Handed the SSA coefficients, the DIVA residual reproduces the SSA residual **bit-for-bit** — pins the grounding/`water_drag` bookkeeping. |
 | `diva_condensation_test.py` | The condensed $5\times5$ reproduces the full $6\times6$ to 1.1e-7; DIVA converges under regularized Coulomb. |
 | `diva_solve_test.py` | End-to-end: DIVA converges as well as SSA ($1.0\times10^{-4}$ vs $9.9\times10^{-5}$), is 4.1 % faster than SSA (deformation on top of sliding), $0\le u_b\le\bar U$, $F_2>0$, deterministic, and agrees across multigrid depths to 2.2e-5. |
@@ -391,7 +394,7 @@ auxiliaries are all cell-local, so no new transfer operator is required.
 - **The adjoint.** `vanka_smooth_adjoint` is still SSA-only (it passes `nullptr` for the
   DIVA fields). This is the next piece of work and the condition under which the author
   endorsed the effort. The pieces are in place: `get_diva_dbeta_eff_du_b` already
-  supplies $\partial\beta_{\rm eff}/\partial U_b$, and the parameter chain factor is
+  supplies $\partial\beta_{\mathrm{eff}}/\partial U_b$, and the parameter chain factor is
   $f_\theta(U_b)/(1+f'(U_b)F_2)$ — closed-form via the implicit function theorem at the
   converged $U_b$, so the adjoint never re-runs the per-cell Newton in reverse.
 - **ISMIP-HOM validation.** Goldberg runs experiment C and nonlinear-sliding cases;

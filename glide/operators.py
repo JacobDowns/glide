@@ -569,6 +569,8 @@ class AdjointOperators:
             self.grid.adjoint.lambda_H.data[:] -= self.vanka_config.omega * self.delta_lambda_H
 
     def compute_gradient_beta(self):
+        if float(self.grid.rheology.stress_balance.value) > 0.5:
+            return self._compute_gradient_beta_diva()
         kernel = self.kernels.get_function('compute_gradient_beta')
         grid_size, block_size, stride, halo = self._kernel_config
 
@@ -597,6 +599,30 @@ class AdjointOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving.calving_rate.value, calving.flotation_reg_calving.value,
                 grid.dx, cp.float32(0.0),
+                grid.ny, grid.nx, stride, halo))
+
+    def _compute_gradient_beta_diva(self):
+        """dJ/d(beta) under DIVA: the same transpose as the SSA kernel, with the
+        sensitivity routed through beta_eff and the closure."""
+        kernel = self.kernels.get_function('compute_gradient_beta_diva')
+        grid_size, block_size, stride, halo = self._kernel_config
+
+        grid = self.grid
+        state = grid.state
+        adjoint = grid.adjoint
+        rheology = grid.rheology
+        sliding = grid.sliding
+
+        sliding.beta.grad.fill(0)
+        kernel(grid_size, block_size,
+               (sliding.beta.grad,
+                state.u.data, state.v.data,
+                adjoint.lambda_u.data, adjoint.lambda_v.data,
+                state.phi.data,
+                sliding.beta.data, sliding.u_c.data, sliding.beta_eff.data,
+                state.u_b.data, rheology.F2.data,
+                sliding.m.value, sliding.u_reg.value,
+                sliding.water_drag.value, sliding.sliding_law.value,
                 grid.ny, grid.nx, stride, halo))
 
     def compute_gradient_m(self):

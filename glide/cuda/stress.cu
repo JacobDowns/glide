@@ -495,6 +495,38 @@ float get_diva_dbeta_eff_du_b(
     return c.d/(denom*denom);
 }
 
+__device__ __forceinline__
+float get_diva_dbeta_eff_dbeta(
+    float U_b, float F2,
+    float beta, float grounded, float m, float u_reg, float water_drag,
+    float u_c, float sliding_law){
+
+    // d(beta_eff)/d(beta), INCLUDING the closure's own response to beta -- this is the
+    // parameter sensitivity the inversion needs, and it is not simply
+    // d/d(beta)[c/(1+c*F2)] at fixed U_b, because changing beta moves U_b too.
+    //
+    // Implicit differentiation of R(U_b,beta) = U_b + f(U_b,beta)*F2 - Ubar = 0 gives
+    //     dU_b/d(beta) = -f_beta*F2 / (1 + f'*F2)
+    // and hence, for tau_b = f(U_b,beta),
+    //     d(tau_b)/d(beta) = f_beta / (1 + f'*F2).
+    // Writing tau_b = beta_eff*Ubar and eliminating Ubar with the closure identity
+    // Ubar = U_b(1 + c*F2) -- which avoids a 0/0 where the ice is at rest -- leaves
+    //     d(beta_eff)/d(beta) = c_beta / ((1 + c*F2)(1 + f'*F2)).
+    //
+    // c_beta is evaluated directly from the law rather than as (c - water_drag)/beta,
+    // so it stays finite where beta = 0.  Grounding appears because compute_diva_coeffs
+    // forms c from beta*grounded.
+    DualFloat c = get_diva_drag_coeff({U_b,1.0f},beta*grounded,m,u_reg,water_drag,u_c,sliding_law);
+    DualFloat f = c * DualFloat{U_b,1.0f};        // f = c*U, so f.d = f'(U_b)
+
+    float U_sq_reg = U_b*U_b + u_reg;
+    float c_beta = (sliding_law < 0.5f)
+                 ? grounded*__powf(U_sq_reg, 0.5f*(m - 1.0f))
+                 : grounded/(sqrtf(U_sq_reg) + u_c);
+
+    return c_beta/((1.0f + c.v*F2)*(1.0f + f.d*F2));
+}
+
 struct TauBxDivaJacobian {
     float res;
     float d_u;

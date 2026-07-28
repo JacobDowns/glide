@@ -349,3 +349,91 @@ void compute_gradient_bed(
 	}
     }
 }
+
+/*=========================================================
+  ====== dJ/d(beta) under DIVA (stress_balance = 1) =======
+  =========================================================*/
+/*
+  The same transpose as compute_gradient_beta -- loop over momentum rows, scatter
+  lambda_row * d(r_row)/d(beta_col) to the COLUMN index -- but the sensitivity now runs
+  through the effective drag, tau_b = -beta_eff*ubar, and beta_eff responds to beta both
+  directly and through the closure.  get_diva_dbeta_eff_dbeta (stress.cu) supplies that
+  combined factor from the implicit function theorem at the converged U_b, so this kernel
+  is just the chain rule on top of the same scatter pattern.
+
+  The guard bounds deliberately mirror compute_gradient_beta; see notes/open_questions.md
+  Q2, which asks whether the nx-1 / ny-1 bounds should be nx / ny.  Whatever is decided
+  there should be applied to all of these kernels together.
+*/
+extern "C" __global__
+void compute_gradient_beta_diva(
+    float* __restrict__ grad_beta,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ lambda_u,
+    const float* __restrict__ lambda_v,
+    const float* __restrict__ phi,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ beta_eff,
+    const float* __restrict__ u_b,
+    const float* __restrict__ F2,
+    float m, float u_reg, float water_drag, float sliding_law,
+    int ny, int nx, int stride, int halo)
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+
+    bool has_u = i >= 0 && i <  ny && j >= 0 && j <= nx;
+    bool has_v = i >= 0 && i <= ny && j >= 0 && j <  nx;
+
+    if ( is_active ) {
+
+	// u-momentum row at the left facet of cell (i,j); the right facet is handled by
+	// the next cell over, as in the residual.
+	if (has_u){
+	    float u_l = get_vfacet(u,i,j,ny,nx);
+	    float lambda_u_l = get_vfacet(lambda_u,i,j,ny,nx);
+
+	    float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
+	    float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+	    TauBxDivaJacobian jac = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
+
+	    float dbe_l = get_diva_dbeta_eff_dbeta(
+		    get_cell(u_b,i,j-1,ny,nx), get_cell(F2,i,j-1,ny,nx),
+		    get_cell(beta,i,j-1,ny,nx), get_cell(phi,i,j-1,ny,nx),
+		    m,u_reg,water_drag,get_cell(u_c,i,j-1,ny,nx),sliding_law);
+	    float dbe_c = get_diva_dbeta_eff_dbeta(
+		    get_cell(u_b,i,j,ny,nx), get_cell(F2,i,j,ny,nx),
+		    get_cell(beta,i,j,ny,nx), get_cell(phi,i,j,ny,nx),
+		    m,u_reg,water_drag,get_cell(u_c,i,j,ny,nx),sliding_law);
+
+	    if (j>0     )  {atomicAdd(&grad_beta[i * nx + j - 1],lambda_u_l * jac.d_beta_eff_l * dbe_l);}
+	    if (j<(nx-1))  {atomicAdd(&grad_beta[i * nx + j]    ,lambda_u_l * jac.d_beta_eff_r * dbe_c);}
+	}
+
+	if (has_v){
+	    float v_t = get_hfacet(v,i,j,ny,nx);
+	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
+
+	    float beta_eff_t = get_cell(beta_eff,i-1,j,ny,nx);
+	    float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+	    TauByDivaJacobian jac = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
+
+	    float dbe_t = get_diva_dbeta_eff_dbeta(
+		    get_cell(u_b,i-1,j,ny,nx), get_cell(F2,i-1,j,ny,nx),
+		    get_cell(beta,i-1,j,ny,nx), get_cell(phi,i-1,j,ny,nx),
+		    m,u_reg,water_drag,get_cell(u_c,i-1,j,ny,nx),sliding_law);
+	    float dbe_c = get_diva_dbeta_eff_dbeta(
+		    get_cell(u_b,i,j,ny,nx), get_cell(F2,i,j,ny,nx),
+		    get_cell(beta,i,j,ny,nx), get_cell(phi,i,j,ny,nx),
+		    m,u_reg,water_drag,get_cell(u_c,i,j,ny,nx),sliding_law);
+
+	    if (i>0     ) {atomicAdd(&grad_beta[(i-1) * nx + j],lambda_v_t * jac.d_beta_eff_t * dbe_t);}
+	    if (i<(ny-1)) {atomicAdd(&grad_beta[i * nx + j]    ,lambda_v_t * jac.d_beta_eff_b * dbe_c);}
+	}
+    }
+}

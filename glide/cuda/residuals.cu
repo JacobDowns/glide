@@ -48,12 +48,12 @@ __device__ void residual_body(
     if (i > ny || j > nx) return;
 
     if (DIVA) {
-	// The vertical quadrature cannot live inside a per-stencil call, so DIVA reads
-	// the depth-averaged viscosity diagnosed by compute_diva_coeffs instead of
-	// forming eta inline.  It must therefore be refreshed before each evaluation.
-	eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);
+		// The vertical quadrature cannot live inside a per-stencil call, so DIVA reads
+		// the depth-averaged viscosity diagnosed by compute_diva_coeffs instead of
+		// forming eta inline.  It must therefore be refreshed before each evaluation.
+		eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);
     } else {
-	populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+		populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
     }
 
     __syncthreads();

@@ -62,7 +62,41 @@ struct DualFloat {
 	return {s * inv_a, -s * a.d * inv_a * inv_a};
     }
 
+    // Scalar minus dual: (s - u, -du)
+    __device__ __forceinline__ friend DualFloat operator-(float s, DualFloat a) {
+	return {s - a.v, -a.d};
+    }
+
+    // Negation: (-u, -du)
+    __device__ __forceinline__ friend DualFloat operator-(DualFloat a) {
+	return {-a.v, -a.d};
+    }
+
 };
+
+// Clamps.  These are not differentiable where the two arguments cross, so the
+// convention is the one-sided derivative of whichever branch is selected: the dual
+// propagates through when the dual argument wins, and the derivative is zero when the
+// constant does.  Callers must keep that in mind -- a clamp that is active at the
+// solution contributes no sensitivity.
+__device__ __forceinline__ DualFloat fmaxf(DualFloat a, float s) {
+    return a.v >= s ? a : DualFloat{s, 0.0f};
+}
+
+__device__ __forceinline__ DualFloat fminf(DualFloat a, float s) {
+    return a.v <= s ? a : DualFloat{s, 0.0f};
+}
+
+__device__ __forceinline__ DualFloat fminf(DualFloat a, DualFloat b) {
+    return a.v <= b.v ? a : b;
+}
+
+__device__ __forceinline__ DualFloat logf(DualFloat u) {
+    // d/dx(log u) = du/u.  Needed for parameter derivatives w.r.t. an exponent, e.g.
+    // d/dm (x)^((m-1)/2) = (x)^((m-1)/2) * 0.5*log(x), which __powf(dual,float)
+    // cannot supply because its exponent is a plain float.
+    return {logf(u.v), u.d / u.v};
+}
 
 __device__ __forceinline__ DualFloat __powf(DualFloat u, float p) {
     // High-performance hardware intrinsic pow

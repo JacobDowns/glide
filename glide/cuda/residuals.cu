@@ -770,8 +770,18 @@ void compute_jvp(
   ==================== VJP Computation ====================
   =========================================================*/
 
-extern "C" __global__
-void compute_vjp(
+// Shared body for the SSA and DIVA adjoint residuals (VJP).  Mirrors
+// residual_body: DIVA is a compile-time flag and the two differ only in the membrane
+// viscosity and the basal drag.
+//
+// NOTE on the basal term.  SSA computes lambda_row * d(r_row)/d(x_col) and scatters it
+// to the COLUMN index -- a genuine transpose.  The DIVA basal drag tau_b = -beta_eff*ubar
+// is linear in the velocity with beta_eff a lagged field, so the only nonzero partial is
+// d(r)/d(u) at the same facet; the transpose is correspondingly trivial.  The velocity
+// dependence hidden inside beta_eff (through the closure) is NOT included here -- this is
+// the frozen-coefficient adjoint.  See notes/diva_numerics.md section 5.8.
+template <bool DIVA>
+__device__ void vjp_body(
     float* __restrict__ vjp_u,
     float* __restrict__ vjp_v,
     float* __restrict__ vjp_H,
@@ -791,6 +801,8 @@ void compute_vjp(
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,     // DIVA only
+    const float* __restrict__ beta_eff,    // DIVA only
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
@@ -824,7 +836,14 @@ void compute_vjp(
 
     __shared__ DualFloat eta_local[bny][bnx];
 
-    populate_viscosity(eta_local, bi, bj, i, j, u, v, lambda_u, lambda_v, B, n, eps_reg, dx, ny, nx);
+    if (DIVA) {
+	// Frozen coefficients: the value is the lagged eta_bar and the perturbation slot
+	// is zero, so no d(eta_bar)/du contribution enters the adjoint.  Exact for the
+	// operator Goldberg proves self-adjoint; the omitted term is the next increment.
+	eta_local[bi][bj] = {get_cell(eta_bar, i, j, ny, nx), 0.0f};
+    } else {
+	populate_viscosity(eta_local, bi, bj, i, j, u, v, lambda_u, lambda_v, B, n, eps_reg, dx, ny, nx);
+    }
 
     __syncthreads();
     bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
@@ -1029,17 +1048,23 @@ void compute_vjp(
 	    float u_c_l = get_cell(u_c,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
-	    TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
-
-
 	    float lambda_u_l = get_vfacet(lambda_u,i,j,ny,nx);
-	    atomicAdd(&s_adj_u[bi][bj],     lambda_u_l * j_tau_bx.d_u);
-	    atomicAdd(&s_adj_v[bi][bj-1],   lambda_u_l * j_tau_bx.d_v_tl);
-	    atomicAdd(&s_adj_v[bi][bj],     lambda_u_l * j_tau_bx.d_v_tr);
-	    atomicAdd(&s_adj_v[bi+1][bj-1], lambda_u_l * j_tau_bx.d_v_bl);
-	    atomicAdd(&s_adj_v[bi+1][bj],   lambda_u_l * j_tau_bx.d_v_br);
-	    atomicAdd(&s_adj_H[bi][bj-1],   lambda_u_l * j_tau_bx.d_H_l);
-	    atomicAdd(&s_adj_H[bi][bj],     lambda_u_l * j_tau_bx.d_H_r);
+
+	    if (DIVA) {
+		float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
+		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+		TauBxDivaJacobian j_tau_bx = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
+		atomicAdd(&s_adj_u[bi][bj], lambda_u_l * j_tau_bx.d_u);
+	    } else {
+		TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
+		atomicAdd(&s_adj_u[bi][bj],     lambda_u_l * j_tau_bx.d_u);
+		atomicAdd(&s_adj_v[bi][bj-1],   lambda_u_l * j_tau_bx.d_v_tl);
+		atomicAdd(&s_adj_v[bi][bj],     lambda_u_l * j_tau_bx.d_v_tr);
+		atomicAdd(&s_adj_v[bi+1][bj-1], lambda_u_l * j_tau_bx.d_v_bl);
+		atomicAdd(&s_adj_v[bi+1][bj],   lambda_u_l * j_tau_bx.d_v_br);
+		atomicAdd(&s_adj_H[bi][bj-1],   lambda_u_l * j_tau_bx.d_H_l);
+		atomicAdd(&s_adj_H[bi][bj],     lambda_u_l * j_tau_bx.d_H_r);
+	    }
 
 	    }
 	    
@@ -1191,17 +1216,23 @@ void compute_vjp(
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
-	    TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
-	    
 	    float lambda_v_t = get_hfacet(lambda_v,i,j,ny,nx);
-	    
-	    atomicAdd(&s_adj_v[bi][bj],    lambda_v_t * j_tau_by.d_v);
-            atomicAdd(&s_adj_u[bi-1][bj],   lambda_v_t * j_tau_by.d_u_tl);
-            atomicAdd(&s_adj_u[bi-1][bj+1], lambda_v_t * j_tau_by.d_u_tr);
-            atomicAdd(&s_adj_u[bi][bj],     lambda_v_t * j_tau_by.d_u_bl);
-            atomicAdd(&s_adj_u[bi][bj+1],   lambda_v_t * j_tau_by.d_u_br);
-	    atomicAdd(&s_adj_H[bi-1][bj],  lambda_v_t * j_tau_by.d_H_t);
-	    atomicAdd(&s_adj_H[bi][bj],    lambda_v_t * j_tau_by.d_H_b);
+
+	    if (DIVA) {
+		float beta_eff_t = get_cell(beta_eff,i-1,j,ny,nx);
+		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+		TauByDivaJacobian j_tau_by = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
+		atomicAdd(&s_adj_v[bi][bj], lambda_v_t * j_tau_by.d_v);
+	    } else {
+		TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
+		atomicAdd(&s_adj_v[bi][bj],    lambda_v_t * j_tau_by.d_v);
+		atomicAdd(&s_adj_u[bi-1][bj],   lambda_v_t * j_tau_by.d_u_tl);
+		atomicAdd(&s_adj_u[bi-1][bj+1], lambda_v_t * j_tau_by.d_u_tr);
+		atomicAdd(&s_adj_u[bi][bj],     lambda_v_t * j_tau_by.d_u_bl);
+		atomicAdd(&s_adj_u[bi][bj+1],   lambda_v_t * j_tau_by.d_u_br);
+		atomicAdd(&s_adj_H[bi-1][bj],  lambda_v_t * j_tau_by.d_H_t);
+		atomicAdd(&s_adj_H[bi][bj],    lambda_v_t * j_tau_by.d_H_b);
+	    }
 
 	    }
 	    
@@ -1272,4 +1303,77 @@ void compute_vjp(
     }
     
 
+}
+
+
+extern "C" __global__
+void compute_vjp(
+    float* __restrict__ vjp_u,
+    float* __restrict__ vjp_v,
+    float* __restrict__ vjp_H,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ lambda_u,
+    const float* __restrict__ lambda_v,
+    const float* __restrict__ lambda_H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    bool use_forcing, bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo)
+{
+    vjp_body<false>(vjp_u,vjp_v,vjp_H,u,v,H,lambda_u,lambda_v,lambda_H,phi,mask,
+	    f_u,f_v,f_H,bed,B,beta,u_c,gamma,nullptr,nullptr,
+	    use_forcing,use_mask,n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
+}
+
+extern "C" __global__
+void compute_vjp_diva(
+    float* __restrict__ vjp_u,
+    float* __restrict__ vjp_v,
+    float* __restrict__ vjp_H,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ lambda_u,
+    const float* __restrict__ lambda_v,
+    const float* __restrict__ lambda_H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,
+    const float* __restrict__ beta_eff,
+    bool use_forcing, bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo)
+{
+    vjp_body<true>(vjp_u,vjp_v,vjp_H,u,v,H,lambda_u,lambda_v,lambda_H,phi,mask,
+	    f_u,f_v,f_H,bed,B,beta,u_c,gamma,eta_bar,beta_eff,
+	    use_forcing,use_mask,n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
 }

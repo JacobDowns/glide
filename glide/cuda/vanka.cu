@@ -910,8 +910,13 @@ void vanka_smooth_diva(
 	    newton_steps,relaxation,ssa_damping,mc_damping);
 }
 
-extern "C" __global__
-void vanka_smooth_adjoint(
+// Shared body for the SSA and DIVA adjoint smoothers.  For DIVA the block assembled
+// here is the *uncondensed* one: the frozen-coefficient adjoint omits the closure path,
+// which is exactly what the rank-1 condensation in the forward smoother encodes, so
+// there is nothing to condense.  When the exact closure/d(eta_bar)/du paths land this
+// needs (A - b c^T/d)^T, i.e. b and c swap roles before the transpose below.
+template <bool DIVA>
+__device__ void vanka_smooth_adjoint_body(
     float* __restrict__ lambda_u_out,
     float* __restrict__ lambda_v_out,
     float* __restrict__ lambda_H_out,
@@ -928,6 +933,8 @@ void vanka_smooth_adjoint(
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,     // DIVA only
+    const float* __restrict__ beta_eff,    // DIVA only
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
@@ -949,7 +956,11 @@ void vanka_smooth_adjoint(
 
     if (i < 0 || i >= ny || j<0 || j >= nx) return;
 
-    populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+    if (DIVA) {
+	eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);
+    } else {
+	populate_viscosity(eta_local, bi, bj, i, j, u, v, B, n, eps_reg, dx, ny, nx);
+    }
 
     __syncthreads();
 
@@ -971,10 +982,11 @@ void vanka_smooth_adjoint(
 	float rhs[5] = {0};
 	// Note that the adjoint assembles a forward problem rhs, but it's 
 	// discarded.  
-	build_5x5_vanka<false>(J, rhs, nullptr,
+	float dr_dbeta_eff[5] = {0};        // populated for DIVA but unused: no condensation here
+	build_5x5_vanka<DIVA>(J, rhs, dr_dbeta_eff,
 		u_l, u_r, v_t, v_b, H_c,
 		u, v, H, eta_local, phi,
-		bed, B, beta, u_c, nullptr, gamma,
+		bed, B, beta, u_c, beta_eff, gamma,
 		n, eps_reg, flotation_reg_driving,
 		m, u_reg, water_drag, flotation_reg_sliding, sliding_law,
 		calving_rate, flotation_reg_calving,
@@ -1048,6 +1060,74 @@ void vanka_smooth_adjoint(
     }
 }
 
+
+extern "C" __global__
+void vanka_smooth_adjoint(
+    float* __restrict__ lambda_u_out,
+    float* __restrict__ lambda_v_out,
+    float* __restrict__ lambda_H_out,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ r_adj_u,  
+    const float* __restrict__ r_adj_v,
+    const float* __restrict__ r_adj_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo,
+    float ssa_damping, float mc_damping
+    ) {
+    vanka_smooth_adjoint_body<false>(lambda_u_out,lambda_v_out,lambda_H_out,u,v,H,phi,mask,
+	    r_adj_u,r_adj_v,r_adj_H,bed,B,beta,u_c,gamma,nullptr,nullptr,
+	    n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
+	    ssa_damping,mc_damping);
+}
+
+extern "C" __global__
+void vanka_smooth_adjoint_diva(
+    float* __restrict__ lambda_u_out,
+    float* __restrict__ lambda_v_out,
+    float* __restrict__ lambda_H_out,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ r_adj_u,  
+    const float* __restrict__ r_adj_v,
+    const float* __restrict__ r_adj_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    const float* __restrict__ eta_bar,     // DIVA only
+    const float* __restrict__ beta_eff,    // DIVA only
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo,
+    float ssa_damping, float mc_damping
+    ) {
+    vanka_smooth_adjoint_body<true>(lambda_u_out,lambda_v_out,lambda_H_out,u,v,H,phi,mask,
+	    r_adj_u,r_adj_v,r_adj_H,bed,B,beta,u_c,gamma,eta_bar,beta_eff,
+	    n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
+	    ssa_damping,mc_damping);
+}
 
 extern "C" __global__
 void vanka_dump(

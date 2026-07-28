@@ -45,8 +45,14 @@ Note the asymmetry with the forward solver: there the operator is genuinely nonl
 FAS is required and the cancellation is a price that must be paid. In the adjoint it is
 avoidable.
 
-**Hypothesis.** This may contribute to the adjoint solve plateauing near `1e-4` relative
-residual rather than reaching the requested `1e-6`.
+**Hypothesis, and evidence against it so far.** This *could* limit how far the adjoint
+solve converges. However, on the `tests/diva_adjoint_test.py` configuration the SSA
+adjoint reaches `9.5e-7` in 3 V-cycles and the DIVA adjoint `1.1e-6` in 20, i.e. both
+attain the requested `1e-6`. So the cancellation is a theoretical concern that has **not
+been demonstrated to bite**; the plateau originally observed in `tests/grad_test.py` is
+more plausibly the under-converged *forward* solve there (see Q3). Recorded because the
+argument is structural and the fix is cheap, not because a failure has been attributed
+to it.
 
 **Proposed test** (small, contained): switch the adjoint `vcycle` to the correction
 scheme -- `f_c = −I r_h`, zero the coarse `λ`, prolong `λ_c` directly -- and see whether

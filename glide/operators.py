@@ -417,7 +417,9 @@ class AdjointOperators:
             freeze_calving=False, 
             return_norms=False):
 
-        kernel = self.kernels.get_function('compute_vjp')
+        diva = float(self.grid.rheology.stress_balance.value) > 0.5
+        kernel = self.kernels.get_function('compute_vjp_diva' if diva
+                                           else 'compute_vjp')
         grid_size, block_size, stride, halo = self._kernel_config
   
         grid = self.grid
@@ -448,6 +450,7 @@ class AdjointOperators:
                 rheology.B.data, 
                 sliding.beta.data, sliding.u_c.data,
                 self.gamma,
+                *((rheology.eta_bar.data, sliding.beta_eff.data) if diva else ()),
                 use_forcing, use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
@@ -467,7 +470,9 @@ class AdjointOperators:
             use_forcing=False,
             freeze_calving=False):
 
-        kernel = self.kernels.get_function('compute_vjp')
+        diva = float(self.grid.rheology.stress_balance.value) > 0.5
+        kernel = self.kernels.get_function('compute_vjp_diva' if diva
+                                           else 'compute_vjp')
         grid_size, block_size, stride, halo = self._kernel_config
   
         grid = self.grid
@@ -498,6 +503,7 @@ class AdjointOperators:
                 rheology.B.data, 
                 sliding.beta.data, sliding.u_c.data,
                 self.gamma,
+                *((rheology.eta_bar.data, sliding.beta_eff.data) if diva else ()),
                 use_forcing, use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
@@ -511,7 +517,9 @@ class AdjointOperators:
     def vanka_smooth(self, dt,
             freeze_calving=False):
 
-        kernel = self.kernels.get_function('vanka_smooth_adjoint')
+        diva = float(self.grid.rheology.stress_balance.value) > 0.5
+        kernel = self.kernels.get_function('vanka_smooth_adjoint_diva' if diva
+                                           else 'vanka_smooth_adjoint')
         grid_size, block_size, stride, halo = self._kernel_config
 
         grid = self.grid
@@ -537,6 +545,7 @@ class AdjointOperators:
                 self.r_u, self.r_v, self.r_H,
                 geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data, 
                 self.gamma,
+                *((rheology.eta_bar.data, sliding.beta_eff.data) if diva else ()),
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 

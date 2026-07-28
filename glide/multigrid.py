@@ -1016,6 +1016,12 @@ class FASAdjointSolver:
         mg.restrict_cell(level.grid.state.phi.data,next_level.grid.state.phi.data)
         mg.restrict_cell(level.grid.state.mask.data,next_level.grid.state.mask.data,method='max')
 
+        # DIVA: eta_bar/F2/beta_eff/u_b are part of "the forward state" the adjoint is
+        # evaluated at, so they must be consistent with the state just restricted above.
+        # They are a deterministic function of it, so recompute rather than restrict.
+        if float(next_level.grid.rheology.stress_balance.value) > 0.5:
+            next_level.grid.forward_operators.compute_diva_coeffs()
+
         # Restrict adjoint solution to child
         mg.restrict_vfacet(level.grid.adjoint.lambda_u.data,next_level.grid.adjoint.lambda_u.data)
         mg.restrict_hfacet(level.grid.adjoint.lambda_v.data,next_level.grid.adjoint.lambda_v.data)

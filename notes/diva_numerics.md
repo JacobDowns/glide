@@ -1,6 +1,6 @@
 # DIVA in GLIDE: mathematics and numerical method
 
-**Branch:** `diva` (off `sliding-laws`) · **Status:** forward model implemented and verified; adjoint not yet started · **Companion:** `notes/diva.md` (the design proposal and staged plan)
+**Branch:** `diva` (off `sliding-laws`) · **Status:** forward model, exact adjoint and `dJ/d(beta)` all implemented and verified; ISMIP-HOM validation outstanding · **Companion:** `notes/diva.md` (the design proposal and staged plan)
 
 **See also:** `notes/diva.md` (design and staged plan) and `notes/open_questions.md` (issues found in existing upstream code while doing this work -- not addressed here).
 

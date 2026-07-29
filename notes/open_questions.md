@@ -211,64 +211,89 @@ other than 0.5.
 
 ------------------------------------------------------------------------
 
-## Q6. The forward solve stalls an order of magnitude short of its tolerance
+## Q6. The reported residual norm mixes units, so `|r|/|r0|` understates convergence
 
-Every forward solve in `tests/` asks for `relative_tolerance = 1e-6` and none reaches it.
-On the standard 128^2 slab configuration the V-cycles plateau at `|r|/|r0| ~ 1.0e-4` and stay
-there:
+**This entry replaces an earlier claim that the forward solve stalls an order of magnitude
+short of its tolerance. That was wrong.** The solve converges to float32 round-off. What
+plateaus is the reported *number*, for reasons that are entirely in the norm.
 
-    V-cycle 1: |r|/|r0| = 1.11e-04, |r_u| = 1.69e-03, |r_v| = 1.37e-03, |r_H| = 2.45e-02
-    V-cycle 2: |r|/|r0| = 1.03e-04, ...
-    V-cycle 19: |r|/|r0| = 1.02e-04, ...
+`FASCDSolver.solve` reports
 
-Quadrupling the V-cycle budget (15 -> 60) does not help, and neither does asking for 1e-12.
-The residual is dominated by `|r_H|`, about 15x the momentum components, so whatever is
-stalling is in the mass row rather than the stress balance. This is pre-existing: it happens
-on the templating commit, before the Q4 fix, and at every multigrid depth.
+```python
+    |r| = sqrt(norm(r_u)**2 + norm(r_v)**2 + norm(r_H)**2)      # cp.linalg.norm, raw L2
+```
 
-It is not float32 round-off -- `|r0| ~ 20`, so 1e-4 relative sits three orders of magnitude
-above `eps`.
+Two problems, both raised by Jake before this was measured.
 
-**Why it matters beyond efficiency.** It sets the floor for every finite-difference check in
-the repo, and the reason is worth stating precisely: an adjoint gradient differentiates the
-*exact* solution of `r(x, theta) = 0`, while a finite difference differentiates *the solver's
-output*. The two agree only to the extent the solver has converged, so the FD-vs-adjoint gap
-partly measures the theta-sensitivity of the solver's own convergence error -- and changing
-the solver path moves that gap in either direction with no adjoint being wrong.
+**1. The three components have different units.** `r_u`, `r_v` are momentum residuals; `r_H`
+is mass (thickness per time). Adding their squares makes the total track whichever has the
+larger raw magnitude, regardless of how converged either is. On the standard 128^2 slab, at
+the point where the reported ratio plateaus:
 
-That is exactly what the Q4 fix exposed. `dJ/d(beta)` for **SSA**, whose adjoint is exact and
-was not touched, went from 1.4e-4 to 1.4e-3; DIVA moved by the same factor. A change
-localised to the shared FD reference is the only thing that can shift both equally.
+    row         |r|        scale of that row      relative      float32 floor for the norm
+    momentum   1.56e-3     2.23e+02  (|r_u| at t=0)   7.0e-6         2.7e-5
+    mass       2.25e-2     1.28e+05  (|H/dt|)         1.8e-7         1.5e-2
 
-**The Q4 fix did not degrade convergence, and this stall is not its doing.** Controlled
-side-by-side, identical configuration, only the prolongation kernel differing:
+The momentum rows are *below* a round-off estimate for their own norm. The mass row sits at
+1.5x its floor. Both are converged as far as float32 permits. `|r_H|` is large in absolute
+terms only because `H ~ 1000` and `dt = 1`, so one ulp per cell over 16384 cells already
+gives ~1.5e-2.
 
-    asymptote (cycle 24)   |r|/|r0|    |r_u|      |r_v|      |r_H|
-    buggy  (vfacet)        9.85e-5    1.57e-3    1.43e-3    2.18e-2
-    fixed  (hfacet)        1.02e-4    1.56e-3    1.40e-3    2.25e-2
+**2. `|r0|` is pure x-momentum in any cold-started scenario.** These tests start from
+`u = v = 0` with `H = H_prev`, so at t=0
 
-Both plateau within about five cycles and then sit unchanged for twenty more. The 3.5%
-difference lives in `r_H`, the component the prolongation does not touch, and `|r_v|` is in
-fact marginally *lower* after the fix.
+    |r_u| = 2.23e+02        (the driving stress)
+    |r_v| = 0.000e+00       (no slope in y, v = 0)
+    |r_H| = 0.000e+00       (H = H_prev and div(uH) = 0)
 
-So a 10x change in finite-difference agreement accompanied a 3.5% change in the residual --
-which is the whole point worth internalising here: **FD agreement is not a measure of
-convergence quality.** The gap being measured is roughly
+`r_H` starts at *exactly zero* and can only grow once the velocities become nonzero. So
+dividing the later mixed norm by this `|r0|` is measuring the mass row's round-off floor in
+units of the momentum row's initial driving stress:
 
-    d/d(theta) [ J(x_solver(theta)) - J(x_exact(theta)) ]
+    1.5e-2 / 2.23e+02  =  6.7e-5     vs the observed plateau of ~1.0e-4.
 
-so it depends on how the *derivative of the leftover error* projects onto the perturbation
-direction, not on the error's magnitude. Two solvers can stall with errors of identical size
-whose theta-dependence projects completely differently. Reading an FD-vs-adjoint number as a
-proxy for solver health, or a change in it as evidence that a solver change was harmful, is
-therefore a mistake -- one worth remembering, because the numbers here invite exactly that
-reading.
+That is the whole "stall". There is nothing to diagnose in the solver.
 
-Consequence for reading the earlier numbers: statements of the form "agrees to 2e-5, i.e. at
-the finite-difference floor" should be read as "at the floor set by the forward solve's
-stall", which is a weaker claim than round-off-limited. `tests/diva_gradient_test.py` was
-therefore changed to judge DIVA against the SSA control rather than against an absolute
-bound, since the control measures that shared floor directly.
+**3. Not normalised by grid size.** `cp.linalg.norm` over an (ny, nx) array grows like
+`sqrt(N)` for a fixed pointwise residual. `|r|/|r0|` is unaffected (both scale together), but
+`absolute_tolerance` means something different at every resolution, and absolute residuals are
+not comparable across the hierarchy.
 
-Diagnosing the stall would be worth doing on its own account: a solver that converged to
-1e-8 would make every gradient check in the repo an order of magnitude sharper.
+**Suggested fix**, if this is worth changing upstream: report each row separately against a
+scale of its own -- momentum against `|r_u(t=0)|` or the driving-stress norm, mass against
+`|H/dt|` -- and use an RMS rather than a raw L2 so the numbers are resolution-independent.
+As it stands, a converged solve reports `1e-4` and looks like a failure, which is how this
+was misread here in the first place.
+
+------------------------------------------------------------------------
+
+## Q7. What actually limits the finite-difference gradient checks
+
+Worth writing down because it was mis-attributed twice: first to the adjoint, then to a
+non-existent solver stall.
+
+The floor is float32 error in the *state*, and it is measurable. Solving the same problem four
+ways -- all converged to round-off, varying multigrid depth (5 and 3 levels), V-cycle count
+(15 and 40) and smoother strength -- gives
+
+    J = 8.89718281e+04, 8.89718359e+04, 8.89715703e+04, 8.89717188e+04
+
+a spread of **2.66e-1**, i.e. 3.0e-6 of J. The FD numerator at the step the test uses is
+`2*eps*dJ/dbeta.d ~ 79.3`, so the implied floor on relative FD agreement is
+
+    2.66e-1 / 79.3  ~  3.3e-3
+
+Measured agreements sit at or just under that (SSA `dJ/d(beta)` 1.4e-3), which is expected:
+the `+eps` and `-eps` solves use identical settings, so their state errors partially correlate
+and cancel better than the worst-case spread implies.
+
+Two things this rules out. It is **not** the objective's summation: accumulating J in float64
+changes the agreement from 1.365e-3 to 1.330e-3, i.e. not at all. And it is **not** solver
+convergence, per Q6.
+
+Consequence: an SSA `dJ/d(beta)` reading of 1.4e-4, as seen before the Q4 fix, was *better
+than the floor* -- a fortunate cancellation, not a reproducible baseline. That is why it moved
+to 1.4e-3 when the iteration path changed, with no adjoint code touched. Absolute FD bounds on
+this problem should therefore be set near 3e-3, or the comparison should be made against the
+exact-adjoint SSA control, which measures the shared floor directly.
+`tests/diva_gradient_test.py` does the latter.

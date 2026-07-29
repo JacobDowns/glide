@@ -76,6 +76,100 @@ float get_membrane_eps_sq(
     return dudx*dudx + dvdy*dvdy + dudx*dvdy + eps_xy2_bar;
 }
 
+
+__device__ __forceinline__ float diva_primal(float x)     { return x; }
+__device__ __forceinline__ float diva_primal(DualFloat x) { return x.v; }
+
+template <typename T>
+__device__ __forceinline__
+T get_diva_c_of_U(
+    T U, float beta_grounded, float m, float u_reg, float water_drag,
+    float u_c, float sliding_law){
+
+    // The drag coefficient c(U) of get_diva_drag_coeff (stress.cu), templated on the
+    // scalar type so the same expression serves the diagnostic kernel (T = float) and
+    // the JVP, where T = DualFloat carries d/d(velocity perturbation).
+    T U_sq_reg = U*U + u_reg;
+
+    T c;
+    if (sliding_law < 0.5f) {
+        c = beta_grounded * __powf(U_sq_reg, 0.5f*(m - 1.0f));
+    } else {
+        c = beta_grounded / (sqrtf(U_sq_reg) + u_c);
+    }
+
+    return c + water_drag;
+}
+
+template <typename T>
+__device__ void diva_coeffs_cell(
+    T eps_mem_sq, T U_bar,                       // the two velocity-dependent inputs
+    float H_c, float B_c, float beta_grounded, float u_c_c,
+    float m, float u_reg, float water_drag, float sliding_law,
+    float glen_exp, float eps_reg, int n_sigma,
+    float U_b_warm,
+    T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out)
+{
+    // Per-cell DIVA closure, shared by compute_diva_coeffs (T = float) and the JVP
+    // (T = DualFloat, seeded with a velocity perturbation direction).
+    //
+    // Note the Newton denominator dR stays a plain float even when T is dual.  That is
+    // deliberate and costs nothing: for U <- U - R(U)/c with any constant c, the
+    // converged derivative satisfies dU = -R_dir/R', independent of c.  So the step
+    // size does not affect the sensitivity, and the second differentiation (f' w.r.t.
+    // U_b, which is not the direction being seeded) can be taken from the primals.
+    const int coupling_iters = 3;
+    const int eta_iters = 3;
+    const int newton_iters = 4;
+
+    float w = 1.0f/(float)n_sigma;
+
+    T U_b = U_b_warm;
+    T coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+    T tau_b = coeff * U_b;
+
+    T eta_avg = T();
+    T F2_c = T();
+
+    for (int c = 0; c < coupling_iters; ++c) {
+        eta_avg = T();
+        F2_c = T();
+
+        for (int k = 0; k < n_sigma; ++k) {
+            float zeta = ((float)k + 0.5f)*w;
+
+            T eta_k = 0.5f*B_c*__powf(eps_mem_sq + eps_reg, glen_exp);
+            for (int e = 0; e < eta_iters; ++e) {
+                T eps_shear = tau_b*zeta/(2.0f*eta_k);
+                eta_k = 0.5f*B_c*__powf(eps_mem_sq + eps_shear*eps_shear + eps_reg, glen_exp);
+            }
+
+            eta_avg = eta_avg + w*eta_k;
+            F2_c    = F2_c + w*zeta*zeta/eta_k;
+        }
+        F2_c = F2_c * H_c;
+
+        for (int it = 0; it < newton_iters; ++it) {
+            coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+            T f = coeff * U_b;
+            T R = U_b + f*F2_c - U_bar;
+            // f'(U_b) from the primals: a separate differentiation from the seeded one.
+            DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},beta_grounded,m,u_reg,water_drag,u_c_c,sliding_law);
+            DualFloat fs = cs * DualFloat{diva_primal(U_b),1.0f};
+            float dR = 1.0f + fs.d*diva_primal(F2_c);
+            U_b = fmaxf(U_b - R/dR, 0.0f);
+        }
+
+        coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+        tau_b = coeff * U_b;
+    }
+
+    eta_bar_out  = eta_avg;
+    F2_out       = F2_c;
+    U_b_out      = U_b;
+    beta_eff_out = coeff/(1.0f + coeff*F2_c);
+}
+
 extern "C" __global__
 void compute_diva_coeffs(
     float* __restrict__ eta_bar,
@@ -134,57 +228,15 @@ void compute_diva_coeffs(
 
     // Warm start from the stored basal speed, bounded by the depth-averaged speed:
     // deformation can only add to sliding, so 0 <= U_b <= U_bar.
-    float U_b = fminf(fmaxf(u_b[idx], 0.0f), U_bar);
-    DualFloat coeff = get_diva_drag_coeff({U_b, 1.0f}, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
-    float tau_b = coeff.v * U_b;
+    float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar);
 
-    // Fixed iteration counts (no per-cell convergence test) keep the cost uniform
-    // across threads and avoid divergence; the outer nonlinear iteration that calls
-    // this kernel absorbs any residual error.
-    const int coupling_iters = 3;   // tau_b <-> (eta(z), F2) <-> U_b
-    const int eta_iters = 3;        // eta_k is implicit in itself through the shear term
-    const int newton_iters = 4;     // R' >= 1, so this converges very fast
-
-    // Midpoint rule in zeta = (s - z)/H over [0,1]: zeta = 0 at the surface, 1 at the bed.
-    float w = 1.0f/(float)n_sigma;
-
-    float eta_avg = 0.0f;
-    float F2_c = 0.0f;
-
-    for (int c = 0; c < coupling_iters; ++c) {
-        eta_avg = 0.0f;
-        F2_c = 0.0f;
-
-        for (int k = 0; k < n_sigma; ++k) {
-            float zeta = ((float)k + 0.5f)*w;
-
-            // The shear ansatz tau_xz = tau_b*(s-z)/H gives eps_xz = tau_b*zeta/(2*eta)
-            // -- the H cancels -- so eta is implicit in itself.  Iterate from the
-            // membrane-only value (which is also the SSA value, recovered when tau_b = 0).
-            float eta_k = 0.5f*B_c*__powf(eps_mem_sq + eps_reg, glen_exp);
-            for (int e = 0; e < eta_iters; ++e) {
-                float eps_shear = tau_b*zeta/(2.0f*eta_k);
-                eta_k = 0.5f*B_c*__powf(eps_mem_sq + eps_shear*eps_shear + eps_reg, glen_exp);
-            }
-
-            eta_avg += w*eta_k;                  // eta_bar = int_0^1 eta dzeta
-            F2_c    += w*zeta*zeta/eta_k;        // F2 = H * int_0^1 zeta^2/eta dzeta
-        }
-        F2_c *= H_c;
-
-        // Closure: Newton on R(U_b) = U_b + f(U_b)*F2 - U_bar, where f(U) = c(U)*U, so
-        // R' = 1 + f'(U_b)*F2 with f and f' both read off the dual product c(U)*U.
-        for (int it = 0; it < newton_iters; ++it) {
-            coeff = get_diva_drag_coeff({U_b, 1.0f}, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
-            DualFloat f = coeff * DualFloat{U_b, 1.0f};
-            float R = U_b + f.v*F2_c - U_bar;
-            float dR = 1.0f + f.d*F2_c;
-            U_b = fmaxf(U_b - R/dR, 0.0f);
-        }
-
-        coeff = get_diva_drag_coeff({U_b, 1.0f}, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
-        tau_b = coeff.v * U_b;
-    }
+    float eta_avg, F2_c, U_b, beta_eff_c;
+    diva_coeffs_cell<float>(eps_mem_sq, U_bar,
+            H_c, B_c, beta_grounded, u_c_c,
+            m, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma,
+            U_b_warm,
+            eta_avg, F2_c, U_b, beta_eff_c);
 
     if (is_active) {
         eta_bar[idx] = eta_avg;
@@ -192,6 +244,6 @@ void compute_diva_coeffs(
         u_b[idx] = U_b;
         // Goldberg eq 41: the secant drag the 2D momentum solve sees, tau_b = beta_eff*U_bar.
         // Strictly non-negative, and finite at rest (no division by the speed).
-        beta_eff[idx] = coeff.v/(1.0f + coeff.v*F2_c);
+        beta_eff[idx] = beta_eff_c;
     }
 }

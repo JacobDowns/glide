@@ -446,11 +446,18 @@ coupling structure, so it measures §5.2.1 without entangling this.
   GLIDE has no such factor, i.e. assumes small bed slopes. Worth quantifying before ISMIP-HOM,
   whose topographic experiments deliberately impose slopes. Note the name collision: Goldberg's $m$
   is geometric, ours is the Weertman exponent.
-- **A possible typo in the paper.** Eq (40) gives the frozen-bed limit as $\tau_x = (H/\omega)\bar u$,
-  i.e. $\beta_{\mathrm{eff}} = H/\omega = 1/F_2$, which is what we implement and what
-  `diva_closure_test` check 1 pins. The text introducing (42) reads $H/(2\omega)$ — a factor of 2
-  apart. Text extraction of typeset maths is unreliable, so this wants an eyeball against the PDF,
-  but if real it is a factor of 2 in frozen-bed drag and worth knowing which is intended.
+- **A typo in the paper — CONFIRMED, and we follow the correct one.** Eq (40) gives the frozen-bed
+  limit as $\tau_x = (H/\omega)\bar u$, i.e. $\beta_{\mathrm{eff}} = H/\omega = 1/F_2$; the text
+  introducing (42) gives $H/(2\omega)$, a factor of 2 apart. Jake confirmed both appear in the
+  typeset PDF, so it is not an extraction artefact.
+
+  (40) is the correct one, and it is derivable rather than a matter of preference: eq (34) reads
+  $u|_{z=b} = \bar u - \tau_x\omega/H$, so a frozen bed ($u|_{z=b}=0$) gives $\tau_x = H\bar u/\omega$
+  directly. (42) cannot be reconciled with (34).
+
+  We implement (40): $\beta_{\mathrm{eff}} = c/(1+cF_2) \to 1/F_2 = H/\omega$ as $c\to\infty$, pinned
+  by `diva_closure_test` check 1. So nothing to change — but worth knowing before comparing any
+  frozen-bed result against a published figure, in case the figure used (42).
 
 ### 5.2.2 Methodology note: how this was found
 

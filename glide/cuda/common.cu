@@ -252,6 +252,39 @@ __device__ __forceinline__ DualFloat get_cell(const float* __restrict__ arr, con
 
 // Cell read that is zeroed where the mask is set -- used to drop contributions from cells
 // whose row has been replaced by an algebraic constraint.
+// Type-directed reads, so ONE templated expression can serve both the primal and the
+// tangent path.  read_vfacet<float> ignores the perturbation array (which may be nullptr);
+// read_vfacet<DualFloat> pairs the value with the matching perturbation entry.  Without
+// these, a body that wants to work for both types cannot choose between the two get_*
+// overloads, since they differ only in return type.
+template <typename T>
+__device__ __forceinline__ T read_vfacet(const float* __restrict__ u, const float* __restrict__ du,
+                                        int i, int j, int ny, int nx);
+template <>
+__device__ __forceinline__ float read_vfacet<float>(const float* __restrict__ u, const float* __restrict__ du,
+                                        int i, int j, int ny, int nx) {
+    return get_vfacet(u,i,j,ny,nx);
+}
+template <>
+__device__ __forceinline__ DualFloat read_vfacet<DualFloat>(const float* __restrict__ u, const float* __restrict__ du,
+                                        int i, int j, int ny, int nx) {
+    return get_vfacet(u,du,i,j,ny,nx);
+}
+
+template <typename T>
+__device__ __forceinline__ T read_hfacet(const float* __restrict__ v, const float* __restrict__ dv,
+                                        int i, int j, int ny, int nx);
+template <>
+__device__ __forceinline__ float read_hfacet<float>(const float* __restrict__ v, const float* __restrict__ dv,
+                                        int i, int j, int ny, int nx) {
+    return get_hfacet(v,i,j,ny,nx);
+}
+template <>
+__device__ __forceinline__ DualFloat read_hfacet<DualFloat>(const float* __restrict__ v, const float* __restrict__ dv,
+                                        int i, int j, int ny, int nx) {
+    return get_hfacet(v,dv,i,j,ny,nx);
+}
+
 __device__ __forceinline__ float get_masked_cell(const float* __restrict__ arr, const float* __restrict__ mask, int i, int j, int ny, int nx) {
     i = max(min(i,ny - 1),0);
     j = max(min(j,nx - 1),0);

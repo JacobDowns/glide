@@ -29,6 +29,11 @@
   is involved.  Nothing in this file is reached unless stress_balance = 1.
   ==================================================*/
 
+// Thin wrappers over membrane_eps_sq<T> (viscosity.cu), which is the single definition of
+// the membrane strain-rate invariant shared with populate_viscosity.  DIVA needs it
+// UNREGULARIZED so the vertical shear terms can be added before eta is formed -- see
+// diva_coeffs_cell -- whereas populate_viscosity adds eps_reg immediately.  That is the only
+// difference between the two uses, and it is why the shared function returns the raw sum.
 __device__ __forceinline__
 float get_membrane_eps_sq(
     const float* __restrict__ u,
@@ -37,43 +42,20 @@ float get_membrane_eps_sq(
     float dx,
     int ny, int nx){
 
-    // Membrane (horizontal) part of the effective strain-rate invariant, returned
-    // *unregularized* so the caller can add the vertical shear terms before forming
-    // eta.  The strain rates mirror populate_viscosity (viscosity.cu); that function
-    // is left untouched so the SSA path is unaffected.
-    float dx_inv = 1.0f/dx;
+    return membrane_eps_sq<float>(u, v, nullptr, nullptr, i, j, dx, ny, nx);
+}
 
-    float u_l = get_vfacet(u, i, j, ny, nx);
-    float u_r = get_vfacet(u, i, j + 1, ny, nx);
-    float v_t = get_hfacet(v, i, j, ny, nx);
-    float v_b = get_hfacet(v, i + 1, j, ny, nx);
+__device__ __forceinline__
+DualFloat get_membrane_eps_sq(
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ du,
+    const float* __restrict__ dv,
+    int i, int j,
+    float dx,
+    int ny, int nx){
 
-    float dudx = (u_r - u_l)*dx_inv;
-    float dvdy = (v_t - v_b)*dx_inv;
-
-    float tl_mask = i > 0 && j > 0;
-    float u_tl = get_vfacet(u, i - 1, j, ny, nx);
-    float v_lt = get_hfacet(v, i, j - 1, ny, nx);
-    float eps_xy_tl = 0.5f*((u_tl - u_l)*dx_inv + (v_t - v_lt)*dx_inv)*tl_mask;
-
-    float tr_mask = i > 0 && j < (nx - 1);
-    float u_tr = get_vfacet(u, i - 1, j + 1, ny, nx);
-    float v_rt = get_hfacet(v, i, j + 1, ny, nx);
-    float eps_xy_tr = 0.5f*((u_tr - u_r)*dx_inv + (v_rt - v_t)*dx_inv)*tr_mask;
-
-    float bl_mask = i < (ny - 1) && j > 0;
-    float u_bl = get_vfacet(u, i + 1, j, ny, nx);
-    float v_lb = get_hfacet(v, i + 1, j - 1, ny, nx);
-    float eps_xy_bl = 0.5f*((u_l - u_bl)*dx_inv + (v_b - v_lb)*dx_inv)*bl_mask;
-
-    float br_mask = i < (ny - 1) && j < (nx - 1);
-    float u_br = get_vfacet(u, i + 1, j + 1, ny, nx);
-    float v_rb = get_hfacet(v, i + 1, j + 1, ny, nx);
-    float eps_xy_br = 0.5f*((u_r - u_br)*dx_inv + (v_rb - v_b)*dx_inv)*br_mask;
-
-    float eps_xy2_bar = 0.25f*(eps_xy_tl*eps_xy_tl + eps_xy_tr*eps_xy_tr + eps_xy_bl*eps_xy_bl + eps_xy_br*eps_xy_br);
-
-    return dudx*dudx + dvdy*dvdy + dudx*dvdy + eps_xy2_bar;
+    return membrane_eps_sq<DualFloat>(u, v, du, dv, i, j, dx, ny, nx);
 }
 
 
@@ -192,53 +174,6 @@ __device__ void diva_coeffs_cell(
 }
 
 
-__device__ __forceinline__
-DualFloat get_membrane_eps_sq(
-    const float* __restrict__ u,
-    const float* __restrict__ v,
-    const float* __restrict__ du,
-    const float* __restrict__ dv,
-    int i, int j,
-    float dx,
-    int ny, int nx){
-
-    // Dual counterpart of the float version above: identical expression, with the
-    // perturbation direction carried through so the caller gets
-    // d(eps_mem_sq)/d(direction) alongside the value.
-    float dx_inv = 1.0f/dx;
-
-    DualFloat u_l = get_vfacet(u, du, i, j, ny, nx);
-    DualFloat u_r = get_vfacet(u, du, i, j + 1, ny, nx);
-    DualFloat v_t = get_hfacet(v, dv, i, j, ny, nx);
-    DualFloat v_b = get_hfacet(v, dv, i + 1, j, ny, nx);
-
-    DualFloat dudx = (u_r - u_l)*dx_inv;
-    DualFloat dvdy = (v_t - v_b)*dx_inv;
-
-    float tl_mask = i > 0 && j > 0;
-    DualFloat u_tl = get_vfacet(u, du, i - 1, j, ny, nx);
-    DualFloat v_lt = get_hfacet(v, dv, i, j - 1, ny, nx);
-    DualFloat eps_xy_tl = 0.5f*((u_tl - u_l)*dx_inv + (v_t - v_lt)*dx_inv)*tl_mask;
-
-    float tr_mask = i > 0 && j < (nx - 1);
-    DualFloat u_tr = get_vfacet(u, du, i - 1, j + 1, ny, nx);
-    DualFloat v_rt = get_hfacet(v, dv, i, j + 1, ny, nx);
-    DualFloat eps_xy_tr = 0.5f*((u_tr - u_r)*dx_inv + (v_rt - v_t)*dx_inv)*tr_mask;
-
-    float bl_mask = i < (ny - 1) && j > 0;
-    DualFloat u_bl = get_vfacet(u, du, i + 1, j, ny, nx);
-    DualFloat v_lb = get_hfacet(v, dv, i + 1, j - 1, ny, nx);
-    DualFloat eps_xy_bl = 0.5f*((u_l - u_bl)*dx_inv + (v_b - v_lb)*dx_inv)*bl_mask;
-
-    float br_mask = i < (ny - 1) && j < (nx - 1);
-    DualFloat u_br = get_vfacet(u, du, i + 1, j + 1, ny, nx);
-    DualFloat v_rb = get_hfacet(v, dv, i + 1, j + 1, ny, nx);
-    DualFloat eps_xy_br = 0.5f*((u_r - u_br)*dx_inv + (v_rb - v_b)*dx_inv)*br_mask;
-
-    DualFloat eps_xy2_bar = 0.25f*(eps_xy_tl*eps_xy_tl + eps_xy_tr*eps_xy_tr + eps_xy_bl*eps_xy_bl + eps_xy_br*eps_xy_br);
-
-    return dudx*dudx + dvdy*dvdy + dudx*dvdy + eps_xy2_bar;
-}
 
 template <int HT, int WT>
 __device__ void populate_diva_coeffs_dual(

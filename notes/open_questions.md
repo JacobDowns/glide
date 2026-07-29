@@ -240,6 +240,30 @@ That is exactly what the Q4 fix exposed. `dJ/d(beta)` for **SSA**, whose adjoint
 was not touched, went from 1.4e-4 to 1.4e-3; DIVA moved by the same factor. A change
 localised to the shared FD reference is the only thing that can shift both equally.
 
+**The Q4 fix did not degrade convergence, and this stall is not its doing.** Controlled
+side-by-side, identical configuration, only the prolongation kernel differing:
+
+    asymptote (cycle 24)   |r|/|r0|    |r_u|      |r_v|      |r_H|
+    buggy  (vfacet)        9.85e-5    1.57e-3    1.43e-3    2.18e-2
+    fixed  (hfacet)        1.02e-4    1.56e-3    1.40e-3    2.25e-2
+
+Both plateau within about five cycles and then sit unchanged for twenty more. The 3.5%
+difference lives in `r_H`, the component the prolongation does not touch, and `|r_v|` is in
+fact marginally *lower* after the fix.
+
+So a 10x change in finite-difference agreement accompanied a 3.5% change in the residual --
+which is the whole point worth internalising here: **FD agreement is not a measure of
+convergence quality.** The gap being measured is roughly
+
+    d/d(theta) [ J(x_solver(theta)) - J(x_exact(theta)) ]
+
+so it depends on how the *derivative of the leftover error* projects onto the perturbation
+direction, not on the error's magnitude. Two solvers can stall with errors of identical size
+whose theta-dependence projects completely differently. Reading an FD-vs-adjoint number as a
+proxy for solver health, or a change in it as evidence that a solver change was harmful, is
+therefore a mistake -- one worth remembering, because the numbers here invite exactly that
+reading.
+
 Consequence for reading the earlier numbers: statements of the form "agrees to 2e-5, i.e. at
 the finite-difference floor" should be read as "at the floor set by the forward solve's
 stall", which is a weaker claim than round-off-limited. `tests/diva_gradient_test.py` was

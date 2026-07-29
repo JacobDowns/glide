@@ -631,7 +631,16 @@ Done and verified (see `tests/` for each):
 
 - **Methodological note, worth keeping.** $\partial J/\partial\beta$ read 9.6e-4 with a *wrong* (frozen) adjoint and 2.2e-2 with the right one, because a wrong $\lambda$ was partly cancelling the missing `eta_bar` path. Neither number was evidence about the gradient on its own. Relatedly, no single FD step is trustworthy here: two-sided truncation falls like $\varepsilon^2$ while float32 round-off grows like $1/\varepsilon$, so the tests sweep $\varepsilon$ to bracket the crossover and print the whole curve. $\partial J/\partial u_c$ under DIVA reads 1.6e-4 at $\varepsilon = 2$ and 1.4e-3 at $\varepsilon = 1$; judging on one step would have manufactured a defect that is not there.
 
-Remaining:
+Remaining, in order:
+
+- **Replace the closure's block iteration with true Newton on $F(U_b)=0$ -- do this FIRST.**
+  Spelled out in §5.2.0. The current iteration omits the $f f' \,\mathrm{d}F_2/\mathrm{d}\tau_b$
+  term from the slope, so its gain is $1 - F'/R'$ and it oscillates once $F' > 2R'$. Our
+  configurations sit at $F'/R' = 1.013$ and are therefore stable **by luck rather than by
+  construction**, which is not a basis for calling any configuration validated -- including the
+  ISMIP-HOM runs below, whose experiments are deliberately deformation-dominated and will sit at
+  much larger $F'/R'$. Using $F'$ makes it true Newton, drives the gain to zero, and removes
+  `coupling_iters` entirely.
 
 - **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. The forward model and the gradients are both in place now, so they can be validated together.
 

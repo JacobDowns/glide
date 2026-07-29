@@ -439,8 +439,12 @@ void compute_residual_diva(
   ==================== JVP Computation ====================
   =========================================================*/
 
-extern "C" __global__
-void compute_jvp(
+// Shared body for the SSA and DIVA JVPs.  Forward mode is a gather by construction --
+// each thread owns one row, reads whatever it needs, writes one value -- so unlike the
+// transpose there is no reach constraint, and the DIVA path carries the FULL
+// d(eta_bar)/du and d(beta_eff)/du with no special machinery.
+template <bool DIVA>
+__device__ void jvp_body(
     float* __restrict__ jvp_u,
     float* __restrict__ jvp_v,
     float* __restrict__ jvp_H,
@@ -460,11 +464,13 @@ void compute_jvp(
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
+    const float* __restrict__ u_b,          // DIVA only
     bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
+    int n_sigma,                            // DIVA only
     int ny, int nx, int stride, int halo)
 {
     const int bny = 16;
@@ -477,10 +483,18 @@ void compute_jvp(
     int i = blockIdx.y * stride + (threadIdx.y - halo);
 
     __shared__ DualFloat eta_local[bny][bnx];
+    __shared__ DualFloat beta_eff_local[bny][bnx];   // DIVA only (unused for SSA)
 
     if (i > ny || j > nx) return;
 
-    populate_viscosity(eta_local, bi, bj, i, j, u, v, d_u, d_v, B, n, eps_reg, dx, ny, nx);
+    if (DIVA) {
+	populate_diva_coeffs_dual(eta_local, beta_eff_local, bi, bj, i, j,
+		u, v, d_u, d_v, H, phi, B, beta, u_c, u_b,
+		m, u_reg, water_drag, sliding_law,
+		n, eps_reg, dx, n_sigma, ny, nx);
+    } else {
+	populate_viscosity(eta_local, bi, bj, i, j, u, v, d_u, d_v, B, n, eps_reg, dx, ny, nx);
+    }
 
     __syncthreads();
     bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
@@ -633,8 +647,16 @@ void compute_jvp(
 	    float u_c_l = get_cell(u_c,i,j-1,ny,nx);
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
-	    DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
-	    d_ru_l += tau_bx.d;
+	    if (DIVA) {
+		// tau_b = -beta_eff*ubar with beta_eff a dual, so this carries the exact
+		// closure-through-velocity sensitivity.
+		DualFloat be = 0.5f*(beta_eff_local[bi][bj - 1] + beta_eff_local[bi][bj]);
+		DualFloat tau_bx = 0.0f - be*u_l;
+		d_ru_l += tau_bx.d;
+	    } else {
+		DualFloat tau_bx = get_tau_bx_dual({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
+		d_ru_l += tau_bx.d;
+	    }
 	    }
 
 	    {
@@ -743,8 +765,14 @@ void compute_jvp(
 	    float beta_c     = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
-	    DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
-	    d_rv_t += tau_by.d;
+	    if (DIVA) {
+		DualFloat be = 0.5f*(beta_eff_local[bi - 1][bj] + beta_eff_local[bi][bj]);
+		DualFloat tau_by_d = 0.0f - be*v_t;
+		d_rv_t += tau_by_d.d;
+	    } else {
+		DualFloat tau_by = get_tau_by_dual({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
+		d_rv_t += tau_by.d;
+	    }
 	    }
 
 	    {
@@ -764,6 +792,77 @@ void compute_jvp(
 
 	}
     }
+}
+
+
+extern "C" __global__
+void compute_jvp(
+    float* __restrict__ jvp_u,
+    float* __restrict__ jvp_v,
+    float* __restrict__ jvp_H,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ d_u,
+    const float* __restrict__ d_v,
+    const float* __restrict__ d_H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int ny, int nx, int stride, int halo){
+    jvp_body<false>(jvp_u,jvp_v,jvp_H,u,v,H,d_u,d_v,d_H,phi,mask,f_u,f_v,f_H,
+	    bed,B,beta,u_c,gamma,nullptr,use_mask,
+	    n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,0,ny,nx,stride,halo);
+}
+
+extern "C" __global__
+void compute_jvp_diva(
+    float* __restrict__ jvp_u,
+    float* __restrict__ jvp_v,
+    float* __restrict__ jvp_H,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ d_u,
+    const float* __restrict__ d_v,
+    const float* __restrict__ d_H,
+    const float* __restrict__ phi,
+    const float* __restrict__ mask,
+    const float* __restrict__ f_u,
+    const float* __restrict__ f_v,
+    const float* __restrict__ f_H,
+    const float* __restrict__ bed,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ gamma,
+    const float* __restrict__ u_b,          // DIVA only
+    bool use_mask,
+    float n, float eps_reg, float flotation_reg_driving,
+    float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
+    float calving_rate, float flotation_reg_calving,
+    float dx, float dt,
+    int n_sigma,                            // DIVA only
+    int ny, int nx, int stride, int halo){
+    jvp_body<true>(jvp_u,jvp_v,jvp_H,u,v,H,d_u,d_v,d_H,phi,mask,f_u,f_v,f_H,
+	    bed,B,beta,u_c,gamma,u_b,use_mask,
+	    n,eps_reg,flotation_reg_driving,
+	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
+	    calving_rate,flotation_reg_calving,dx,dt,n_sigma,ny,nx,stride,halo);
 }
 
 /*=========================================================

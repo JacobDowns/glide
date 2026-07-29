@@ -12,10 +12,11 @@ class ForwardOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        # diva.cu is last so the DIVA kernels can use every helper above them
-        # (stress/flux stencils, lu_6x6_solve); nothing above depends on DIVA.
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu', 'diva.cu']
+        # diva.cu sits right after stress.cu: it depends only on common.cu and
+        # stress.cu, and placing it here lets residuals.cu and vanka.cu use
+        # diva_coeffs_cell<T> for the DIVA JVP and smoother.
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
+                          'residuals.cu', 'vanka.cu', 'grad.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:
@@ -139,7 +140,9 @@ class ForwardOperators:
             freeze_phi=False,
             return_norms=False):
 
-        kernel = self.kernels.get_function('compute_jvp')
+        diva = float(self.grid.rheology.stress_balance.value) > 0.5
+        kernel = self.kernels.get_function('compute_jvp_diva' if diva
+                                           else 'compute_jvp')
         grid_size, block_size, stride, halo = self._kernel_config
   
         grid = self.grid
@@ -168,6 +171,7 @@ class ForwardOperators:
                 rheology.B.data, 
                 sliding.beta.data, sliding.u_c.data,
                 self.gamma,
+                *((state.u_b.data,) if diva else ()),
                 use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
@@ -175,6 +179,7 @@ class ForwardOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
+                *((int(rheology.n_sigma.value),) if diva else ()),
                 grid.ny, grid.nx, stride, halo)) 
 
     def compute_phi(self, relaxation=cp.float32(0.0)):
@@ -370,10 +375,11 @@ class AdjointOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        # diva.cu is last so the DIVA kernels can use every helper above them
-        # (stress/flux stencils, lu_6x6_solve); nothing above depends on DIVA.
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu', 'diva.cu']
+        # diva.cu sits right after stress.cu: it depends only on common.cu and
+        # stress.cu, and placing it here lets residuals.cu and vanka.cu use
+        # diva_coeffs_cell<T> for the DIVA JVP and smoother.
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
+                          'residuals.cu', 'vanka.cu', 'grad.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:

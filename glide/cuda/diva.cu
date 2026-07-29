@@ -80,6 +80,12 @@ float get_membrane_eps_sq(
 __device__ __forceinline__ float diva_primal(float x)     { return x; }
 __device__ __forceinline__ float diva_primal(DualFloat x) { return x.v; }
 
+// Seed a scalar of either type from a float.  A dual gets a zero perturbation, which is
+// correct for the closure's warm start: the converged sensitivity is fixed by the fixed
+// point, not by where the iteration started.
+__device__ __forceinline__ void diva_from_float(float& x, float v)     { x = v; }
+__device__ __forceinline__ void diva_from_float(DualFloat& x, float v) { x = {v, 0.0f}; }
+
 template <typename T>
 __device__ __forceinline__
 T get_diva_c_of_U(
@@ -124,7 +130,7 @@ __device__ void diva_coeffs_cell(
 
     float w = 1.0f/(float)n_sigma;
 
-    T U_b = U_b_warm;
+    T U_b; diva_from_float(U_b, U_b_warm);
     T coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
     T tau_b = coeff * U_b;
 
@@ -168,6 +174,111 @@ __device__ void diva_coeffs_cell(
     F2_out       = F2_c;
     U_b_out      = U_b;
     beta_eff_out = coeff/(1.0f + coeff*F2_c);
+}
+
+
+__device__ __forceinline__
+DualFloat get_membrane_eps_sq(
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ du,
+    const float* __restrict__ dv,
+    int i, int j,
+    float dx,
+    int ny, int nx){
+
+    // Dual counterpart of the float version above: identical expression, with the
+    // perturbation direction carried through so the caller gets
+    // d(eps_mem_sq)/d(direction) alongside the value.
+    float dx_inv = 1.0f/dx;
+
+    DualFloat u_l = get_vfacet(u, du, i, j, ny, nx);
+    DualFloat u_r = get_vfacet(u, du, i, j + 1, ny, nx);
+    DualFloat v_t = get_hfacet(v, dv, i, j, ny, nx);
+    DualFloat v_b = get_hfacet(v, dv, i + 1, j, ny, nx);
+
+    DualFloat dudx = (u_r - u_l)*dx_inv;
+    DualFloat dvdy = (v_t - v_b)*dx_inv;
+
+    float tl_mask = i > 0 && j > 0;
+    DualFloat u_tl = get_vfacet(u, du, i - 1, j, ny, nx);
+    DualFloat v_lt = get_hfacet(v, dv, i, j - 1, ny, nx);
+    DualFloat eps_xy_tl = 0.5f*((u_tl - u_l)*dx_inv + (v_t - v_lt)*dx_inv)*tl_mask;
+
+    float tr_mask = i > 0 && j < (nx - 1);
+    DualFloat u_tr = get_vfacet(u, du, i - 1, j + 1, ny, nx);
+    DualFloat v_rt = get_hfacet(v, dv, i, j + 1, ny, nx);
+    DualFloat eps_xy_tr = 0.5f*((u_tr - u_r)*dx_inv + (v_rt - v_t)*dx_inv)*tr_mask;
+
+    float bl_mask = i < (ny - 1) && j > 0;
+    DualFloat u_bl = get_vfacet(u, du, i + 1, j, ny, nx);
+    DualFloat v_lb = get_hfacet(v, dv, i + 1, j - 1, ny, nx);
+    DualFloat eps_xy_bl = 0.5f*((u_l - u_bl)*dx_inv + (v_b - v_lb)*dx_inv)*bl_mask;
+
+    float br_mask = i < (ny - 1) && j < (nx - 1);
+    DualFloat u_br = get_vfacet(u, du, i + 1, j + 1, ny, nx);
+    DualFloat v_rb = get_hfacet(v, dv, i + 1, j + 1, ny, nx);
+    DualFloat eps_xy_br = 0.5f*((u_r - u_br)*dx_inv + (v_rb - v_b)*dx_inv)*br_mask;
+
+    DualFloat eps_xy2_bar = 0.25f*(eps_xy_tl*eps_xy_tl + eps_xy_tr*eps_xy_tr + eps_xy_bl*eps_xy_bl + eps_xy_br*eps_xy_br);
+
+    return dudx*dudx + dvdy*dvdy + dudx*dvdy + eps_xy2_bar;
+}
+
+template <int HT, int WT>
+__device__ void populate_diva_coeffs_dual(
+    DualFloat (&eta_local)[HT][WT],
+    DualFloat (&beta_eff_local)[HT][WT],
+    int bi, int bj,
+    int i, int j,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ du,
+    const float* __restrict__ dv,
+    const float* __restrict__ thk,
+    const float* __restrict__ phi,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ u_b,
+    float m, float u_reg, float water_drag, float sliding_law,
+    float n, float eps_reg, float dx, int n_sigma,
+    int ny, int nx){
+
+    // Fills the eta_bar and beta_eff tiles as DUALS, i.e. with the exact
+    // d/d(velocity direction) of the whole cell-local closure -- the vertical
+    // quadrature, the eta_k fixed point and the U_b Newton all differentiated by
+    // running them in dual arithmetic.  This is what the frozen adjoint omits.
+    float glen_exp = (1.0f - n)/(2.0f * n);
+
+    DualFloat eps_mem_sq = get_membrane_eps_sq(u, v, du, dv, i, j, dx, ny, nx);
+
+    DualFloat u_l = get_vfacet(u, du, i, j, ny, nx);
+    DualFloat u_r = get_vfacet(u, du, i, j + 1, ny, nx);
+    DualFloat v_t = get_hfacet(v, dv, i, j, ny, nx);
+    DualFloat v_b = get_hfacet(v, dv, i + 1, j, ny, nx);
+
+    DualFloat u_ctr = 0.5f*(u_l + u_r);
+    DualFloat v_ctr = 0.5f*(v_t + v_b);
+    DualFloat U_bar = sqrtf(u_ctr*u_ctr + v_ctr*v_ctr);
+
+    float H_c = get_cell(thk, i, j, ny, nx);
+    float B_c = get_cell(B, i, j, ny, nx);
+    float grounded = get_cell(phi, i, j, ny, nx);
+    float beta_grounded = get_cell(beta, i, j, ny, nx) * grounded;
+    float u_c_c = get_cell(u_c, i, j, ny, nx);
+    float U_b_warm = fminf(fmaxf(get_cell(u_b, i, j, ny, nx), 0.0f), U_bar.v);
+
+    DualFloat eta_d, F2_d, U_b_d, beta_eff_d;
+    diva_coeffs_cell<DualFloat>(eps_mem_sq, U_bar,
+            H_c, B_c, beta_grounded, u_c_c,
+            m, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma,
+            U_b_warm,
+            eta_d, F2_d, U_b_d, beta_eff_d);
+
+    eta_local[bi][bj] = eta_d;
+    beta_eff_local[bi][bj] = beta_eff_d;
 }
 
 extern "C" __global__

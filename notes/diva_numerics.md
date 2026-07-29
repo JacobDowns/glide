@@ -346,8 +346,8 @@ so it was never at a fixed point. The numbers below replace it.)
 | realistic $B$, thick, slow, high drag | 5.0 | 3.30 | −0.866 | converges |
 | realistic $B$, soft membrane | 1.0 | 7.85 | **−1.645** | oscillates |
 
-It is **not** an artefact of the soft-ice test configuration: it is reachable at realistic
-stiffness whenever the basal drag is high. That $\tau_b^*=7.54$ is ~68 kPa with a 7.5/20
+It is **not** an artefact of the soft-ice test configuration: the *local* map is unstable at
+realistic stiffness whenever the basal drag is high. That $\tau_b^*=7.54$ is ~68 kPa with a 7.5/20
 sliding–deformation split, an ordinary Greenland condition.
 
 Directly observed in the kernel: in the soft configuration at $\beta=0.1$, repeated
@@ -355,9 +355,29 @@ Directly observed in the kernel: in the soft configuration at $\beta=0.1$, repea
 `u_b` alternating between $\approx 0.71$ and $\approx 5.75$, and $F_2$ by a factor of ~18, with no
 sign of damping by call 12.
 
+**IMPORTANT CAVEAT: this analysis holds $\bar U$ FIXED.** In the solver it is not — $\bar U$ responds
+to $\beta_{\mathrm{eff}}$ through the momentum solve, an additional feedback path excluded here. So
+$|\Phi'|>1$ establishes that *the local, $\bar U$-frozen map* 2-cycles; it does **not** establish that
+the coupled solver oscillates. Settling that needs a stability analysis of the full system, which
+has not been done.
+
+**And GLIDE's local loop is a deviation from Goldberg, not a reproduction of it.** His scheme
+(paper, following eq 42) is a *single* fixed-point iteration over the velocity field: from
+$\bar u^{(i)}$ diagnose $\nu^{(i)}, \omega^{(i)}, \beta^{(i)}_{\mathrm{eff}}$, solve the linear 2-D
+system (43–44) for $\bar u^{(i+1)}$, and then — in his words — "$\tau_x^{(i+1)}$ is set to
+$\beta^{(i)}_{\mathrm{eff}}\bar u^{(i+1)}$, and $u_z^{(i+1)}$ is found from Equation (31) using
+$\nu^{(i)}_{\mathrm{(hy)}}$". So $\tau$ and $u_z$ are **lagged across the outer loop** and the local
+diagnosis is a single pass. There is no local sub-iteration to oscillate. `coupling_iters` is ours.
+
+This also inverts part of the earlier recommendation: *more* coupling sweeps make the between-call
+behaviour worse, not better, since three sweeps carry gain $(\Phi')^3 = -2.6$ where one carries
+$-1.38$. What survives is the Newton argument — a robustly solved local closure hands the outer
+iteration a well-defined function of $\bar U$ whatever the gain, which beats any Picard sweep count
+and is what Goldberg's single lagged pass is implicitly relying on being well behaved.
+
 **Why nothing has broken.** Our configurations sit at $\Phi' = -0.013$, three orders of magnitude
-inside the stability boundary, so every DIVA solve in the suite converges. The margin is real but
-it is luck rather than design, and ISMIP-HOM is deliberately deformation-dominated.
+inside the local stability boundary, so every DIVA solve in the suite converges. The margin is real
+but it is luck rather than design, and ISMIP-HOM is deliberately deformation-dominated.
 
 **The fix, when we take it.** Since $\Phi'<0$ always, $g(\tau_b) = \tau_b - \Phi(\tau_b)$ has
 $g' = 1 + |\Phi'| \ge 1$: **unconditionally well conditioned**. Newton on $g$ converges in every
@@ -371,6 +391,18 @@ Not implemented yet: it changes the forward model in every configuration, so it 
 change with ISMIP-HOM available to validate against. Nothing verified depends on it;
 `tests/diva_closure_test.py` check 5 isolates the per-level solve by replicating the kernel's own
 coupling structure, so it measures §5.2.1 without entangling this.
+
+### 5.2.1b Two places where we knowingly differ from Goldberg
+
+- **The bed-slope factor.** Goldberg carries $m = \sqrt{1 + b_x^2 + b_y^2}$ through his eqs (38)–(41);
+  GLIDE has no such factor, i.e. assumes small bed slopes. Worth quantifying before ISMIP-HOM,
+  whose topographic experiments deliberately impose slopes. Note the name collision: Goldberg's $m$
+  is geometric, ours is the Weertman exponent.
+- **A possible typo in the paper.** Eq (40) gives the frozen-bed limit as $\tau_x = (H/\omega)\bar u$,
+  i.e. $\beta_{\mathrm{eff}} = H/\omega = 1/F_2$, which is what we implement and what
+  `diva_closure_test` check 1 pins. The text introducing (42) reads $H/(2\omega)$ — a factor of 2
+  apart. Text extraction of typeset maths is unreliable, so this wants an eyeball against the PDF,
+  but if real it is a factor of 2 in frozen-bed drag and worth knowing which is intended.
 
 ### 5.2.2 Methodology note: how this was found
 

@@ -346,6 +346,19 @@ adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
 
 ## 7. Not yet done
 
+- **Turn on the exact coefficient adjoint.** The four closure terms are implemented and
+verified -- `AdjointOperators.diva_exact_coeff_adjoint = True` takes the adjoint identity
+from 9.7e-2 to **5.0e-7**, i.e. round-off against an SSA control of 1.2e-7, with no
+symmetry assumed. They are gated **off** by default because the adjoint *smoother* still
+assembles the frozen block: with the exact terms in the residual it no longer approximates
+the operator it preconditions, and the adjoint V-cycles stall (1.1e-6 -> 1.1e-1). Note the
+forward solve does not have this problem because it *lags* the coefficients, so within a
+sweep its operator matches its smoother. Options: give the adjoint smoother the
+condensation transpose (helps only for nonlinear laws, since c' = 0 makes it inert for
+m = 1); damp or under-relax the adjoint iteration; or treat the coefficient terms as a
+deferred correction with an outer Picard. Until then the usable DIVA gradient is the
+frozen one, which the dot-product test shows is about 10% wrong in operator action.
+
 - **The adjoint.** `vanka_smooth_adjoint` is still SSA-only (it passes `nullptr` for the DIVA fields). This is the next piece of work and the condition under which the author endorsed the effort. The pieces are in place: `get_diva_dbeta_eff_du_b` already supplies $\partial\beta_{\mathrm{eff}}/\partial U_b$, and the parameter chain factor is $f_\theta(U_b)/(1+f'(U_b)F_2)$ — closed-form via the implicit function theorem at the converged $U_b$, so the adjoint never re-runs the per-cell Newton in reverse.
 - **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. To be done once the adjoint is in, so the forward model and the gradients are validated together.
 - **Thermomechanical** $B(z)$, which would use the vertical discretisation already here.

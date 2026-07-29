@@ -44,7 +44,8 @@ SEED = 3
 
 SSA_DOTPROD_BOUND = 1e-5     # exact transpose: round-off only
 JVP_FD_BOUND = 1e-3          # limited by the FD reference, not the JVP
-DIVA_DOTPROD_BOUND = 0.5     # loose: the frozen VJP is knowingly incomplete (~1e-1)
+DIVA_FROZEN_BOUND = 0.5      # loose: the frozen VJP is knowingly incomplete (~1e-1)
+DIVA_EXACT_BOUND = 1e-5      # with the coefficient terms applied: round-off
 
 
 def converged_state(stress_balance):
@@ -93,7 +94,7 @@ def masks():
     return mu, mv, mh
 
 
-def run(stress_balance, tag):
+def run(stress_balance, tag, exact_coeff_adjoint=False):
     mu, mv, mh = masks()
     rng = np.random.RandomState(SEED)
     rand = lambda m: (rng.randn(*m.shape) * m).astype(np.float32)
@@ -103,11 +104,15 @@ def run(stress_balance, tag):
     mg = converged_state(stress_balance)
     grid = mg.levels[0]
     fo, ao = grid.forward_operators, grid.adjoint_operators
+    ao.diva_exact_coeff_adjoint = exact_coeff_adjoint
     grid.state.mask.data.fill(0.0)
     for a in (fo.f_u, fo.f_v, fo.f_H, ao.f_u, ao.f_v, ao.f_H):
         a.fill(0.0)
     u0 = grid.state.u.data.copy()
     v0 = grid.state.v.data.copy()
+    # u_b must be restored too: the FD block below cold-starts it, and the closure's
+    # warm start is part of the state both the JVP and the VJP are evaluated at.
+    ub0 = grid.state.u_b.data.copy()
 
     # --- 1. JVP against FD of the residual (velocity direction only) ---
     fo.var_u[:, :] = cp.asarray(xu); fo.var_v[:, :] = cp.asarray(xv); fo.var_H.fill(0.0)
@@ -125,6 +130,12 @@ def run(stress_balance, tag):
     fd = (residual(eps) - residual(-eps)) / (2 * eps)
     grid.state.u.data[:, :] = u0
     grid.state.v.data[:, :] = v0
+    grid.state.u_b.data[:, :] = ub0
+    if stress_balance > 0.5:
+        # compute_residual refreshed eta_bar/F2/beta_eff at the perturbed state, so put
+        # them back in step with the restored one -- otherwise the VJP reads coefficient
+        # fields from a different state than the JVP differentiates.
+        fo.compute_diva_coeffs()
     sel = mu > 0
     jvp_err = np.abs(Ju[sel] - fd[sel]).max() / max(np.abs(fd[sel]).max(), 1e-30)
 
@@ -154,15 +165,21 @@ def main():
     assert dot_ssa < SSA_DOTPROD_BOUND, \
         f"SSA VJP is not the exact transpose of its JVP: {dot_ssa:.3e}"
 
-    jvp_diva, dot_diva = run(1.0, "DIVA          ")
+    jvp_diva, dot_frozen = run(1.0, "DIVA frozen   ")
     assert jvp_diva < JVP_FD_BOUND, f"DIVA JVP disagrees with FD: {jvp_diva:.3e}"
-    assert dot_diva < DIVA_DOTPROD_BOUND, \
-        f"DIVA adjoint identity far worse than the frozen approximation explains: {dot_diva:.3e}"
+    assert dot_frozen < DIVA_FROZEN_BOUND, \
+        f"DIVA frozen adjoint far worse than expected: {dot_frozen:.3e}"
 
-    print(f"\nDIVA JVP is validated ({jvp_diva:.1e} vs FD, same order as SSA's {jvp_ssa:.1e}),")
-    print(f"so the adjoint-identity gap of {dot_diva:.2e} is the frozen-coefficient error,")
-    print(f"measured against an SSA control at {dot_ssa:.1e}. Tighten DIVA_DOTPROD_BOUND")
-    print("to round-off once the omitted terms are added to the VJP.")
+    _, dot_exact = run(1.0, "DIVA exact    ", exact_coeff_adjoint=True)
+    assert dot_exact < DIVA_EXACT_BOUND, \
+        f"the exact coefficient transpose is not exact: {dot_exact:.3e}"
+
+    print(f"\nDIVA JVP validated ({jvp_diva:.1e} vs FD, same order as SSA's {jvp_ssa:.1e}).")
+    print(f"Frozen coefficient adjoint: {dot_frozen:.2e}  --  about 10% wrong.")
+    print(f"Exact coefficient adjoint:  {dot_exact:.2e}  --  round-off, vs SSA control {dot_ssa:.1e}.")
+    print("So the four closure terms are exactly right. They are gated OFF by default")
+    print("because the adjoint SMOOTHER still assembles the frozen block and the")
+    print("V-cycles stall with them on; see notes/diva_numerics.md.")
 
 
 if __name__ == '__main__':

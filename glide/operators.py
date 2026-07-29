@@ -429,6 +429,20 @@ class AdjointOperators:
         self.delta_lambda_v = cp.zeros((grid.ny+1,grid.nx),dtype=cp.float32)
         self.delta_lambda_H = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 
+        # DIVA: per-cell adjoints of the closure coefficients -- the intermediate the
+        # transpose is split at (see _apply_diva_coeff_adjoints).
+        #
+        # Gated OFF by default.  Enabling it makes the adjoint residual the exact
+        # transpose (dot-product identity 9.7e-2 -> 9.4e-5), but the adjoint SMOOTHER
+        # still assembles the frozen block, so it no longer approximates the operator it
+        # preconditions and the adjoint V-cycles stall (1.1e-6 -> 1.1e-1). The forward
+        # solve avoids this by lagging the coefficients, so within a sweep its operator
+        # matches its smoother. Turning this on therefore needs a matching smoother
+        # upgrade -- see notes/diva_numerics.md.
+        self.diva_exact_coeff_adjoint = False
+        self.W_eta = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+        self.W_be = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
 
@@ -470,6 +484,11 @@ class AdjointOperators:
         self.r_v.fill(0)
         self.r_H.fill(0)
         use_forcing=True
+        diva_exact = diva and self.diva_exact_coeff_adjoint
+        if diva:
+            self.W_eta.fill(0.0)
+            self.W_be.fill(0.0)
+
         kernel(grid_size, block_size,
                (self.r_u, self.r_v, self.r_H,
                 state.u.data, state.v.data, state.H.data, 
@@ -480,7 +499,8 @@ class AdjointOperators:
                 rheology.B.data, 
                 sliding.beta.data, sliding.u_c.data,
                 self.gamma,
-                *((rheology.eta_bar.data, sliding.beta_eff.data) if diva else ()),
+                *((rheology.eta_bar.data, sliding.beta_eff.data,
+                   self.W_eta, self.W_be) if diva else ()),
                 use_forcing, use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
@@ -490,12 +510,41 @@ class AdjointOperators:
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
 
+        if diva_exact:
+            self._apply_diva_coeff_adjoints(self.r_u, self.r_v)
+
         if return_norms:
             return cp.linalg.norm(self.r_u),cp.linalg.norm(self.r_v),cp.linalg.norm(self.r_H)
 
 
 
-    def compute_vjp(self, dt, 
+    def _apply_diva_coeff_adjoints(self, out_u, out_v):
+        """Second half of the DIVA transpose.  vjp_body pushes
+        lambda_row * d(r_row)/d(coefficient) onto the owning cell, filling W_eta and
+        W_be; this converts those per-cell coefficient adjoints into velocity
+        sensitivities and adds them into out_u/out_v.
+
+        No symmetry is assumed: this is the honest transpose of the four closure paths
+        the frozen adjoint omitted.  Splitting the transpose at the cell is what keeps
+        it feasible -- the composite row->facet dependence reaches +/-2, but row->cell
+        and cell->facet are each +/-1, so neither half needs a wider halo."""
+        kernel = self.kernels.get_function('compute_diva_vjp_coeffs')
+        grid_size, block_size, stride, halo = self._kernel_config
+
+        grid = self.grid
+        rheology = grid.rheology
+        grid.forward_operators.compute_diva_derivs()
+
+        kernel(grid_size, block_size,
+               (out_u, out_v,
+                grid.state.u.data, grid.state.v.data,
+                self.W_eta, self.W_be,
+                rheology.deta_deps.data, rheology.deta_dU.data,
+                rheology.dbe_deps.data, rheology.dbe_dU.data,
+                grid.dx,
+                grid.ny, grid.nx, stride, halo))
+
+    def compute_vjp(self, dt,
             use_mask=True,
             use_forcing=False,
             freeze_calving=False):
@@ -523,6 +572,11 @@ class AdjointOperators:
         self.vjp_u.fill(0)
         self.vjp_v.fill(0)
         self.vjp_H.fill(0)
+        diva_exact = diva and self.diva_exact_coeff_adjoint
+        if diva:
+            self.W_eta.fill(0.0)
+            self.W_be.fill(0.0)
+
         kernel(grid_size, block_size,
                (self.vjp_u, self.vjp_v, self.vjp_H,
                 state.u.data, state.v.data, state.H.data, 
@@ -533,7 +587,8 @@ class AdjointOperators:
                 rheology.B.data, 
                 sliding.beta.data, sliding.u_c.data,
                 self.gamma,
-                *((rheology.eta_bar.data, sliding.beta_eff.data) if diva else ()),
+                *((rheology.eta_bar.data, sliding.beta_eff.data,
+                   self.W_eta, self.W_be) if diva else ()),
                 use_forcing, use_mask,
                 rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
@@ -542,6 +597,9 @@ class AdjointOperators:
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo)) 
+
+        if diva_exact:
+            self._apply_diva_coeff_adjoints(self.vjp_u, self.vjp_v)
 
 
     def vanka_smooth(self, dt,

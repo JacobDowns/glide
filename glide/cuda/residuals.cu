@@ -902,6 +902,8 @@ __device__ void vjp_body(
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,     // DIVA only
     const float* __restrict__ beta_eff,    // DIVA only
+    float* __restrict__ W_eta,             // DIVA only: adjoint of eta_bar, per cell
+    float* __restrict__ W_be,              // DIVA only: adjoint of beta_eff, per cell
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,     
@@ -1040,6 +1042,7 @@ __device__ void vjp_body(
 
             atomicAdd(&s_adj_u[bi][bj],lambda_sigma_xx_c * dx_inv);
             atomicAdd(&s_adj_H[bi][bj],lambda_u_l*j_sigma_xx_c.d_eta_H*eta_H_c.d_H*dx_inv);
+            if (DIVA) diva_add_W(W_eta, i, j, ny, nx, lambda_u_l*j_sigma_xx_c.d_eta_H*eta_H_c.d_eta*dx_inv);
 	    }
 
 	    {
@@ -1062,6 +1065,7 @@ __device__ void vjp_body(
 
 	    atomicAdd(&s_adj_u[bi][bj],  -lambda_sigma_xx_l*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj-1],-lambda_u_l*j_sigma_xx_l.d_eta_H*eta_H_l.d_H*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j-1, ny, nx, -lambda_u_l*j_sigma_xx_l.d_eta_H*eta_H_l.d_eta*dx_inv);
 	    }
 
 	    {
@@ -1093,9 +1097,13 @@ __device__ void vjp_body(
 
 	    atomicAdd(&s_adj_u[bi][bj],    lambda_sigma_xy_tl*dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj-1],lambda_u_l * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_tl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j-1, ny, nx, lambda_u_l*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_tl*dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj],  lambda_u_l * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_tr*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j, ny, nx, lambda_u_l*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_tr*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj-1],  lambda_u_l * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_bl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j-1, ny, nx, lambda_u_l*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj],    lambda_u_l * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_br*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j, ny, nx, lambda_u_l*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_br*dx_inv);
 	    }
 
 	    {
@@ -1127,9 +1135,13 @@ __device__ void vjp_body(
     
 	    atomicAdd(&s_adj_u[bi][bj]  ,  -lambda_sigma_xy_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj-1],  -lambda_u_l * j_sigma_xy_bl.d_eta_H*eta_H_bl.d_H_tl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j-1, ny, nx, -lambda_u_l*j_sigma_xy_bl.d_eta_H*eta_H_bl.d_eta_tl*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj],    -lambda_u_l * j_sigma_xy_bl.d_eta_H*eta_H_bl.d_H_tr*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j, ny, nx, -lambda_u_l*j_sigma_xy_bl.d_eta_H*eta_H_bl.d_eta_tr*dx_inv);
 	    atomicAdd(&s_adj_H[bi+1][bj-1],-lambda_u_l * j_sigma_xy_bl.d_eta_H*eta_H_bl.d_H_bl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i+1, j-1, ny, nx, -lambda_u_l*j_sigma_xy_bl.d_eta_H*eta_H_bl.d_eta_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi+1][bj],  -lambda_u_l * j_sigma_xy_bl.d_eta_H*eta_H_bl.d_H_br*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i+1, j, ny, nx, -lambda_u_l*j_sigma_xy_bl.d_eta_H*eta_H_bl.d_eta_br*dx_inv);
 	    }
             
             {    
@@ -1154,6 +1166,8 @@ __device__ void vjp_body(
 		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
 		TauBxDivaJacobian j_tau_bx = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
 		atomicAdd(&s_adj_u[bi][bj], lambda_u_l * j_tau_bx.d_u);
+		diva_add_W(W_be, i, j-1, ny, nx, lambda_u_l * j_tau_bx.d_beta_eff_l);
+		diva_add_W(W_be, i, j,   ny, nx, lambda_u_l * j_tau_bx.d_beta_eff_r);
 	    } else {
 		TauBxJacobian j_tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
 		atomicAdd(&s_adj_u[bi][bj],     lambda_u_l * j_tau_bx.d_u);
@@ -1208,6 +1222,7 @@ __device__ void vjp_body(
 
 	    atomicAdd(&s_adj_v[bi][bj],  lambda_sigma_yy_t * dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj],lambda_v_t*j_sigma_yy_t.d_eta_H*eta_H_t.d_H*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j, ny, nx, lambda_v_t*j_sigma_yy_t.d_eta_H*eta_H_t.d_eta*dx_inv);
 	    }
 
 	    {
@@ -1229,6 +1244,7 @@ __device__ void vjp_body(
 	    float lambda_sigma_yy_c = j_sigma_yy_c.apply_jvp({lambda_u_l,lambda_u_r,lambda_v_t,lambda_v_b,eta_H_c.apply_jvp({eta_c.d,0.0f})});
 	    atomicAdd(&s_adj_v[bi][bj],-lambda_sigma_yy_c*dx_inv);
             atomicAdd(&s_adj_H[bi][bj],-lambda_v_t*j_sigma_yy_c.d_eta_H*eta_H_c.d_H*dx_inv);
+            if (DIVA) diva_add_W(W_eta, i, j, ny, nx, -lambda_v_t*j_sigma_yy_c.d_eta_H*eta_H_c.d_eta*dx_inv);
 	    }
 	    
 	    {
@@ -1260,9 +1276,13 @@ __device__ void vjp_body(
 
 	    atomicAdd(&s_adj_v[bi][bj],    -lambda_sigma_xy_tl*dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj-1],-lambda_v_t * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_tl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j-1, ny, nx, -lambda_v_t*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_tl*dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj],  -lambda_v_t * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_tr*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j, ny, nx, -lambda_v_t*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_tr*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj-1],  -lambda_v_t * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_bl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j-1, ny, nx, -lambda_v_t*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj],    -lambda_v_t * j_sigma_xy_tl.d_eta_H*eta_H_tl.d_H_br*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j, ny, nx, -lambda_v_t*j_sigma_xy_tl.d_eta_H*eta_H_tl.d_eta_br*dx_inv);
 	    }
 
 	    {
@@ -1293,9 +1313,13 @@ __device__ void vjp_body(
 
 	    atomicAdd(&s_adj_v[bi][bj],    lambda_sigma_xy_tr*dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj],  lambda_v_t * j_sigma_xy_tr.d_eta_H*eta_H_tr.d_H_tl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j, ny, nx, lambda_v_t*j_sigma_xy_tr.d_eta_H*eta_H_tr.d_eta_tl*dx_inv);
 	    atomicAdd(&s_adj_H[bi-1][bj+1],lambda_v_t * j_sigma_xy_tr.d_eta_H*eta_H_tr.d_H_tr*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i-1, j+1, ny, nx, lambda_v_t*j_sigma_xy_tr.d_eta_H*eta_H_tr.d_eta_tr*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj],    lambda_v_t * j_sigma_xy_tr.d_eta_H*eta_H_tr.d_H_bl*dx_inv);
+	    if (DIVA) diva_add_W(W_eta, i, j, ny, nx, lambda_v_t*j_sigma_xy_tr.d_eta_H*eta_H_tr.d_eta_bl*dx_inv);
 	    atomicAdd(&s_adj_H[bi][bj+1],  lambda_v_t * j_sigma_xy_tr.d_eta_H*eta_H_tr.d_H_br*dx_inv);            
+	    if (DIVA) diva_add_W(W_eta, i, j+1, ny, nx, lambda_v_t*j_sigma_xy_tr.d_eta_H*eta_H_tr.d_eta_br*dx_inv);
 	    }
              
 	    
@@ -1322,6 +1346,8 @@ __device__ void vjp_body(
 		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
 		TauByDivaJacobian j_tau_by = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
 		atomicAdd(&s_adj_v[bi][bj], lambda_v_t * j_tau_by.d_v);
+		diva_add_W(W_be, i-1, j, ny, nx, lambda_v_t * j_tau_by.d_beta_eff_t);
+		diva_add_W(W_be, i,   j, ny, nx, lambda_v_t * j_tau_by.d_beta_eff_b);
 	    } else {
 		TauByJacobian j_tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
 		atomicAdd(&s_adj_v[bi][bj],    lambda_v_t * j_tau_by.d_v);
@@ -1434,7 +1460,7 @@ void compute_vjp(
     int ny, int nx, int stride, int halo)
 {
     vjp_body<false>(vjp_u,vjp_v,vjp_H,u,v,H,lambda_u,lambda_v,lambda_H,phi,mask,
-	    f_u,f_v,f_H,bed,B,beta,u_c,gamma,nullptr,nullptr,
+	    f_u,f_v,f_H,bed,B,beta,u_c,gamma,nullptr,nullptr,nullptr,nullptr,
 	    use_forcing,use_mask,n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
@@ -1463,6 +1489,8 @@ void compute_vjp_diva(
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,
     const float* __restrict__ beta_eff,
+    float* __restrict__ W_eta,
+    float* __restrict__ W_be,
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
@@ -1471,7 +1499,7 @@ void compute_vjp_diva(
     int ny, int nx, int stride, int halo)
 {
     vjp_body<true>(vjp_u,vjp_v,vjp_H,u,v,H,lambda_u,lambda_v,lambda_H,phi,mask,
-	    f_u,f_v,f_H,bed,B,beta,u_c,gamma,eta_bar,beta_eff,
+	    f_u,f_v,f_H,bed,B,beta,u_c,gamma,eta_bar,beta_eff,W_eta,W_be,
 	    use_forcing,use_mask,n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);

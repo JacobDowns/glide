@@ -77,6 +77,16 @@ float get_membrane_eps_sq(
 }
 
 
+__device__ __forceinline__
+void diva_add_W(float* __restrict__ W, int i, int j, int ny, int nx, float val){
+    // Bounds-guarded global accumulate.  Used by the DIVA VJP to push
+    // lambda_row * d(r_row)/d(coefficient) onto the owning CELL.  Splitting the
+    // transpose at the cell like this keeps both halves within a +/-1 reach: the
+    // composite row->facet dependence is +/-2, but row->cell and cell->facet are each
+    // +/-1, so neither step needs a wider halo.
+    if (i >= 0 && i < ny && j >= 0 && j < nx) atomicAdd(&W[i*nx + j], val);
+}
+
 __device__ __forceinline__ float diva_primal(float x)     { return x; }
 __device__ __forceinline__ float diva_primal(DualFloat x) { return x.v; }
 
@@ -438,4 +448,128 @@ void compute_diva_derivs(
         dbe_deps[idx]  = d_be_deps;
         dbe_dU[idx]    = d_be_dU;
     }
+}
+
+/*=========================================================
+  ==== DIVA VJP: coefficient adjoints -> velocity ==========
+  =========================================================*/
+/*
+  Second half of the DIVA transpose.  vjp_body pushes lambda_row * d(r_row)/d(coeff)
+  onto the owning cell, giving W_eta and W_be.  This kernel converts those per-cell
+  coefficient adjoints into velocity sensitivities:
+
+      (J^T lambda)_j += sum_c [ A_c * d(eps_mem^2)_c/d(u_j) + B_c * d(Ubar)_c/d(u_j) ]
+
+      A_c = W_eta_c * d(eta_bar)/d(eps_mem^2) + W_be_c * d(beta_eff)/d(eps_mem^2)
+      B_c = W_eta_c * d(eta_bar)/d(Ubar)      + W_be_c * d(beta_eff)/d(Ubar)
+
+  One thread per cell, scattering to that cell's own stencil, so the reach is +/-1 --
+  the composite row->facet dependence is +/-2 but neither half exceeds +/-1.  No
+  symmetry is assumed anywhere: this is the honest transpose of the coefficient paths,
+  which is what the frozen adjoint omitted.
+*/
+extern "C" __global__
+void compute_diva_vjp_coeffs(
+    float* __restrict__ r_u,
+    float* __restrict__ r_v,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ W_eta,
+    const float* __restrict__ W_be,
+    const float* __restrict__ deta_deps,
+    const float* __restrict__ deta_dU,
+    const float* __restrict__ dbe_deps,
+    const float* __restrict__ dbe_dU,
+    float dx,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+    if (!is_active) return;
+
+    int idx = i * nx + j;
+    float we = W_eta[idx];
+    float wb = W_be[idx];
+    float A = we*deta_deps[idx] + wb*dbe_deps[idx];
+    float B = we*deta_dU[idx]   + wb*dbe_dU[idx];
+    if (A == 0.0f && B == 0.0f) return;
+
+    float dx_inv = 1.0f/dx;
+    float h = 0.5f*dx_inv;
+
+    // Rebuild the same strain rates get_membrane_eps_sq forms, so the partials below
+    // match it term for term.
+    float u_l = get_vfacet(u, i, j, ny, nx);
+    float u_r = get_vfacet(u, i, j + 1, ny, nx);
+    float v_t = get_hfacet(v, i, j, ny, nx);
+    float v_b = get_hfacet(v, i + 1, j, ny, nx);
+
+    float dudx = (u_r - u_l)*dx_inv;
+    float dvdy = (v_t - v_b)*dx_inv;
+
+    float tl_mask = i > 0 && j > 0;
+    float tr_mask = i > 0 && j < (nx - 1);
+    float bl_mask = i < (ny - 1) && j > 0;
+    float br_mask = i < (ny - 1) && j < (nx - 1);
+
+    float u_tl = get_vfacet(u, i - 1, j, ny, nx);
+    float v_lt = get_hfacet(v, i, j - 1, ny, nx);
+    float u_tr = get_vfacet(u, i - 1, j + 1, ny, nx);
+    float v_rt = get_hfacet(v, i, j + 1, ny, nx);
+    float u_bl = get_vfacet(u, i + 1, j, ny, nx);
+    float v_lb = get_hfacet(v, i + 1, j - 1, ny, nx);
+    float u_br = get_vfacet(u, i + 1, j + 1, ny, nx);
+    float v_rb = get_hfacet(v, i + 1, j + 1, ny, nx);
+
+    float e_tl = 0.5f*((u_tl - u_l)*dx_inv + (v_t - v_lt)*dx_inv)*tl_mask;
+    float e_tr = 0.5f*((u_tr - u_r)*dx_inv + (v_rt - v_t)*dx_inv)*tr_mask;
+    float e_bl = 0.5f*((u_l - u_bl)*dx_inv + (v_b - v_lb)*dx_inv)*bl_mask;
+    float e_br = 0.5f*((u_r - u_br)*dx_inv + (v_rb - v_b)*dx_inv)*br_mask;
+
+    // d(eps_mem^2)/d(.) where eps_mem^2 = dudx^2 + dvdy^2 + dudx*dvdy + eps_xy2_bar
+    float P = 2.0f*dudx + dvdy;          // d/d(dudx)
+    float Q = 2.0f*dvdy + dudx;          // d/d(dvdy)
+    float R_tl = 0.5f*e_tl*tl_mask;      // d/d(eps_xy_tl)
+    float R_tr = 0.5f*e_tr*tr_mask;
+    float R_bl = 0.5f*e_bl*bl_mask;
+    float R_br = 0.5f*e_br*br_mask;
+
+    // d(Ubar)/d(.) : Ubar = |0.5(u_l+u_r), 0.5(v_t+v_b)|
+    float u_ctr = 0.5f*(u_l + u_r);
+    float v_ctr = 0.5f*(v_t + v_b);
+    float U_bar = sqrtf(u_ctr*u_ctr + v_ctr*v_ctr);
+    float inv_U = U_bar > 1e-6f ? 1.0f/U_bar : 0.0f;
+    float dU_du = 0.5f*u_ctr*inv_U;      // for both u_l and u_r
+    float dU_dv = 0.5f*v_ctr*inv_U;      // for both v_t and v_b
+
+    // Scatter.  u facets are (ny, nx+1); v facets are (ny+1, nx).
+    #define DIVA_ADD_U(I,J,VAL) if ((I) >= 0 && (I) < ny && (J) >= 0 && (J) <= nx) \
+        atomicAdd(&r_u[(I)*(nx + 1) + (J)], (VAL));
+    #define DIVA_ADD_V(I,J,VAL) if ((I) >= 0 && (I) <= ny && (J) >= 0 && (J) < nx) \
+        atomicAdd(&r_v[(I)*nx + (J)], (VAL));
+
+    DIVA_ADD_U(i,   j,     A*(-P*dx_inv - R_tl*h + R_bl*h) + B*dU_du)
+    DIVA_ADD_U(i,   j + 1, A*( P*dx_inv - R_tr*h + R_br*h) + B*dU_du)
+    DIVA_ADD_V(i,   j,     A*( Q*dx_inv + R_tl*h - R_tr*h) + B*dU_dv)
+    DIVA_ADD_V(i + 1, j,   A*(-Q*dx_inv + R_bl*h - R_br*h) + B*dU_dv)
+
+    DIVA_ADD_U(i - 1, j,     A*( R_tl*h))
+    DIVA_ADD_U(i - 1, j + 1, A*( R_tr*h))
+    DIVA_ADD_U(i + 1, j,     A*(-R_bl*h))
+    DIVA_ADD_U(i + 1, j + 1, A*(-R_br*h))
+
+    DIVA_ADD_V(i,     j - 1, A*(-R_tl*h))
+    DIVA_ADD_V(i,     j + 1, A*( R_tr*h))
+    DIVA_ADD_V(i + 1, j - 1, A*(-R_bl*h))
+    DIVA_ADD_V(i + 1, j + 1, A*( R_br*h))
+
+    #undef DIVA_ADD_U
+    #undef DIVA_ADD_V
 }

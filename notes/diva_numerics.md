@@ -197,6 +197,54 @@ Design choices worth reviewing:
 - **Only interior (non-halo) threads write.** `u_b` is read in place as the warm start, so each cell must have exactly one writer or the result would depend on block scheduling. This is what makes the kernel deterministic.
 - **Grounding is folded into `beta_eff` here** (via $\beta\cdot\phi$). The momentum kernels must therefore *not* apply the grounded factor again — unlike the SSA basal stencils, which do it internally. This asymmetry is deliberate and is the thing most likely to be mis-edited later; `tests/diva_residual_test.py` pins it.
 
+### 5.2.0 The kernel as a root-finding problem
+
+The clearest way to read `diva_coeffs_cell`. The SSA-shaped operator (Goldberg eqs 43–44) needs two
+coefficients per cell, $\bar\eta$ and $\beta_{\mathrm{eff}}$, and the momentum solve can only offer
+$\bar U$. The kernel inverts that. **There is one genuinely free scalar** — the partition of $\bar U$
+into sliding and internal deformation — and one equation fixing it:
+
+$$F(U_b) \;=\; U_b \;+\; f(U_b)\,F_2\big(f(U_b)\big) \;-\; \bar U \;=\; 0$$
+
+Constitutive, $\tau_b = f(U_b) = c(U_b)U_b$:
+
+$$c(U) = \begin{cases}\beta\varphi\,\big(U^2+u_{\mathrm{reg}}\big)^{\frac{m-1}{2}} + w_d & \text{Weertman}\\[6pt]\dfrac{\beta\varphi}{\sqrt{U^2+u_{\mathrm{reg}}}+u_c} + w_d & \text{regularized Coulomb}\end{cases}$$
+
+Shear integral, dependent on $U_b$ only through $\tau_b$:
+
+$$F_2(\tau_b) \;=\; H\!\int_0^1 \frac{\zeta^2}{\eta(\zeta;\tau_b)}\,\mathrm{d}\zeta \;\approx\; H\sum_{k=1}^{N_\sigma} w\,\frac{\zeta_k^2}{\eta(\zeta_k;\tau_b)},\qquad \zeta_k=\frac{k-\tfrac12}{N_\sigma},\;\; w=\frac1{N_\sigma}$$
+
+and a nested root problem per level, which is why $F_2$ is not a closed form (§5.2.1):
+
+$$G\big(\eta;\zeta,\tau_b\big) \;=\; \eta - \tfrac12 B\Big[\dot\varepsilon^2_{\mathrm{mem}} + \varepsilon_{\mathrm{reg}} + \Big(\frac{\tau_b\zeta}{2\eta}\Big)^{\!2}\Big]^{p} = 0, \qquad p=\frac{1-n}{2n}$$
+
+Both outputs are then formulas:
+
+$$\bar\eta = \sum_k w\,\eta(\zeta_k;\tau_b), \qquad \beta_{\mathrm{eff}} = \frac{c(U_b)}{1+c(U_b)F_2} \quad\text{(G-41)}$$
+
+**The derivative is the whole story.**
+
+$$F'(U_b) \;=\; \underbrace{1 + f'(U_b)F_2}_{\displaystyle R'(U_b)} \;+\; \underbrace{f(U_b)f'(U_b)\frac{\mathrm{d}F_2}{\mathrm{d}\tau_b}}_{\text{omitted by the code}}$$
+
+Every term is non-negative ($f,f'\ge0$, $F_2>0$, and $\mathrm{d}F_2/\mathrm{d}\tau_b>0$ because more
+drag means more shear means thinner ice), so $F'\ge 1$: **$F$ is strictly increasing, the root is
+unique, and full Newton is unconditionally well conditioned.** The problem is benign.
+
+What the code does instead is block Gauss–Seidel: the closure Newton uses $R'$, i.e. holds $F_2$
+frozen, and `coupling_iters` refreshes $F_2$ around it. Its gain is exactly
+
+$$\Phi'(\tau_b) \;=\; 1 - \frac{F'}{R'} \qquad\Longrightarrow\qquad |\Phi'|>1 \iff F' > 2R'$$
+
+(verified against bisection-found roots to $10^{-11}$; see §5.2.1a for the table). So the mechanism
+is simply that the iteration **under-estimates the slope of a monotone increasing function**, and
+Newton with an under-estimated slope overshoots — by more than $2\times$, it oscillates. Our
+configurations sit at $F'/R' = 1.013$, the omitted term being 1.4% of the total, which is why
+nothing has ever misbehaved.
+
+Using $F'$ in place of $R'$ makes it true Newton on $F(U_b)=0$: gain zero, quadratic, and
+`coupling_iters` **disappears** rather than being wrapped in anything. $\mathrm{d}F_2/\mathrm{d}\tau_b$
+is what a dual seeded on $\tau_b$ returns, so the machinery already exists.
+
 ### 5.2.1 The per-level viscosity solve, and why Picard was not enough
 
 The innermost loop above solves a genuine scalar fixed point. At depth $\zeta$, Glen's law and

@@ -358,3 +358,84 @@ void compute_diva_coeffs(
         beta_eff[idx] = beta_eff_c;
     }
 }
+
+extern "C" __global__
+void compute_diva_derivs(
+    float* __restrict__ deta_deps,
+    float* __restrict__ deta_dU,
+    float* __restrict__ dbe_deps,
+    float* __restrict__ dbe_dU,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ H,
+    const float* __restrict__ phi,
+    const float* __restrict__ B,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ u_b,
+    float m, float u_reg, float water_drag, float sliding_law,
+    float n, float eps_reg, float dx,
+    int n_sigma,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    // The four total derivatives of the cell-local closure with respect to its two
+    // velocity-dependent inputs, from two dual seedings.  These are what the adjoint
+    // needs and the forward does not: with them the transpose can be applied without
+    // re-running the quadrature, and without assuming the operator is symmetric.
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+
+    float glen_exp = (1.0f - n)/(2.0f * n);
+
+    float u_l = get_vfacet(u, i, j, ny, nx);
+    float u_r = get_vfacet(u, i, j + 1, ny, nx);
+    float v_t = get_hfacet(v, i, j, ny, nx);
+    float v_b = get_hfacet(v, i + 1, j, ny, nx);
+    float u_ctr = 0.5f*(u_l + u_r);
+    float v_ctr = 0.5f*(v_t + v_b);
+    float U_bar_v = sqrtf(u_ctr*u_ctr + v_ctr*v_ctr);
+
+    float eps_mem_v = get_membrane_eps_sq(u, v, i, j, dx, ny, nx);
+
+    float H_c = get_cell(H, i, j, ny, nx);
+    float B_c = get_cell(B, i, j, ny, nx);
+    float grounded = get_cell(phi, i, j, ny, nx);
+    float beta_grounded = get_cell(beta, i, j, ny, nx) * grounded;
+    float u_c_c = get_cell(u_c, i, j, ny, nx);
+    int idx = i * nx + j;
+    float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar_v);
+
+    DualFloat eta_d, F2_d, U_b_d, be_d;
+
+    // Seed 1: d/d(eps_mem^2)
+    diva_coeffs_cell<DualFloat>({eps_mem_v,1.0f}, {U_bar_v,0.0f},
+            H_c, B_c, beta_grounded, u_c_c,
+            m, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma, U_b_warm,
+            eta_d, F2_d, U_b_d, be_d);
+    float d_eta_deps = eta_d.d;
+    float d_be_deps  = be_d.d;
+
+    // Seed 2: d/d(Ubar)
+    diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,1.0f},
+            H_c, B_c, beta_grounded, u_c_c,
+            m, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma, U_b_warm,
+            eta_d, F2_d, U_b_d, be_d);
+    float d_eta_dU = eta_d.d;
+    float d_be_dU  = be_d.d;
+
+    if (is_active) {
+        deta_deps[idx] = d_eta_deps;
+        deta_dU[idx]   = d_eta_dU;
+        dbe_deps[idx]  = d_be_deps;
+        dbe_dU[idx]    = d_be_dU;
+    }
+}

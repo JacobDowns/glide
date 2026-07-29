@@ -220,6 +220,30 @@ class ForwardOperators:
                     grid.ny, grid.nx,
                     stride, halo))
 
+    def compute_diva_derivs(self):
+        """The four total derivatives of the cell-local DIVA closure w.r.t. its two
+        velocity-dependent inputs (eps_mem^2 and Ubar), from two dual seedings.  Needed
+        only by the adjoint."""
+        kernel = self.kernels.get_function('compute_diva_derivs')
+        grid_size, block_size, stride, halo = self._kernel_config
+
+        grid = self.grid
+        state = grid.state
+        rheology = grid.rheology
+        sliding = grid.sliding
+
+        kernel(grid_size, block_size,
+                   (rheology.deta_deps.data, rheology.deta_dU.data,
+                    rheology.dbe_deps.data, rheology.dbe_dU.data,
+                    state.u.data, state.v.data, state.H.data, state.phi.data,
+                    rheology.B.data, sliding.beta.data, sliding.u_c.data, state.u_b.data,
+                    sliding.m.value, sliding.u_reg.value,
+                    sliding.water_drag.value, sliding.sliding_law.value,
+                    rheology.n.value, rheology.eps_reg.value, grid.dx,
+                    int(rheology.n_sigma.value),
+                    grid.ny, grid.nx,
+                    stride, halo))
+
     def vanka_smooth(self, dt,
             freeze_calving=False,
             freeze_phi=False):

@@ -98,6 +98,9 @@ class Multigrid:
         self.restrict_cell(fine_grid.rheology.B.data,coarse_grid.rheology.B.data)
         self.restrict_cell(fine_grid.rheology.eta_bar.data,coarse_grid.rheology.eta_bar.data)
         self.restrict_cell(fine_grid.rheology.F2.data,coarse_grid.rheology.F2.data)
+        for nm in ('deta_deps','deta_dU','dbe_deps','dbe_dU'):
+            self.restrict_cell(getattr(fine_grid.rheology,nm).data,
+                               getattr(coarse_grid.rheology,nm).data)
         coarse_grid.rheology.n.set(fine_grid.rheology.n.value)
         coarse_grid.rheology.eps_reg.set(fine_grid.rheology.eps_reg.value)
         coarse_grid.rheology.stress_balance.set(fine_grid.rheology.stress_balance.value)
@@ -435,6 +438,14 @@ class MGRheologyManager:
             restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
             name="F2",
         )
+
+        for _nm in ('deta_deps','deta_dU','dbe_deps','dbe_dU'):
+            setattr(self, _nm, HierarchyFieldManager(
+                mg.levels,
+                getter=(lambda nm: (lambda g: getattr(g.rheology, nm)))(_nm),
+                restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+                name=_nm,
+            ))
 
         self.n = HierarchyFieldManager(
             mg.levels,

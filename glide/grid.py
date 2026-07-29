@@ -69,6 +69,12 @@ class Rheology:
     B: Field | None = None
     eta_bar: Field | None = None      # DIVA depth-averaged effective viscosity (diagnostic)
     F2: Field | None = None           # DIVA vertical shear integral F2 = int eta^-1 ((s-z)/H)^2 dz
+    # Total derivatives of the cell-local DIVA closure w.r.t. its two velocity-dependent
+    # inputs, obtained by two dual seedings.  The adjoint needs these; the forward does not.
+    deta_deps: Field | None = None    # d(eta_bar)/d(eps_mem^2)
+    deta_dU: Field | None = None      # d(eta_bar)/d(Ubar)
+    dbe_deps: Field | None = None     # d(beta_eff)/d(eps_mem^2)
+    dbe_dU: Field | None = None       # d(beta_eff)/d(Ubar)
     n: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(3.0),
@@ -417,7 +423,16 @@ class Grid:
             units='m Pa^{-1} a^{-1}',
             attrs={'long_name':'DIVA vertical shear integral F2'})
 
-        return Rheology(B=B, eta_bar=eta_bar, F2=F2)
+        def _cell(name, units, long_name):
+            return Field(data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+                         grid_entity=GridEntity.CELL, dx=self.dx, grid=self,
+                         name=name, units=units, attrs={'long_name':long_name})
+
+        return Rheology(B=B, eta_bar=eta_bar, F2=F2,
+                deta_deps=_cell('deta_deps','Pa a^3','DIVA d(eta_bar)/d(eps_mem^2)'),
+                deta_dU=_cell('deta_dU','Pa a^2 m^{-1}','DIVA d(eta_bar)/d(Ubar)'),
+                dbe_deps=_cell('dbe_deps','?','DIVA d(beta_eff)/d(eps_mem^2)'),
+                dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'))
 
     def _allocate_sliding(self):
         beta = Field(

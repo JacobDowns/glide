@@ -12,6 +12,13 @@ value known independently rather than against a stored regression:
   3. Coulomb law -- no closed form; require the closure residual itself to vanish.
   4. determinism -- repeated calls must agree bit-for-bit (the kernel reads u_b in place,
                     so only interior threads may write it).
+  5. shear-dominated -- eta_bar and F2 against a float64 reference that solves the per-level
+                    viscosity fixed point to convergence. This is the check the first four
+                    miss: check 1 sets tau_b = 0, where the per-level solve is exact in one
+                    step, and checks 2-3 validate the Newton against the COMPUTED F2, so they
+                    pass whatever F2 happens to be. A truncated per-level solve was wrong by
+                    16% in F2 at tau_b ~ 4 and 75% at tau_b ~ 30 while all four passed;
+                    see notes/diva_numerics.md 5.2.1.
 
 A uniform velocity field is used so every membrane strain rate vanishes exactly, which
 makes eta_membrane analytic: eta = 0.5*B*eps_reg^((1-n)/(2n)).
@@ -60,6 +67,73 @@ def coeffs(mg):
     at = lambda f: float(cp.asnumpy(f.data)[ny // 2, nx // 2])
     return (at(grid.rheology.eta_bar), at(grid.rheology.F2), at(grid.state.u_b),
             at(grid.sliding.beta_eff))
+
+
+def exact_level_viscosity(A, k, glen_exp):
+    """Solve eta = 0.5*B*(A + k/eta^2)^p to convergence in float64, by plain Picard run far
+    past its (slow) contraction.  Deliberately a different algorithm from the kernel's Newton,
+    so this is an independent reference rather than a re-implementation."""
+    eta = 0.5 * B0 * A ** glen_exp
+    for _ in range(4000):
+        eta = 0.5 * B0 * (A + k / eta ** 2) ** glen_exp
+    return eta
+
+
+def reference_closure(beta, glen_exp, coupling_iters=3):
+    """Faithful float64 replica of diva_coeffs_cell for a LINEAR sliding law, with the
+    per-level viscosity solved EXACTLY.
+
+    Same structure as the kernel: cold warm-start (u_b = 0), `coupling_iters` sweeps, and
+    within each sweep the midpoint quadrature then the closure root.  For a linear law
+    R(U_b) = U_b*(1 + beta*F2) - U_bar is linear, so the kernel's 4 Newton steps land on the
+    exact root and there is nothing to approximate there.
+
+    Any disagreement with the kernel is therefore attributable to the per-level solve.
+    """
+    A = EPS_REG                      # membrane strain rates vanish in this configuration
+    w = 1.0 / N_SIGMA
+    U_b = 0.0
+    tau_b = beta * U_b
+    eta_avg = F2 = 0.0
+    for _ in range(coupling_iters):
+        eta_avg = 0.0
+        F2 = 0.0
+        for k in range(N_SIGMA):
+            zeta = (k + 0.5) * w
+            eta = exact_level_viscosity(A, (tau_b * zeta / 2.0) ** 2, glen_exp)
+            eta_avg += w * eta
+            F2 += w * zeta * zeta / eta
+        F2 *= H0
+        U_b = U0 / (1.0 + beta * F2)
+        tau_b = beta * U_b
+    return eta_avg, F2, U_b
+
+
+def check_shear_dominated(glen_exp):
+    """Push tau_b until the vertical shear dominates the membrane term, and require the
+    kernel to match a reference whose per-level viscosity is solved to convergence.
+
+    This is the check the first four miss.  Check 1 sets tau_b = 0, where the per-level solve
+    is exact in one step; checks 2-3 validate the Newton against the COMPUTED F2, so they pass
+    whatever F2 happens to be.  A truncated per-level Picard was wrong by 16% in F2 at
+    tau_b ~ 4 and 75% at tau_b ~ 30 with all four passing -- see notes/diva_numerics.md 5.2.1.
+    """
+    worst = 0.0
+    for beta in (0.02, 0.1, 0.5, 2.0):
+        mg = build()
+        mg.sliding.beta.set(cp.full((ny, nx), beta, dtype=cp.float32))
+        eta_bar, F2, u_b, _ = coeffs(mg)
+        eta_ref, F2_ref, u_b_ref = reference_closure(beta, glen_exp)
+        d_eta = abs(eta_bar - eta_ref) / eta_ref
+        d_F2 = abs(F2 - F2_ref) / F2_ref
+        d_ub = abs(u_b - u_b_ref) / max(abs(u_b_ref), 1e-30)
+        print(f"[shear]     beta = {beta:<5g} eta_bar err = {d_eta:.2e}   "
+              f"F2 err = {d_F2:.2e}   u_b err = {d_ub:.2e}")
+        worst = max(worst, d_eta, d_F2, d_ub)
+    assert worst < 1e-4, (
+        f"per-level viscosity solve disagrees with a converged reference: {worst:.2e}. "
+        f"A truncated Picard gives ~1e-1 here; see notes/diva_numerics.md 5.2.1.")
+    return worst
 
 
 def main():
@@ -119,6 +193,10 @@ def main():
     first, second = coeffs(mg), coeffs(mg)
     print(f"[repeat]    {first} vs {second}")
     assert first == second, "compute_diva_coeffs must be deterministic"
+
+    print()
+    worst = check_shear_dominated(glen_exp)
+    print(f"            worst coefficient error vs converged reference: {worst:.2e}")
 
     print("\nOK: DIVA coefficients and sliding closure behave as derived")
 

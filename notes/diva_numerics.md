@@ -197,6 +197,182 @@ Design choices worth reviewing:
 - **Only interior (non-halo) threads write.** `u_b` is read in place as the warm start, so each cell must have exactly one writer or the result would depend on block scheduling. This is what makes the kernel deterministic.
 - **Grounding is folded into `beta_eff` here** (via $\beta\cdot\phi$). The momentum kernels must therefore *not* apply the grounded factor again — unlike the SSA basal stencils, which do it internally. This asymmetry is deliberate and is the thing most likely to be mis-edited later; `tests/diva_residual_test.py` pins it.
 
+### 5.2.1 The per-level viscosity solve, and why Picard was not enough
+
+The innermost loop above solves a genuine scalar fixed point. At depth $\zeta$, Glen's law and
+the DIVA shear ansatz are two relations in $(\eta, \dot\varepsilon_{xz})$:
+
+$$\eta = \tfrac12 B\big[\underbrace{\dot\varepsilon^2_{\mathrm{mem}} + \varepsilon_{\mathrm{reg}}}_{A} + \dot\varepsilon_{xz}^2\big]^{p},
+\qquad p \equiv \frac{1-n}{2n} < 0,
+\qquad \dot\varepsilon_{xz} = \frac{\tau_b\zeta}{2\eta}$$
+
+Eliminating the shear rate leaves $\eta$ on both sides:
+
+$$\eta = \tfrac12 B\Big[A + \frac{k}{\eta^2}\Big]^{p} \equiv G(\eta),
+\qquad k \equiv \Big(\frac{\tau_b\zeta}{2}\Big)^2$$
+
+**The contraction rate.** Differentiating and evaluating at the root ($G(\eta)=\eta$),
+
+$$G'(\eta) = -2p\,\frac{s}{E}\,\frac{G(\eta)}{\eta}
+\;\;\xrightarrow[\text{at the root}]{}\;\;
+2|p|\frac{s}{E},
+\qquad s \equiv \frac{k}{\eta^2},\; E \equiv A + s$$
+
+Since $s \le E$ by construction, the Picard iteration $\eta \leftarrow G(\eta)$ is a contraction with
+
+$$|G'| \le 2|p| = \frac{n-1}{n} = \tfrac23 \ \text{for Glen } n=3$$
+
+**independent of $B$, $H$, $\tau_b$ and $\zeta$.** And because $s>0$ with $p<0$, the shear-free
+starting value $\eta_0 = \tfrac12 BA^{p}$ *overestimates*, so the iteration descends monotonically.
+That looks like a licence to fix the trip count at 3 — and it is not, because the bound is only
+attained as $s/E \to 1$, which is precisely the shear-dominated regime DIVA exists to capture.
+Three sweeps of a rate-$2/3$ contraction starting hundreds of times away from the root is not
+convergence.
+
+**Measured.** With the defaults ($\varepsilon_{\mathrm{reg}} = 10^{-6}$, $n_\sigma = 8$,
+$\dot\varepsilon^2_{\mathrm{mem}} \approx 6\times10^{-9}$ for the slab tests, $H = 1000$ m), 3 sweeps
+against a converged reference. $\tau_b$ is in code units, i.e. divided by $\rho g$, so 100 kPa
+$\approx 11$:
+
+| $\tau_b$ | $s/E$ | error in $\bar\eta$ | **error in $F_2$** |
+|---------:|------:|--------------------:|-------------------:|
+| 1.0 | 0.16 | 0.0% | 0.0% |
+| 4.4 *(our test configurations)* | 0.98 | 4.6% | **15.9%** |
+| 11.0 *(~100 kPa)* | 1.00 | 19.4% | **53.0%** |
+| 30.0 | 1.00 | 33.7% | **74.5%** |
+
+$F_2$ suffers most because it weights deep levels by $\zeta^2$ and the near-bed levels are the
+least converged (35% error in $\eta$ at $\zeta=1$, $\tau_b=4.4$; **17** sweeps are needed there for
+$10^{-3}$). $F_2$ too low means deformation underestimated, which drives DIVA back toward the SSA
+answer — the exact effect it exists to correct.
+
+**Why no test caught it.** `diva_closure_test` check 1, the strong one, sets $\tau_b = 0$, where
+$s=0$ and Picard is exact in one step. Checks 2 and 3 validate the *Newton* against the
+**computed** $F_2$, so they pass whatever $F_2$ happens to be. Nothing else compares DIVA to an
+external reference — which is what ISMIP-HOM is for, and this is the kind of thing it would have
+surfaced.
+
+Note this was never a defect in the *adjoint*: the dual numbers differentiate the implemented map
+exactly, so the dot-product identity and the parameter gradients remain correct statements about
+the code as written. What was wrong was the fidelity of the implemented forward map to the DIVA
+equations.
+
+**The fix: Newton, not Picard.** For $n=3$ the fixed point is in fact a *depressed cubic* with an
+exact root. Substituting $p=-\tfrac13$ and clearing denominators:
+
+$$\eta = \tfrac12 B\Big(A+\frac{k}{\eta^2}\Big)^{-1/3}
+\;\Longrightarrow\;
+B^3 = 8A\eta^3 + 8k\eta
+\;\Longrightarrow\;
+8A\,\eta^3 + 8k\,\eta - B^3 = 0$$
+
+No $\eta^2$ term, and $A,k,B^3>0$, so by Descartes exactly one positive real root — available in
+closed form via Cardano. **We do not use it.** Cardano's two cube-root terms are
+$\sqrt[3]{h\pm\sqrt{D}}$ with $D \approx (a_1/3)^3$ when the shear dominates, so they nearly cancel
+in exactly the regime of interest. Verified in float32 against a float64 reference:
+
+| $\tau_b$ | Cardano (float32) | Newton, 3 iters (float32) |
+|---------:|------------------:|--------------------------:|
+| 11.0 | 2.7e-6 | 2.0e-7 |
+| 30.0 | 9.0e-5 | 0.0 |
+| 100.0 | **1.9e-3** | 3.5e-7 |
+
+So the implementation applies **Newton to $\Phi(\eta) = \eta - G(\eta)$**:
+
+$$\eta \leftarrow \eta - \frac{\eta - G(\eta)}{1 - G'(\eta)},
+\qquad G'(\eta) = 2|p|\,\frac{s}{E}\,\frac{G(\eta)}{\eta}$$
+
+Three properties make this the right choice over both Picard and Cardano:
+
+- **Well conditioned by construction.** $G' \in (0, 2|p|) \subset (0,1)$, so $1-G' \in (1/3, 1)$ and
+  the Newton denominator is never near zero. No safeguarding needed.
+- **General in $n$.** The expression for $G'$ holds for any $p$, so unlike the closed form there is
+  no `n == 3` branch.
+- **No new dual overloads.** It uses only $\times, +, \div$ and `__powf`, all of which `DualFloat`
+  already has, so the derivative rides along exactly as before.
+
+The starting guess matters, and takes the smaller of the two asymptotic limits — both of which
+overestimate, since dropping either positive term in the cubic inflates $\eta$:
+
+$$\eta_A = \tfrac12 BA^{p} \quad (\text{shear-free}),
+\qquad \eta_k = \big(\tfrac12 Bk^{p}\big)^{n} \quad (\text{shear-dominated})$$
+
+With $\min(\eta_A,\eta_k)$, **3 Newton iterations reach float32 round-off across the whole range**
+($\le 2.6\times10^{-7}$ up to $\tau_b=100$) — the same trip count the Picard loop used. Starting from
+$\eta_A$ alone would need 6.
+
+### 5.2.1a UNRESOLVED: the outer coupling loop in the shear-dominated regime
+
+Fixing the per-level solve exposed a separate question about the loop *around* it, which is
+**not settled** and is recorded here rather than answered.
+
+What is observed, directly from the kernel: with the closure test's soft-ice configuration
+($B=1$, $\bar\eta_{\mathrm{mem}} = 50$) and $\beta = 0.1$, repeated calls to
+`compute_diva_coeffs` -- which is what the solver does, warm-starting `u_b` from the previous
+call -- do not settle. `u_b` alternates between $\approx 0.71$ and $\approx 5.75$ on successive
+calls, and $F_2$ with it, by a factor of ~18. The mechanism is plausible: the coupling is Picard
+on $\tau_b$ through $\tau_b \to F_2 \to U_b \to \tau_b$, where raising $\tau_b$ raises $F_2$
+which *lowers* $U_b$ which lowers $\tau_b$ — negative feedback, which oscillates rather than
+creeping if the loop gain exceeds one in magnitude.
+
+What is **not** established:
+
+- Whether that is a genuine 2-cycle of the underlying map or an artefact of the 3-sweep
+  truncation. An attempt to measure the loop gain was **invalid**: it differentiated around the
+  state a 400-sweep Picard landed on, and that iteration is itself oscillating, so it was never
+  at a fixed point to differentiate around. Any conclusion needs the true root found robustly
+  first — bisection on $\tau_b - \Phi(\tau_b)$, not fixed-point iteration.
+- Whether it is reachable at realistic ice stiffness. The closure test deliberately uses $B=1$
+  to make $\bar\eta_{\mathrm{mem}}$ a round number; the real $B \approx 24$ gives ice ~24x
+  stiffer, so less shear for a given $\tau_b$ and a weaker feedback. The slab configurations our
+  tests actually solve show no sign of it, and every DIVA solve in the suite converges.
+- Whether it would matter if reachable. Oscillating coefficients would show up as a stalled
+  momentum solve, which we do not see — but we have not looked in a regime where the gain is
+  large.
+
+Worth resolving before ISMIP-HOM, since the experiments there are deliberately
+deformation-dominated. If it is real, the fix is standard: under-relax the $\tau_b$ update, or
+solve the coupled pair $(\tau_b, U_b)$ by Newton rather than by alternating Picard.
+
+Note this does not affect anything verified: `tests/diva_closure_test.py` check 5 pins the
+per-level solve against a converged reference (agreement $4\times10^{-7}$) by replicating the
+kernel's *own* coupling structure, so it isolates the piece that was fixed from the piece that is
+open.
+
+### 5.2.2 Methodology note: how this was found
+
+Worth recording, because the finding was a by-product rather than the object of a search, and the
+sequence generalises.
+
+1. **A claim was made in prose** — a comment asserting that 3 sweeps suffice, resting on the
+   contraction bound $2|p| = 2/3$.
+2. **The claim was checked numerically before being repeated.** A 20-line NumPy replication of the
+   iteration confirmed the algebra (predicted vs observed contraction ratios matched, monotone
+   descent held, the bound was attained) — and in doing so swept parameters more widely than any
+   test did.
+3. **An outlier in that sweep was chased rather than dismissed.** One random draw showed 233% error
+   after 3 sweeps. The tempting reading is "unphysical parameters".
+4. **The regime was re-tested with the code's real defaults**, not random ones: `eps_reg` read from
+   `grid.py`, $\tau_b$ converted to code units from a physical basal stress. The error survived, and
+   sat squarely in the range our own tests run at.
+5. **The effect was propagated to the quantities that matter.** Per-level $\eta$ error is not the
+   headline; $\bar\eta$ and $F_2$ are what the momentum balance sees, and $F_2$ turned out to be
+   hit ~3x harder by the $\zeta^2$ weighting.
+6. **The candidate fix was itself checked in float32 before being adopted**, which is what rejected
+   Cardano — it is exact in float64 and loses three digits in float32 in the regime of interest.
+
+A seventh step belongs on the list, and it is the one this session got wrong twice: **when the
+scaffolding built to measure something is itself an iterative scheme, verify that it converged
+before trusting what it reports.** The loop-gain measurement in 5.2.1a was invalid for exactly
+that reason -- 400 Picard sweeps were assumed to be a fixed point and were an oscillation. The
+same error, in a different costume, produced the retracted Q6.
+
+The transferable part: steps 2 and 6. An analytic bound is a statement about the limit, not about
+the truncation actually shipped, and a closed form is a statement about exact arithmetic, not about
+float32. Both needed a measurement to become claims about this code. See also
+`notes/open_questions.md` Q6, where reasoning from a plausible mechanism instead of measuring first
+produced a retracted entry.
+
 ### 5.3 Dual numbers for the sliding law
 
 `get_diva_drag_coeff` (`cuda/stress.cu`) returns $c(U)$ as a `DualFloat`, so $c'(U)$ — and hence $f'=(cU)'$ by the product rule — falls out of the *same* evaluation. The same helper therefore serves the closure Newton, the block Jacobian, and (later) the adjoint, **for every sliding law, with no per-law hand derivation**. This required extending `DualFloat` with $\div$(dual,dual) and $\sqrt{\cdot}$(dual) — the only additions to the existing dual-number machinery.

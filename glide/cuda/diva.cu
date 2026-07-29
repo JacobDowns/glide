@@ -141,10 +141,52 @@ __device__ void diva_coeffs_cell(
         for (int k = 0; k < n_sigma; ++k) {
             float zeta = ((float)k + 0.5f)*w;
 
-            T eta_k = 0.5f*B_c*__powf(eps_mem_sq + eps_reg, glen_exp);
+            // ---- per-level viscosity: solve eta = G(eta) by NEWTON, not Picard ----
+            //
+            // Glen's law plus the DIVA shear ansatz eps_xz = tau_b*zeta/(2*eta) give a scalar
+            // fixed point with eta on both sides:
+            //
+            //   eta = 0.5*B*[ A + k/eta^2 ]^p  =  G(eta),   A = eps_mem^2 + eps_reg,
+            //                                               k = (tau_b*zeta/2)^2,  p = glen_exp
+            //
+            // Picard (eta <- G(eta)) contracts at |G'| <= 2|p| = (n-1)/n, i.e. 2/3 for n = 3,
+            // which sounds like a licence to take three sweeps.  It is not: the bound is only
+            // approached as the shear term comes to dominate A, which is exactly the regime DIVA
+            // exists for, and there three sweeps from a starting value hundreds of times off the
+            // root left F2 wrong by 16% at the tau_b of our own tests and 53% at ~100 kPa.
+            // See notes/diva_numerics.md 5.2.1 for the measurements.
+            //
+            // Newton on Phi(eta) = eta - G(eta) instead.  Three reasons over the alternatives:
+            //   * G' lies in (0, 2|p|) subset (0,1), so 1 - G' is bounded away from zero and the
+            //     step needs no safeguarding.
+            //   * G' below holds for any p, so unlike the n = 3 closed form (a depressed cubic,
+            //     8A*eta^3 + 8k*eta - B^3 = 0) there is no special case -- and that closed form
+            //     is unusable here anyway: Cardano's two cube roots nearly cancel when the shear
+            //     dominates, losing three digits in float32 in precisely the regime of interest.
+            //   * It needs no new dual overloads, so the derivative rides along as before.
+            // k must be typed T, not taken from primals: it carries tau_b, which carries the
+            // seeded perturbation, so a primal-only k would silently drop d(eta)/d(tau_b).
+            T k_shear = tau_b*(0.5f*zeta);
+            k_shear = k_shear*k_shear;
+            T A_mem = eps_mem_sq + eps_reg;
+
+            // Start from the smaller of the two asymptotic limits.  Both overestimate, since
+            // dropping either positive term of the cubic inflates eta; taking the min puts the
+            // guess close enough that three Newton steps reach float32 round-off everywhere,
+            // where starting from the shear-free value alone would need six.
+            T eta_k = 0.5f*B_c*__powf(A_mem, glen_exp);
+            if (diva_primal(k_shear) > 0.0f) {
+                T eta_shear = __powf(0.5f*B_c*__powf(k_shear, glen_exp),
+                                     1.0f/(1.0f + 2.0f*glen_exp));
+                eta_k = fminf(eta_k, eta_shear);
+            }
             for (int e = 0; e < eta_iters; ++e) {
-                T eps_shear = tau_b*zeta/(2.0f*eta_k);
-                eta_k = 0.5f*B_c*__powf(eps_mem_sq + eps_shear*eps_shear + eps_reg, glen_exp);
+                T s_sh = k_shear/(eta_k*eta_k);           // s = k/eta^2
+                T E_sh = A_mem + s_sh;                    // E = A + s
+                T G_of = 0.5f*B_c*__powf(E_sh, glen_exp); // G(eta)
+                // G'(eta) = -2p * (s/E) * G(eta)/eta   (exact, not the at-the-root form)
+                T Gp = (-2.0f*glen_exp)*(s_sh/E_sh)*(G_of/eta_k);
+                eta_k = eta_k - (eta_k - G_of)/(1.0f - Gp);
             }
 
             eta_avg = eta_avg + w*eta_k;

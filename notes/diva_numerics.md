@@ -253,82 +253,48 @@ Nothing in the FAS cycle changes. Each level diagnoses its own $\bar\eta, F_2,
 
 ### 5.8 Operator symmetry: what the adjoint relies on
 
-This is a real design constraint rather than a curiosity, so it is recorded here
-explicitly. It was previously implicit in the code and untested.
+This is a real design constraint rather than a curiosity, so it is recorded here explicitly. It was previously implicit in the code and untested.
 
 **Where symmetry is and is not relied on.** GLIDE's adjoint is a hybrid:
 
 | site | mechanism | needs symmetry |
-|---|---|---|
+|------------------------|------------------------|------------------------|
 | adjoint block solve (`vanka_smooth_adjoint`) | builds forward `J`, then **explicitly transposes** it (`J_T[r*5+c] = J[c*5+r]`) | no |
 | adjoint multigrid transfers | reuses the forward operators | no -- multigrid only accelerates; the fixed point is set by the residual equation |
 | basal / driving / flux / calving in `compute_vjp` | explicit scatter, `atomicAdd(adj_X, lambda_row * j.d_X)`, deposited at the **column** index | no |
 | **viscous (membrane) term in `compute_vjp`** | λ-seeded forward JVP -- `populate_viscosity(..., lambda_u, lambda_v, ...)`, then `eta_c.d` fed through `apply_jvp`, deposited at the **row** index | **yes** |
 
-So exactly one term computes `J λ` and uses it where `Jᵀ λ` is wanted. The tell is where
-the result lands: the basal block scatters to column indices, the membrane block deposits
-at its own row.
+So exactly one term computes `J λ` and uses it where `Jᵀ λ` is wanted. The tell is where the result lands: the basal block scatters to column indices, the membrane block deposits at its own row.
 
-**Why the shortcut is there.** `∂η/∂u` is the worst transpose in the code to write by
-hand: the shared `eta_local` tile couples a 3×3 cell neighbourhood, each `η` depends on
-~8 velocity facets, and the shear terms contract four cells' viscosity derivatives at
-once -- roughly 32 velocity degrees of freedom feeding a single row. Exploiting symmetry
-lets the adjoint reuse the **forward data flow verbatim**, with λ substituted for the
-perturbation. The honest transpose is perfectly feasible matrix-free (form
-`w_c = (Gᵀλ)_c` per cell, then scatter `w_c · ∂η_c/∂u_j`), but it needs a second,
-differently-shaped phase: an extra shared tile, an extra `__syncthreads()`, and a scatter
-whose reach may exceed the current `halo = 1` tiling. The cost is code structure, not
-flops.
+**Why the shortcut is there.** `∂η/∂u` is the worst transpose in the code to write by hand: the shared `eta_local` tile couples a 3×3 cell neighbourhood, each `η` depends on \~8 velocity facets, and the shear terms contract four cells' viscosity derivatives at once -- roughly 32 velocity degrees of freedom feeding a single row. Exploiting symmetry lets the adjoint reuse the **forward data flow verbatim**, with λ substituted for the perturbation. The honest transpose is perfectly feasible matrix-free (form `w_c = (Gᵀλ)_c` per cell, then scatter `w_c · ∂η_c/∂u_j`), but it needs a second, differently-shaped phase: an extra shared tile, an extra `__syncthreads()`, and a scatter whose reach may exceed the current `halo = 1` tiling. The cost is code structure, not flops.
 
-**Measured** (central FD on the assembled residual, so the measured Jacobian contains
-the full `∂η̄/∂u` and `∂β_eff/∂u` paths; relative asymmetry of `⟨Jx,y⟩` vs `⟨x,Jy⟩`):
+**Measured** (central FD on the assembled residual, so the measured Jacobian contains the full `∂η̄/∂u` and `∂β_eff/∂u` paths; relative asymmetry of `⟨Jx,y⟩` vs `⟨x,Jy⟩`):
 
-| block | SSA | DIVA |
-|---|---|---|
-| momentum diagonal | 5.0e-6 | 7.3e-5 |
+| block                                    | SSA    | DIVA   |
+|------------------------------------------|--------|--------|
+| momentum diagonal                        | 5.0e-6 | 7.3e-5 |
 | off-diagonal `u`--`H` (positive control) | 9.8e-2 | 9.8e-2 |
 
-The control confirms the test detects real asymmetry, so the diagonal figures are
-meaningful. DIVA's momentum block is symmetric to three orders below a genuinely
-asymmetric one. DIVA is ~15x less symmetric than SSA, which is plausibly a small real
-asymmetry from the fixed-iteration closure not being exactly the gradient of anything;
-expect that as a floor in FD gradient checks.
+The control confirms the test detects real asymmetry, so the diagonal figures are meaningful. DIVA's momentum block is symmetric to three orders below a genuinely asymmetric one. DIVA is \~15x less symmetric than SSA, which is plausibly a small real asymmetry from the fixed-iteration closure not being exactly the gradient of anything; expect that as a floor in FD gradient checks.
 
-**What preserves symmetry.** The whole higher-order ladder (SSA, DIVA, MOLHO,
-Blatter--Pattyn) is variationally derived, so the momentum block is symmetric by
-construction. Also **every isotropic sliding law, neural networks included**: for
-`tau_b = -c(s) u` with `s = |u|`,
+**What preserves symmetry.** The whole higher-order ladder (SSA, DIVA, MOLHO, Blatter--Pattyn) is variationally derived, so the momentum block is symmetric by construction. Also **every isotropic sliding law, neural networks included**: for `tau_b = -c(s) u` with `s = |u|`,
 
-$$
-\frac{\partial \tau_{b,i}}{\partial u_j} = -\Big[c(s)\,\delta_{ij} + \frac{c'(s)}{s}u_i u_j\Big]
-$$
+$$\frac{\partial \tau_{b,i}}{\partial u_j} = -\Big[c(s)\,\delta_{ij} + \frac{c'(s)}{s}u_i u_j\Big]$$
 
-and both terms are symmetric in `(i,j)` for *any* scalar `c`. The eigenvalues are
-`c + c's = f'(s)` along the flow and `c` across it, so **definiteness** (not symmetry)
-is what requires a monotone law -- the rate-weakening constraint documented in
-`differentiable_sliding_laws.md`. Two separate properties: symmetry licenses the adjoint
-shortcut, monotonicity licenses the solver.
+and both terms are symmetric in `(i,j)` for *any* scalar `c`. The eigenvalues are `c + c's = f'(s)` along the flow and `c` across it, so **definiteness** (not symmetry) is what requires a monotone law -- the rate-weakening constraint documented in `differentiable_sliding_laws.md`. Two separate properties: symmetry licenses the adjoint shortcut, monotonicity licenses the solver.
 
-Thermomechanical coupling does **not** threaten it: `B(T)` enters as a coefficient, so
-within the momentum block `eta` is still an isotropic function of the strain invariant.
-The new `∂r_u/∂T` and `∂r_T/∂u` blocks are off-diagonal and get explicit transposes, as
-the `H` blocks already do.
+Thermomechanical coupling does **not** threaten it: `B(T)` enters as a coefficient, so within the momentum block `eta` is still an isotropic function of the strain invariant. The new `∂r_u/∂T` and `∂r_T/∂u` blocks are off-diagonal and get explicit transposes, as the `H` blocks already do.
 
-**What would break it:** anisotropic drag (an NN emitting a 2x2 tensor, or drag not
-antiparallel to `u`); thickness transport (already nonsymmetric, already explicit);
-thermal or hydrological couplings (off-diagonal, handle explicitly).
+**What would break it:** anisotropic drag (an NN emitting a 2x2 tensor, or drag not antiparallel to `u`); thickness transport (already nonsymmetric, already explicit); thermal or hydrological couplings (off-diagonal, handle explicitly).
 
-**Consequence for the DIVA adjoint.** `η̄` depends on velocity through two paths, and
-they are treated differently on purpose:
+**Consequence for the DIVA adjoint.** `η̄` depends on velocity through two paths, and they are treated differently on purpose:
 
 | path into `η̄` | stencil | mechanism | symmetry assumed |
-|---|---|---|---|
+|------------------|------------------|------------------|------------------|
 | `ε̇²_mem(u)` | wide (3x3 cells) | λ-seeded JVP shortcut | yes -- but the *same* assumption SSA already makes, structurally guaranteed |
 | closure, via `Ū_c` | **local, 4 facets** | explicit transpose scatter | **no** |
 
-The closure path enters only through `Ū_c = |ū_c|`, which `compute_diva_coeffs` builds
-from the cell's own four facets, so its transpose is a small local scatter. The DIVA
-adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
+The closure path enters only through `Ū_c = |ū_c|`, which `compute_diva_coeffs` builds from the cell's own four facets, so its transpose is a small local scatter. The DIVA adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
 
 ## 6. Verification status
 
@@ -344,52 +310,44 @@ adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
 
 ------------------------------------------------------------------------
 
-## 7. Not yet done
+## 7. Status and what remains
 
-- ~~**Complete `dJ/d(beta)`.**~~ **DONE.** `dJ/d(beta)` is now the cell-local product
-`W_eta_c*d(eta_bar_c)/d(beta_c) + W_be_c*d(beta_eff_c)/d(beta_c)`, from a third dual
-seeding of the closure (seeded with `grounded` so the result is w.r.t. the raw beta). It
-agrees with finite differences at the FD floor -- best 2.2e-5, against an SSA control of
-1.4e-4 -- and it *replaced* the facet-walking kernel with ~15 lines. The same expression
-gives `u_c` and `m` by swapping which derivative field is used.
+Done and verified (see `tests/` for each):
 
-  Historical note worth keeping: with the frozen adjoint this read 9.6e-4 and with the
-  exact adjoint 2.2e-2, because a wrong lambda had been partly cancelling the missing
-  `eta_bar` path. Neither number was evidence about the gradient on its own.
+- **The forward model.** Converges as well as SSA, ~11% more expensive, consistent across multigrid depths. SSA is bit-identical with `stress_balance = 0`.
 
-- **`u_c` and `m` gradients.** Same shape as above. `u_c` and `m` are still plain floats
-  in `diva_coeffs_cell`; templating them the way `beta` now is makes them seedable, and
-  then each needs only its own pair of derivative fields plus one kernel line.
+- **The exact coefficient adjoint.** `AdjointOperators.diva_exact_coeff_adjoint = True`, on by default. Dot-product identity $\langle J^T\lambda, x\rangle$ vs $\langle\lambda, Jx\rangle$ = **5.6e-7** against an SSA control of 1.2e-7, with **no symmetry assumed anywhere** in the DIVA path. `vanka_smooth_adjoint` is templated on DIVA and uses the uncondensed block; the smoother stays frozen-coefficient, which is fine because it is only a preconditioner -- exactly as in SSA, where the VJP carries $\partial\eta/\partial u$ and the smoother does not.
 
-- ~~**Turn on the exact coefficient adjoint.**~~ The adjoint operator is now exact (dot-product identity
-5.6e-7) and the adjoint solve converges, but the *parameter* sensitivity is not yet
-complete: `get_diva_dbeta_eff_dbeta` covers only the `beta -> beta_eff` path, while beta
-also moves `eta_bar` through `beta -> c -> tau_b -> shear term`. Against finite differences
-`dJ/d(beta)` therefore reads 2.2e-2, having read 9.6e-4 with the frozen adjoint only
-because a wrong lambda partly cancelled the missing term -- a good reminder that agreement
-with FD is not evidence of correctness when two errors can offset.
+  An earlier attempt appeared to stall the adjoint V-cycles at 1.1e-1. The cause was not the smoother but the **Dirichlet rows**: the coefficient gather ran after the main VJP kernel had replaced those rows with an identity, so what it added there could never be reduced and sat in the residual as a floor. Flat *and* omega-independent is the signature of that, as against a weak preconditioner, which responds to omega.
 
-The fix is simpler than the current kernel. `W_eta` and `W_be` already *are*
-`lambda^T d(r)/d(coefficient)`, so the parameter gradient is a purely cell-local product
-with no facet loop:
+- **All three sliding-parameter gradients**, $\partial J/\partial\beta$, $\partial J/\partial u_c$ and $\partial J/\partial m$, as one cell-local expression:
 
-      dJ/d(beta)_c = W_eta_c * d(eta_bar_c)/d(beta_c) + W_be_c * d(beta_eff_c)/d(beta_c)
+```         
+  dJ/d(p)_c = W_eta_c * d(eta_bar_c)/d(p_c) + W_be_c * d(beta_eff_c)/d(p_c)
+```
 
-which needs one more dual seeding in compute_diva_derivs (seed beta) and replaces
-compute_gradient_beta_diva entirely. The same shape then gives `u_c` and `m` for free.
+  `W_eta` and `W_be`, filled by `vjp_body`, already *are* $\lambda^T\,\partial r/\partial(\text{coefficient})$ summed over every row that touches the cell, so no facet loop is involved and nothing in the expression knows which parameter $p$ is -- the identity of $p$ lives entirely in which pair of derivative fields is passed. One kernel serves $\beta$ and $u_c$; a reducing variant serves the global $m$. Every input a gradient could be wanted for is templated in `get_diva_c_of_U`, so adding a parameter means seeding it and reading `.d`, with no second derivation to keep in sync. Contrast SSA, which needs a separate ~90-line facet-walking kernel per parameter because there the parameters enter the momentum stencils directly rather than through a state-dependent coefficient.
 
-- **Turn on the exact coefficient adjoint.** The four closure terms are implemented and
-verified -- `AdjointOperators.diva_exact_coeff_adjoint = True` takes the adjoint identity
-from 9.7e-2 to **5.0e-7**, i.e. round-off against an SSA control of 1.2e-7, with no
-symmetry assumed. They are **on** by default. An earlier attempt appeared to stall the adjoint V-cycles at
-1.1e-1; the cause was not the smoother but the Dirichlet rows -- the coefficient gather ran
-after the main VJP kernel had replaced those rows with an identity, so what it added there
-could never be reduced and sat in the residual as a floor. Skipping the Dirichlet facets in
-the gather fixed it, and the adjoint now converges to 1.0e-6 exactly as the frozen version
-does. The smoother is still the frozen block, which is fine: it is only a preconditioner,
-exactly as in SSA where the VJP carries d(eta)/du and the smoother does not.
+  Against finite differences (best of a bracketed step sweep):
 
-- **The adjoint.** `vanka_smooth_adjoint` is still SSA-only (it passes `nullptr` for the DIVA fields). This is the next piece of work and the condition under which the author endorsed the effort. The pieces are in place: `get_diva_dbeta_eff_du_b` already supplies $\partial\beta_{\mathrm{eff}}/\partial U_b$, and the parameter chain factor is $f_\theta(U_b)/(1+f'(U_b)F_2)$ — closed-form via the implicit function theorem at the converged $U_b$, so the adjoint never re-runs the per-cell Newton in reverse.
-- **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. To be done once the adjoint is in, so the forward model and the gradients are validated together.
+  | | SSA control | DIVA |
+  |---|---|---|
+  | $\partial J/\partial\beta$ | 1.4e-4 | **2.2e-5** |
+  | $\partial J/\partial u_c$ | 2.6e-4 | **1.6e-4** |
+  | $\partial J/\partial m$ | 9.5e-5 | **5.5e-5** |
+
+  DIVA is at or better than the exact-adjoint SSA control throughout, i.e. all six are limited by the finite-difference reference rather than by the adjoint.
+
+  Two implementation details that are easy to get wrong. The $\beta$ seeding perturbs by `grounded`, not 1, because the closure is handed $\beta\varphi$ -- otherwise the result is $\partial/\partial(\beta\varphi)$ rather than the $\partial/\partial\beta$ an inversion controls. And $m$ needs `__powf(dual, dual)`: it sits in the *exponent*, so $d(x^p) = x^p(\tfrac{p}{x}dx + \log x\,dp)$ and the existing `(dual, float)` overload cannot supply the second term.
+
+- **Methodological note, worth keeping.** $\partial J/\partial\beta$ read 9.6e-4 with a *wrong* (frozen) adjoint and 2.2e-2 with the right one, because a wrong $\lambda$ was partly cancelling the missing `eta_bar` path. Neither number was evidence about the gradient on its own. Relatedly, no single FD step is trustworthy here: two-sided truncation falls like $\varepsilon^2$ while float32 round-off grows like $1/\varepsilon$, so the tests sweep $\varepsilon$ to bracket the crossover and print the whole curve. $\partial J/\partial u_c$ under DIVA reads 1.6e-4 at $\varepsilon = 2$ and 1.4e-3 at $\varepsilon = 1$; judging on one step would have manufactured a defect that is not there.
+
+Remaining:
+
+- **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. The forward model and the gradients are both in place now, so they can be validated together.
+
+- **Quadrature-order convergence in** $N_\sigma$. The default is 8 with midpoint quadrature; nothing yet establishes what that costs against, say, 32.
+
 - **Thermomechanical** $B(z)$, which would use the vertical discretisation already here.
+
 - **Quadrature order**: midpoint is first-cut; Goldberg's factor conventions are pinned but the rule itself has not been convergence-tested in $N_\sigma$.

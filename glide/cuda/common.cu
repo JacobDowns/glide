@@ -109,6 +109,18 @@ __device__ __forceinline__ DualFloat __powf(DualFloat u, float p) {
     return {val, deriv};
 }
 
+__device__ __forceinline__ DualFloat __powf(DualFloat u, DualFloat p) {
+    // Both base and exponent carry a perturbation:
+    //     d(u^p) = u^p * ( (p/u) du + log(u) dp )
+    // Needed when the exponent is itself a parameter being differentiated, as for the
+    // Weertman m.  Reduces exactly to the (dual, float) overload above when dp = 0.
+    float val = __powf(u.v, p.v);
+
+    float deriv = val * (p.v * u.d / u.v + logf(u.v) * p.d);
+
+    return {val, deriv};
+}
+
 __device__ __forceinline__ DualFloat sqrtf(DualFloat u) {
     // Hardware intrinsic sqrt; d/dx(sqrt(u)) = du / (2*sqrt(u))
     // If u.v is zero the derivative is singular; callers regularize (e.g. eps_reg).

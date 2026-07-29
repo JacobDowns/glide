@@ -33,16 +33,18 @@ from glide.operators import CUDA_FILES
 PROBE = r'''
 extern "C" __global__
 void deriv_probe(const float* eps, const float* Ubar, const float* beta,
+                 const float* u_cs, const float* ms,
                  float* eta_v, float* be_v,
                  float* deta_deps, float* deta_dU, float* dbe_deps, float* dbe_dU,
                  float* deta_dbeta, float* dbe_dbeta,
-                 float H_c, float B_c, float u_c_c,
-                 float m, float u_reg, float wd, float law,
+                 float* deta_duc, float* dbe_duc, float* deta_dm, float* dbe_dm,
+                 float H_c, float B_c,
+                 float u_reg, float wd, float law,
                  float glen_exp, float eps_reg, int n_sigma, float U_b_warm, int n)
 {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
-    float e = eps[i], U = Ubar[i], bg = beta[i];
+    float e = eps[i], U = Ubar[i], bg = beta[i], u_c_c = u_cs[i], m = ms[i];
 
     float eta_f, F2_f, Ub_f, be_f;
     diva_coeffs_cell<float>(e, U, H_c,B_c,bg,u_c_c, m,u_reg,wd,law,
@@ -50,17 +52,25 @@ void deriv_probe(const float* eps, const float* Ubar, const float* beta,
     eta_v[i]=eta_f; be_v[i]=be_f;
 
     DualFloat a,b,c,d;
-    diva_coeffs_cell<DualFloat>({e,1.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},u_c_c, m,u_reg,wd,law,
+    diva_coeffs_cell<DualFloat>({e,1.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
                                 glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
     deta_deps[i]=a.d; dbe_deps[i]=d.d;
 
-    diva_coeffs_cell<DualFloat>({e,0.0f},{U,1.0f}, H_c,B_c,{bg,0.0f},u_c_c, m,u_reg,wd,law,
+    diva_coeffs_cell<DualFloat>({e,0.0f},{U,1.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
                                 glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
     deta_dU[i]=a.d; dbe_dU[i]=d.d;
 
-    diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,1.0f},u_c_c, m,u_reg,wd,law,
+    diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,1.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
                                 glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
     deta_dbeta[i]=a.d; dbe_dbeta[i]=d.d;
+
+    diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,1.0f}, {m,0.0f},u_reg,wd,law,
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+    deta_duc[i]=a.d; dbe_duc[i]=d.d;
+
+    diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,1.0f},u_reg,wd,law,
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+    deta_dm[i]=a.d; dbe_dm[i]=d.d;
 }
 '''
 
@@ -80,14 +90,15 @@ def build_module():
     return cp.RawModule(code=src + PROBE, options=("--use_fast_math",))
 
 
-def probe(mod, eps_arr, U_arr, beta_arr, m, law):
+def probe(mod, eps_arr, U_arr, beta_arr, u_c_arr, m_arr, law):
     n = len(eps_arr)
-    out = [cp.zeros(n, cp.float32) for _ in range(8)]
+    out = [cp.zeros(n, cp.float32) for _ in range(12)]
     mod.get_function("deriv_probe")((n // 64 + 1,), (64,),
         (cp.asarray(eps_arr, cp.float32), cp.asarray(U_arr, cp.float32),
-         cp.asarray(beta_arr, cp.float32), *out,
-         np.float32(H_C), np.float32(B_C), np.float32(U_C_C),
-         np.float32(m), np.float32(U_REG), np.float32(WATER_DRAG), np.float32(law),
+         cp.asarray(beta_arr, cp.float32), cp.asarray(u_c_arr, cp.float32),
+         cp.asarray(m_arr, cp.float32), *out,
+         np.float32(H_C), np.float32(B_C),
+         np.float32(U_REG), np.float32(WATER_DRAG), np.float32(law),
          np.float32(GLEN_EXP), np.float32(EPS_REG), np.int32(N_SIGMA),
          np.float32(WARM), n))
     return [cp.asnumpy(o) for o in out]
@@ -101,19 +112,27 @@ def best_agreement(mod, m, law, beta_g, which):
         eps_arr = np.array([EPS0] * 3, np.float32)
         U_arr = np.array([U0] * 3, np.float32)
         beta_arr = np.array([beta_g] * 3, np.float32)
+        u_c_arr = np.array([U_C_C] * 3, np.float32)
+        m_arr = np.array([m] * 3, np.float32)
         if which.endswith("deps"):
             h = EPS0 * frac; eps_arr[1] -= h; eps_arr[2] += h
         elif which.endswith("dbeta"):
             h = beta_g * frac; beta_arr[1] -= h; beta_arr[2] += h
+        elif which.endswith("duc"):
+            h = U_C_C * frac; u_c_arr[1] -= h; u_c_arr[2] += h
+        elif which.endswith("dm"):
+            h = m * frac; m_arr[1] -= h; m_arr[2] += h
         else:
             h = U0 * frac; U_arr[1] -= h; U_arr[2] += h
 
-        eta, be, de_de, de_dU, db_de, db_dU, de_db, db_db = probe(
-                mod, eps_arr, U_arr, beta_arr, m, law)
-        value = {"deta_deps": eta, "deta_dU": eta, "deta_dbeta": eta,
-                 "dbe_deps": be, "dbe_dU": be, "dbe_dbeta": be}[which]
+        (eta, be, de_de, de_dU, db_de, db_dU,
+         de_db, db_db, de_duc, db_duc, de_dm, db_dm) = probe(
+                mod, eps_arr, U_arr, beta_arr, u_c_arr, m_arr, law)
+        value = eta if which.startswith("deta") else be
         dual = {"deta_deps": de_de, "deta_dU": de_dU, "deta_dbeta": de_db,
-                "dbe_deps": db_de, "dbe_dU": db_dU, "dbe_dbeta": db_db}[which][0]
+                "deta_duc": de_duc, "deta_dm": de_dm,
+                "dbe_deps": db_de, "dbe_dU": db_dU, "dbe_dbeta": db_db,
+                "dbe_duc": db_duc, "dbe_dm": db_dm}[which][0]
         fd = (value[2] - value[1]) / (2 * h)
         rel = abs(dual - fd) / max(abs(fd), 1e-30)
         if rel < best[0]:
@@ -126,14 +145,26 @@ def main():
     for tag, m, law, beta_g in (("Weertman m=0.5", 0.5, 0.0, 0.05),
                                 ("regularized Coulomb", 1.0, 1.0, 6.0)):
         print(f"{tag}:")
+        # u_c only enters the Coulomb branch and m only the Weertman branch, so each
+        # law exercises just one of the two.  The other is checked to be exactly zero.
+        active = ("deta_duc", "dbe_duc") if law > 0.5 else ("deta_dm", "dbe_dm")
+        inert  = ("deta_dm", "dbe_dm") if law > 0.5 else ("deta_duc", "dbe_duc")
         for which in ("deta_deps", "deta_dU", "dbe_deps", "dbe_dU",
-                      "deta_dbeta", "dbe_dbeta"):
+                      "deta_dbeta", "dbe_dbeta") + active:
             rel, dual, fd, frac = best_agreement(mod, m, law, beta_g, which)
             print(f"  {which:<10} dual = {dual:+.6e}  FD = {fd:+.6e}  "
                   f"rel = {rel:.2e}  (best at step {frac:g})")
             assert rel < TOL, f"{tag} {which}: dual derivative disagrees with FD ({rel:.2e})"
 
-    print("\nOK: all six closure derivatives agree with finite differences")
+        # The other law's parameter must come back identically zero -- not merely small.
+        # A nonzero value here would mean the untaken branch is still contributing, which
+        # would put a spurious search direction into an inversion over that parameter.
+        for which in inert:
+            _, dual, _, _ = best_agreement(mod, m, law, beta_g, which)
+            print(f"  {which:<10} dual = {dual:+.6e}  (inert under this law)")
+            assert dual == 0.0, f"{tag} {which}: expected exactly zero, got {dual:.6e}"
+
+    print("\nOK: all closure derivatives agree with finite differences")
 
 
 if __name__ == '__main__':

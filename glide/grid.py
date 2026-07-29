@@ -75,8 +75,12 @@ class Rheology:
     deta_dU: Field | None = None      # d(eta_bar)/d(Ubar)
     dbe_deps: Field | None = None     # d(beta_eff)/d(eps_mem^2)
     dbe_dU: Field | None = None       # d(beta_eff)/d(Ubar)
-    deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)   -- for the parameter gradient
+    deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)   -- for the parameter gradients
     dbe_dbeta: Field | None = None    # d(beta_eff)/d(beta)
+    deta_duc: Field | None = None     # d(eta_bar)/d(u_c)    -- zero under Weertman
+    dbe_duc: Field | None = None      # d(beta_eff)/d(u_c)
+    deta_dm: Field | None = None      # d(eta_bar)/d(m)      -- zero under Coulomb
+    dbe_dm: Field | None = None       # d(beta_eff)/d(m)
     n: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(3.0),
@@ -436,7 +440,11 @@ class Grid:
                 dbe_deps=_cell('dbe_deps','?','DIVA d(beta_eff)/d(eps_mem^2)'),
                 dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'),
                 deta_dbeta=_cell('deta_dbeta','?','DIVA d(eta_bar)/d(beta)'),
-                dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'))
+                dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'),
+                deta_duc=_cell('deta_duc','?','DIVA d(eta_bar)/d(u_c)'),
+                dbe_duc=_cell('dbe_duc','?','DIVA d(beta_eff)/d(u_c)'),
+                deta_dm=_cell('deta_dm','?','DIVA d(eta_bar)/d(m)'),
+                dbe_dm=_cell('dbe_dm','?','DIVA d(beta_eff)/d(m)'))
 
     def _allocate_sliding(self):
         beta = Field(

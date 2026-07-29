@@ -224,9 +224,9 @@ class ForwardOperators:
                     stride, halo))
 
     def compute_diva_derivs(self):
-        """The four total derivatives of the cell-local DIVA closure w.r.t. its two
-        velocity-dependent inputs (eps_mem^2 and Ubar), from two dual seedings.  Needed
-        only by the adjoint."""
+        """Total derivatives of the cell-local DIVA closure, one dual seeding per input:
+        eps_mem^2 and Ubar for the state transpose, then beta, u_c and m for the parameter
+        gradients.  Needed only by the adjoint."""
         kernel = self.kernels.get_function('compute_diva_derivs')
         grid_size, block_size, stride, halo = self._kernel_config
 
@@ -239,6 +239,8 @@ class ForwardOperators:
                    (rheology.deta_deps.data, rheology.deta_dU.data,
                     rheology.dbe_deps.data, rheology.dbe_dU.data,
                     rheology.deta_dbeta.data, rheology.dbe_dbeta.data,
+                    rheology.deta_duc.data, rheology.dbe_duc.data,
+                    rheology.deta_dm.data, rheology.dbe_dm.data,
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data, state.u_b.data,
                     sliding.m.value, sliding.u_reg.value,
@@ -657,7 +659,9 @@ class AdjointOperators:
 
     def compute_gradient_beta(self):
         if float(self.grid.rheology.stress_balance.value) > 0.5:
-            return self._compute_gradient_beta_diva()
+            rheology = self.grid.rheology
+            return self._diva_param_gradient(self.grid.sliding.beta.grad,
+                                             rheology.deta_dbeta, rheology.dbe_dbeta)
         kernel = self.kernels.get_function('compute_gradient_beta')
         grid_size, block_size, stride, halo = self._kernel_config
 
@@ -688,37 +692,48 @@ class AdjointOperators:
                 grid.dx, cp.float32(0.0),
                 grid.ny, grid.nx, stride, halo))
 
-    def _compute_gradient_beta_diva(self):
-        """dJ/d(beta) under DIVA, as a cell-local product.
+    def _diva_param_gradient(self, out, deta_dp, dbe_dp, reduce=False):
+        """Any DIVA sliding-parameter gradient, as a cell-local product.
 
         W_eta and W_be (filled by the VJP) already are lambda^T d(r)/d(coefficient)
         summed over every row touching the cell, so the parameter gradient is just the
-        chain rule per cell -- no facet loop.  This is the SSA pattern plus one link:
-        compute_gradient_beta computes W for beta directly, because under SSA beta enters
-        the stencil itself rather than through a state-dependent coefficient.
+        chain rule per cell -- no facet loop.  Nothing here knows which parameter it is:
+        beta, u_c and m differ only in which pair of derivative fields is passed, and m
+        additionally reduces to a scalar.  Contrast the SSA path, which needs a separate
+        facet-walking kernel per parameter because there the parameters enter the momentum
+        stencils directly rather than through a state-dependent coefficient.
 
-        A VJP evaluation is run first so W corresponds to the current (converged) lambda
-        rather than to whatever the last smoother sweep left behind."""
+        The VJP is re-evaluated first so W corresponds to the current (converged) lambda
+        rather than to whatever the last smoother sweep left behind.  That costs one
+        residual plus one derivative kernel per call -- negligible next to the multigrid
+        adjoint solve that precedes it, and it keeps the result independent of call order.
+        """
         grid = self.grid
-        rheology = grid.rheology
 
-        # Refresh W at the current (converged) lambda: the last thing the adjoint solve
-        # does is smooth, so the W left behind corresponds to lambda before that update.
         self.compute_residual(getattr(self, '_last_dt', cp.float32(1.0)), use_mask=False)
         grid.forward_operators.compute_diva_derivs()
 
-        kernel = self.kernels.get_function('compute_gradient_beta_diva')
+        name = 'compute_gradient_param_sum_diva' if reduce else 'compute_gradient_param_diva'
+        kernel = self.kernels.get_function(name)
         grid_size, block_size, stride, halo = self._kernel_config
+        # Required for the reducing variant (it accumulates); belt-and-braces for the
+        # per-cell one, whose tiling writes every cell exactly once.
+        out.fill(0)
         kernel(grid_size, block_size,
-               (grid.sliding.beta.grad,
-                self.W_eta, self.W_be,
-                rheology.deta_dbeta.data, rheology.dbe_dbeta.data,
+               (out, self.W_eta, self.W_be, deta_dp.data, dbe_dp.data,
                 grid.ny, grid.nx, stride, halo))
 
     def compute_gradient_m(self):
         """Gradient w.r.t. the global Weertman exponent m (a single scalar).
         Contracts the adjoint state with d(tau_b)/dm over all momentum facets and
         stores the reduced value on sliding.m.grad."""
+        if float(self.grid.rheology.stress_balance.value) > 0.5:
+            rheology = self.grid.rheology
+            grad_m = cp.zeros(1, dtype=cp.float32)
+            self._diva_param_gradient(grad_m, rheology.deta_dm, rheology.dbe_dm,
+                                      reduce=True)
+            self.grid.sliding.m.grad = float(grad_m[0])
+            return
         kernel = self.kernels.get_function('compute_gradient_m')
         grid_size, block_size, stride, halo = self._kernel_config
 
@@ -750,6 +765,10 @@ class AdjointOperators:
         sliding.m.grad = float(grad_m[0])
 
     def compute_gradient_u_c(self):
+        if float(self.grid.rheology.stress_balance.value) > 0.5:
+            rheology = self.grid.rheology
+            return self._diva_param_gradient(self.grid.sliding.u_c.grad,
+                                             rheology.deta_duc, rheology.dbe_duc)
         kernel = self.kernels.get_function('compute_gradient_u_c')
         grid_size, block_size, stride, halo = self._kernel_config
 

@@ -99,19 +99,24 @@ __device__ __forceinline__ void diva_from_float(DualFloat& x, float v) { x = {v,
 template <typename T>
 __device__ __forceinline__
 T get_diva_c_of_U(
-    T U, T beta_grounded, float m, float u_reg, float water_drag,
-    float u_c, float sliding_law){
+    T U, T beta_grounded, T m, float u_reg, float water_drag,
+    T u_c, float sliding_law){
 
     // The drag coefficient c(U) of get_diva_drag_coeff (stress.cu), templated on the
     // scalar type so the same expression serves the diagnostic kernel (T = float) and
-    // the JVP, where T = DualFloat carries d/d(velocity perturbation).
+    // the JVP/derivative kernels, where T = DualFloat carries d/d(seeded direction).
+    //
+    // Every input a gradient is ever wanted for is typed T, not float: the velocity
+    // (through U), and the three sliding parameters beta, m and u_c.  Seeding any one of
+    // them and reading the .d of the outputs is then the whole parameter gradient, with
+    // no second derivation to keep in sync with this expression.
     T U_sq_reg = U*U + u_reg;
 
     T c;
     if (sliding_law < 0.5f) {
         c = beta_grounded * __powf(U_sq_reg, 0.5f*(m - 1.0f));
     } else {
-        c = beta_grounded / (T(sqrtf(U_sq_reg) + u_c));
+        c = beta_grounded / (sqrtf(U_sq_reg) + u_c);
     }
 
     return c + water_drag;
@@ -120,8 +125,8 @@ T get_diva_c_of_U(
 template <typename T>
 __device__ void diva_coeffs_cell(
     T eps_mem_sq, T U_bar,                       // the two velocity-dependent inputs
-    float H_c, float B_c, T beta_grounded, float u_c_c,
-    float m, float u_reg, float water_drag, float sliding_law,
+    float H_c, float B_c, T beta_grounded, T u_c_c,
+    T m, float u_reg, float water_drag, float sliding_law,
     float glen_exp, float eps_reg, int n_sigma,
     float U_b_warm,
     T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out)
@@ -170,7 +175,7 @@ __device__ void diva_coeffs_cell(
             T f = coeff * U_b;
             T R = U_b + f*F2_c - U_bar;
             // f'(U_b) from the primals: a separate differentiation from the seeded one.
-            DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},diva_primal(beta_grounded),m,u_reg,water_drag,u_c_c,sliding_law);
+            DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},diva_primal(beta_grounded),diva_primal(m),u_reg,water_drag,diva_primal(u_c_c),sliding_law);
             DualFloat fs = cs * DualFloat{diva_primal(U_b),1.0f};
             float dR = 1.0f + fs.d*diva_primal(F2_c);
             U_b = fmaxf(U_b - R/dR, 0.0f);
@@ -281,8 +286,8 @@ __device__ void populate_diva_coeffs_dual(
 
     DualFloat eta_d, F2_d, U_b_d, beta_eff_d;
     diva_coeffs_cell<DualFloat>(eps_mem_sq, U_bar,
-            H_c, B_c, DualFloat{beta_grounded, 0.0f}, u_c_c,
-            m, u_reg, water_drag, sliding_law,
+            H_c, B_c, DualFloat{beta_grounded, 0.0f}, DualFloat{u_c_c, 0.0f},
+            DualFloat{m, 0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma,
             U_b_warm,
             eta_d, F2_d, U_b_d, beta_eff_d);
@@ -377,6 +382,10 @@ void compute_diva_derivs(
     float* __restrict__ dbe_dU,
     float* __restrict__ deta_dbeta,
     float* __restrict__ dbe_dbeta,
+    float* __restrict__ deta_duc,
+    float* __restrict__ dbe_duc,
+    float* __restrict__ deta_dm,
+    float* __restrict__ dbe_dm,
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
@@ -392,10 +401,16 @@ void compute_diva_derivs(
     int stride, int halo
     )
 {
-    // The four total derivatives of the cell-local closure with respect to its two
-    // velocity-dependent inputs, from two dual seedings.  These are what the adjoint
-    // needs and the forward does not: with them the transpose can be applied without
-    // re-running the quadrature, and without assuming the operator is symmetric.
+    // Total derivatives of the cell-local closure, one dual seeding per input.  These are
+    // what the adjoint needs and the forward does not: with them the transpose can be
+    // applied without re-running the quadrature, and without assuming symmetry.
+    //
+    //   seeds 1-2 (eps_mem^2, Ubar) -> the state transpose
+    //   seeds 3-5 (beta, u_c, m)    -> the parameter gradients
+    //
+    // The two groups differ only in which input is seeded; there is one closure, and the
+    // quadrature/fixed-point/Newton are differentiated by running them in dual arithmetic
+    // rather than by any hand-derived expression.
     int j = blockIdx.x * stride + (threadIdx.x - halo);
     int i = blockIdx.y * stride + (threadIdx.y - halo);
 
@@ -428,8 +443,8 @@ void compute_diva_derivs(
 
     // Seed 1: d/d(eps_mem^2)
     diva_coeffs_cell<DualFloat>({eps_mem_v,1.0f}, {U_bar_v,0.0f},
-            H_c, B_c, {beta_grounded,0.0f}, u_c_c,
-            m, u_reg, water_drag, sliding_law,
+            H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
+            {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
             eta_d, F2_d, U_b_d, be_d);
     float d_eta_deps = eta_d.d;
@@ -437,8 +452,8 @@ void compute_diva_derivs(
 
     // Seed 2: d/d(Ubar)
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,1.0f},
-            H_c, B_c, {beta_grounded,0.0f}, u_c_c,
-            m, u_reg, water_drag, sliding_law,
+            H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
+            {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
             eta_d, F2_d, U_b_d, be_d);
     float d_eta_dU = eta_d.d;
@@ -450,12 +465,34 @@ void compute_diva_derivs(
     // beta_eff (beta -> c -> tau_b -> shear term), which is the path the parameter
     // gradient was missing.
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
-            H_c, B_c, {beta_grounded,grounded}, u_c_c,
-            m, u_reg, water_drag, sliding_law,
+            H_c, B_c, {beta_grounded,grounded}, {u_c_c,0.0f},
+            {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
             eta_d, F2_d, U_b_d, be_d);
     float d_eta_dbeta = eta_d.d;
     float d_be_dbeta  = be_d.d;
+
+    // Seed 4: d/d(u_c), the regularized-Coulomb threshold speed.  Identically zero under
+    // Weertman, where the u_c branch is not taken -- the same way SSA's d_u_c is.
+    diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
+            H_c, B_c, {beta_grounded,0.0f}, {u_c_c,1.0f},
+            {m,0.0f}, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma, U_b_warm,
+            eta_d, F2_d, U_b_d, be_d);
+    float d_eta_duc = eta_d.d;
+    float d_be_duc  = be_d.d;
+
+    // Seed 5: d/d(m), the Weertman exponent.  m is a single global scalar, so these are
+    // the per-cell contributions that compute_gradient_param_sum_diva reduces.  Getting
+    // this needed __powf(dual, dual) -- the exponent, not just the base, is now dual.
+    // Identically zero under regularized Coulomb.
+    diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
+            H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
+            {m,1.0f}, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma, U_b_warm,
+            eta_d, F2_d, U_b_d, be_d);
+    float d_eta_dm = eta_d.d;
+    float d_be_dm  = be_d.d;
 
     if (is_active) {
         deta_deps[idx] = d_eta_deps;
@@ -464,6 +501,10 @@ void compute_diva_derivs(
         dbe_dU[idx]    = d_be_dU;
         deta_dbeta[idx] = d_eta_dbeta;
         dbe_dbeta[idx]  = d_be_dbeta;
+        deta_duc[idx]   = d_eta_duc;
+        dbe_duc[idx]    = d_be_duc;
+        deta_dm[idx]    = d_eta_dm;
+        dbe_dm[idx]     = d_be_dm;
     }
 }
 
@@ -595,30 +636,34 @@ void compute_diva_vjp_coeffs(
 }
 
 /*=========================================================
-  ====== dJ/d(beta) under DIVA: cell-local W product =======
+  === DIVA parameter gradients: cell-local W products ======
   =========================================================*/
 /*
   W_eta and W_be, filled by vjp_body, already ARE lambda^T d(r)/d(coefficient) summed
-  over every row that touches the cell.  So the parameter gradient is just the chain
-  rule applied per cell, with no facet loop at all:
+  over every row that touches the cell.  So a parameter gradient is just the chain rule
+  applied per cell, with no facet loop at all:
 
-      dJ/d(beta)_c = W_eta_c * d(eta_bar_c)/d(beta_c) + W_be_c * d(beta_eff_c)/d(beta_c)
+      dJ/d(p)_c = W_eta_c * d(eta_bar_c)/d(p_c) + W_be_c * d(beta_eff_c)/d(p_c)
 
-  This replaces compute_gradient_beta_diva, which walked the facets and carried only the
-  beta_eff path -- beta also moves eta_bar through beta -> c -> tau_b -> shear term.
-  The same expression gives u_c and m by swapping the two derivative fields.
+  Nothing in this expression knows *which* parameter p is -- the identity of p lives
+  entirely in which pair of derivative fields the caller passes.  So one kernel serves
+  beta and u_c, and the reducing variant below serves the global m.  Compare the SSA
+  path, which needs a separate ~90-line facet-walking kernel per parameter
+  (compute_gradient_beta / _u_c / _m in grad.cu) because there beta, u_c and m enter the
+  momentum stencils directly rather than through a state-dependent coefficient.
 
-  Note this is the SSA pattern with one extra link: compute_gradient_beta already
-  computes W for beta directly, because under SSA beta enters the stencil itself rather
-  than through a state-dependent coefficient.
+  This replaced an earlier facet-walking compute_gradient_beta_diva that carried only the
+  beta_eff path.  Every parameter also moves eta_bar, through p -> c -> tau_b -> the
+  shear term in the effective strain rate; for beta that omission was the whole error.
 */
-extern "C" __global__
-void compute_gradient_beta_diva(
-    float* __restrict__ grad_beta,
+template <bool REDUCE>
+__device__ __forceinline__
+void diva_param_gradient_body(
+    float* __restrict__ grad,
     const float* __restrict__ W_eta,
     const float* __restrict__ W_be,
-    const float* __restrict__ deta_dbeta,
-    const float* __restrict__ dbe_dbeta,
+    const float* __restrict__ deta_dp,
+    const float* __restrict__ dbe_dp,
     int ny, int nx,
     int stride, int halo
     )
@@ -633,5 +678,46 @@ void compute_gradient_beta_diva(
     if (!is_active) return;
 
     int idx = i * nx + j;
-    grad_beta[idx] = W_eta[idx]*deta_dbeta[idx] + W_be[idx]*dbe_dbeta[idx];
+    float g = W_eta[idx]*deta_dp[idx] + W_be[idx]*dbe_dp[idx];
+
+    if (REDUCE) {
+        // A single global scalar (the Weertman m), so every cell's contribution is summed
+        // into one slot.  Same convention as SSA's compute_gradient_m; note the atomics
+        // make the summation order nondeterministic, so this gradient is reproducible
+        // only to float32 round-off, unlike the per-cell variant.
+        atomicAdd(&grad[0], g);
+    } else {
+        grad[idx] = g;
+    }
+}
+
+// Per-cell parameter: used for both beta and u_c, which differ only in the derivative
+// fields passed in.
+extern "C" __global__
+void compute_gradient_param_diva(
+    float* __restrict__ grad,
+    const float* __restrict__ W_eta,
+    const float* __restrict__ W_be,
+    const float* __restrict__ deta_dp,
+    const float* __restrict__ dbe_dp,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    diva_param_gradient_body<false>(grad, W_eta, W_be, deta_dp, dbe_dp, ny, nx, stride, halo);
+}
+
+// Global scalar parameter: used for m.  grad must be zeroed by the caller.
+extern "C" __global__
+void compute_gradient_param_sum_diva(
+    float* __restrict__ grad,
+    const float* __restrict__ W_eta,
+    const float* __restrict__ W_be,
+    const float* __restrict__ deta_dp,
+    const float* __restrict__ dbe_dp,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    diva_param_gradient_body<true>(grad, W_eta, W_be, deta_dp, dbe_dp, ny, nx, stride, halo);
 }

@@ -5,12 +5,18 @@ compute_vjp_diva and vanka_smooth_adjoint_diva form a consistent pair and the FA
 adjoint cycle converges on it, with the coefficients recomputed per level from the
 restricted forward state.
 
-This is the *frozen-coefficient* adjoint: eta_bar and beta_eff are treated as constant
-with respect to the velocity, so the d(eta_bar)/du and closure paths are omitted. That is
-exactly the operator Goldberg proves self-adjoint (see notes/diva_numerics.md 5.8). It is
-therefore not yet the exact gradient of the DIVA forward model -- the parameter gradients
-and the exact velocity paths come next -- but the solve must work before any of that is
-meaningful.
+This runs whatever AdjointOperators is configured for, which by default is now the
+**exact** coefficient transpose -- the d(eta_bar)/du and closure paths included. The
+smoother remains the frozen block, which is deliberate: it is only a preconditioner, and
+the frozen operator is the one Goldberg proves self-adjoint (see notes/diva_numerics.md
+5.8), so it makes a good one. SSA works the same way -- its VJP carries d(eta)/du and its
+smoother does not.
+
+Convergence is therefore the thing under test here, not correctness of the transpose;
+tests/diva_dotproduct_test.py establishes that separately and much more sharply. Worth
+knowing what a failure looks like: an earlier version stalled flat at 1.1e-1 regardless of
+omega, which is the signature of contributions landing on Dirichlet rows that the smoother
+has replaced with identities -- NOT of a weak preconditioner, which responds to omega.
 
     uv run python tests/diva_adjoint_test.py
 """

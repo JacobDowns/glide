@@ -17,12 +17,13 @@ Two checks, in the order that makes them interpretable:
 The SSA case is the control. Its VJP is an exact transpose of its JVP, so it should hit
 round-off, which is what establishes that any DIVA discrepancy is signal.
 
-Current status: the DIVA VJP is still the **frozen-coefficient** one -- eta_bar and
-beta_eff held fixed with respect to velocity -- while the DIVA JVP carries the full
-d(eta_bar)/du and d(beta_eff)/du through dual arithmetic. So check 2 measures precisely
-what the frozen adjoint omits. It comes out near 1e-1, i.e. about 10%; a finite-difference
-gradient check could not resolve this at all. DIVA_DOTPROD_BOUND should be tightened to
-round-off once the missing terms are added to the VJP.
+DIVA is run BOTH ways, which is the point of keeping this test: with the coefficient
+transpose off (eta_bar and beta_eff held fixed w.r.t. velocity, while the JVP carries the
+full d(eta_bar)/du and d(beta_eff)/du through dual arithmetic) check 2 measures precisely
+what those terms are worth, and with it on it should hit round-off. The frozen number comes
+out near 1e-1 -- about 10% -- which a finite-difference gradient check could not resolve at
+all, and which is why the frozen case is retained rather than deleted: it is the standing
+evidence that the omitted terms matter. The exact case is the default in production.
 
     uv run python tests/diva_dotproduct_test.py
 """
@@ -177,9 +178,10 @@ def main():
     print(f"\nDIVA JVP validated ({jvp_diva:.1e} vs FD, same order as SSA's {jvp_ssa:.1e}).")
     print(f"Frozen coefficient adjoint: {dot_frozen:.2e}  --  about 10% wrong.")
     print(f"Exact coefficient adjoint:  {dot_exact:.2e}  --  round-off, vs SSA control {dot_ssa:.1e}.")
-    print("So the four closure terms are exactly right. They are gated OFF by default")
-    print("because the adjoint SMOOTHER still assembles the frozen block and the")
-    print("V-cycles stall with them on; see notes/diva_numerics.md.")
+    print("So the closure terms are exactly right, and they are ON by default.")
+    print("The adjoint SMOOTHER still assembles the frozen block, which is fine -- it is")
+    print("only a preconditioner, exactly as in SSA, where the VJP carries d(eta)/du and")
+    print("the smoother does not; see notes/diva_numerics.md section 7.")
 
 
 if __name__ == '__main__':

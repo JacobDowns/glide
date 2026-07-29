@@ -26,7 +26,7 @@ __device__ void residual_body(
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,     // DIVA only: depth-averaged viscosity
-    const float* __restrict__ beta_eff,    // DIVA only: effective (secant) basal drag
+    const float* __restrict__ beta_eff,    // DIVA only: effective  basal drag
     bool use_forcing, bool use_mask,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
@@ -199,9 +199,9 @@ __device__ void residual_body(
 	    ru_l -= sigma_xy_bl.res * dx_inv;
 	    }
 	
-            {    
-            float u_l    = get_vfacet(u,i,j,ny,nx);
-            float v_tl   = get_hfacet(v,i,j-1,ny,nx);
+        {    
+		float u_l    = get_vfacet(u,i,j,ny,nx);
+		float v_tl   = get_hfacet(v,i,j-1,ny,nx);
 	    float v_tr   = get_hfacet(v,i,j,ny,nx);
 	    float v_bl   = get_hfacet(v,i+1,j-1,ny,nx);
 	    float v_br   = get_hfacet(v,i+1,j,ny,nx);
@@ -215,16 +215,16 @@ __device__ void residual_body(
 	    float beta_c = get_cell(beta,i,j,ny,nx);
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 	    if (DIVA) {
-		// tau_b = -beta_eff*ubar; the grounded factor and water_drag are already
-		// inside beta_eff, and the sliding law's velocity dependence now lives in
-		// the closure that produced it.
-		float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
-		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
-		TauBxDivaJacobian tau_bx = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
-		ru_l += tau_bx.res;
+			// tau_b = -beta_eff*ubar; the grounded factor and water_drag are already
+			// inside beta_eff, and the sliding law's velocity dependence now lives in
+			// the closure that produced it.
+			float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
+			float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+			TauBxDivaJacobian tau_bx = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
+			ru_l += tau_bx.res;
 	    } else {
-		TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
-		ru_l += tau_bx.res;
+			TauBxJacobian tau_bx = get_tau_bx_jac({u_l,v_tl,v_tr,v_bl,v_br,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
+			ru_l += tau_bx.res;
 	    }
 	    }
 
@@ -240,7 +240,7 @@ __device__ void residual_body(
 	    }
 
 	    if (j == 0 || j == nx) {
-		ru_l = get_vfacet(u,i,j,ny,nx);
+			ru_l = get_vfacet(u,i,j,ny,nx);
 	    }	
 	    r_u[i * (nx + 1) + j] = ru_l;
 	}
@@ -322,10 +322,10 @@ __device__ void residual_body(
 
 	    {
 	    float v_t = get_hfacet(v,i,j,ny,nx);
-            float u_tl = get_vfacet(u,i-1,j,ny,nx);
-            float u_tr = get_vfacet(u,i-1,j+1,ny,nx);
-            float u_bl = get_vfacet(u,i,j,ny,nx);
-            float u_br = get_vfacet(u,i,j+1,ny,nx);
+		float u_tl = get_vfacet(u,i-1,j,ny,nx);
+		float u_tr = get_vfacet(u,i-1,j+1,ny,nx);
+		float u_bl = get_vfacet(u,i,j,ny,nx);
+		float u_br = get_vfacet(u,i,j+1,ny,nx);
 
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
@@ -337,13 +337,13 @@ __device__ void residual_body(
 	    float u_c_c = get_cell(u_c,i,j,ny,nx);
 
 	    if (DIVA) {
-		float beta_eff_t = get_cell(beta_eff,i-1,j,ny,nx);
-		float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
-		TauByDivaJacobian tau_by = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
-		rv_t += tau_by.res;
+			float beta_eff_t = get_cell(beta_eff,i-1,j,ny,nx);
+			float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
+			TauByDivaJacobian tau_by = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
+			rv_t += tau_by.res;
 	    } else {
-		TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
-		rv_t += tau_by.res;
+			TauByJacobian tau_by = get_tau_by_jac({v_t,u_tl,u_tr,u_bl,u_br,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
+			rv_t += tau_by.res;
 	    }
 	    }
 
@@ -360,7 +360,7 @@ __device__ void residual_body(
 	    }
 
 	    if (i == 0 || i == ny) {
-		rv_t = get_hfacet(v,i,j,ny,nx);
+			rv_t = get_hfacet(v,i,j,ny,nx);
 	    }	
 
 	    r_v[i * nx + j] = rv_t;
@@ -873,12 +873,25 @@ void compute_jvp_diva(
 // residual_body: DIVA is a compile-time flag and the two differ only in the membrane
 // viscosity and the basal drag.
 //
-// NOTE on the basal term.  SSA computes lambda_row * d(r_row)/d(x_col) and scatters it
-// to the COLUMN index -- a genuine transpose.  The DIVA basal drag tau_b = -beta_eff*ubar
-// is linear in the velocity with beta_eff a lagged field, so the only nonzero partial is
-// d(r)/d(u) at the same facet; the transpose is correspondingly trivial.  The velocity
-// dependence hidden inside beta_eff (through the closure) is NOT included here -- this is
-// the frozen-coefficient adjoint.  See notes/diva_numerics.md section 5.8.
+// NOTE on the coefficient terms.  SSA computes lambda_row * d(r_row)/d(x_col) and scatters
+// it to the COLUMN index -- a genuine transpose.  Under DIVA the velocity reaches a row
+// through TWO routes: directly through the stencil, and indirectly through the cell-local
+// closure that produced eta_bar and beta_eff.  This kernel handles the direct route, and
+// reads eta_bar/beta_eff as frozen fields while doing so (the eta tile is built with
+// .d = 0, and tau_b = -beta_eff*ubar is then linear in the velocity, so its only nonzero
+// local partial is d(r)/d(u) at the same facet).
+//
+// The indirect route is NOT dropped -- it is deferred, not frozen.  Every row's
+// lambda_row * d(r_row)/d(coefficient) is accumulated per cell into W_eta and W_be, and
+// compute_diva_vjp_coeffs (diva.cu) then pushes those through d(coefficient)/d(velocity)
+// back onto the facets.  Splitting the transpose at the cell is what keeps both halves
+// within a +/-1 reach: row->facet is +/-2 composite, but row->cell and cell->facet are
+// each +/-1, so neither needs a wider halo.  Together the two passes give the EXACT
+// transpose, with no symmetry assumed -- dot-product identity 5.6e-7 against an SSA
+// control of 1.2e-7.  See notes/diva_numerics.md sections 5.8 and 7.
+//
+// The same W fields are reused for the parameter gradients (beta, u_c, m), since they
+// already are lambda^T d(r)/d(coefficient) summed over every row touching the cell.
 template <bool DIVA>
 __device__ void vjp_body(
     float* __restrict__ vjp_u,

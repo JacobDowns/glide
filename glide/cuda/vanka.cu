@@ -910,11 +910,19 @@ void vanka_smooth_diva(
 	    newton_steps,relaxation,ssa_damping,mc_damping);
 }
 
-// Shared body for the SSA and DIVA adjoint smoothers.  For DIVA the block assembled
-// here is the *uncondensed* one: the frozen-coefficient adjoint omits the closure path,
-// which is exactly what the rank-1 condensation in the forward smoother encodes, so
-// there is nothing to condense.  When the exact closure/d(eta_bar)/du paths land this
-// needs (A - b c^T/d)^T, i.e. b and c swap roles before the transpose below.
+// Shared body for the SSA and DIVA adjoint smoothers.  For DIVA the block assembled here
+// is the *uncondensed* one, i.e. the frozen-coefficient block: it omits the closure path,
+// which is exactly what the rank-1 condensation in the forward smoother encodes, so there
+// is nothing to condense.
+//
+// That is a deliberate choice, not a missing piece.  The exact closure and d(eta_bar)/du
+// paths DO exist -- they are in the VJP (see the note at the top of vjp_body in
+// residuals.cu), which is what defines the operator being solved.  The smoother only has
+// to PRECONDITION that operator, and the frozen block does so well: the adjoint V-cycles
+// converge to 1.0e-6, the same as SSA, whose VJP likewise carries d(eta)/du while its
+// smoother does not.  Making the smoother exact would mean transposing the condensed block,
+// (A - b c^T/d)^T, i.e. b and c swapping roles before the transpose below -- available if
+// convergence ever demands it, but it does not.
 template <bool DIVA>
 __device__ void vanka_smooth_adjoint_body(
     float* __restrict__ lambda_u_out,

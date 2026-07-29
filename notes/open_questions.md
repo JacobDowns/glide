@@ -119,3 +119,67 @@ oracle. `tests/ssa_regression_test.py` was added on the `diva` branch for that p
 (cold-started, converged, bit-reproducible). Left as-is deliberately; a seeded direction
 plus a converged configuration would make `grad_test.py` a usable gradient check, but
 that is a change to an upstream test.
+
+------------------------------------------------------------------------
+
+## Q4. `prolongate_hfacet` dispatches to the **v**facet kernels
+
+`Multigrid.prolongate_hfacet` (`glide/multigrid.py`) looks up
+`prolongate_vfacet_injection` / `prolongate_vfacet_bilinear` rather than the `hfacet`
+kernels of the same names. Those exist in `cuda/transfer.cu`, are correct, and are
+**never called**.
+
+This is not a naming quibble: the two kernels index different grids. `vfacet` treats the
+array as `(ny, nx+1)` and reads the coarse field with row stride `nx_coarse+1`; `hfacet`
+treats it as `(ny+1, nx)` with stride `nx_coarse`. The v-velocity correction is therefore
+prolongated with the u-grid's strides, which shears it by one element per row. For a
+square grid the *element count* happens to match (`ny*(nx+1) == (ny+1)*nx`), so nothing
+goes out of bounds and nothing crashes -- which is presumably why it has survived.
+
+Direct check, prolongating a random coarse v field both ways on a 9x8 -> 17x16 transfer:
+
+    max |vfacet_kernel - hfacet_kernel| = 2.06   (field values are O(1))
+    270 of 272 elements differ by more than 1e-6
+
+Both call sites are live: the forward FAS V-cycle and the adjoint V-cycle both prolongate
+the `z_v` correction this way.
+
+**Impact.** Invisible in the configurations our tests use, because they run a strong fine
+smoother (`finest_steps = 150`, `post_steps = 50`) that does nearly all the work -- fixing
+it changes convergence there by under 5%, and the *converged answer* is unaffected either
+way, since FAS coarse corrections only accelerate and the fine smoother still drives the
+true residual down. It matters when multigrid is actually load-bearing. With the smoother
+turned down (`pre/post/finest = 2`, `newton steps = 5`) on the same 128^2 problem:
+
+    V-cycle 6    |r|/|r0|     |r_u|      |r_v|
+    current       6.31e-4    8.02e-2    1.14e-1
+    fixed         4.12e-4    6.85e-2    5.88e-2
+
+so the v residual converges about **2x** faster once its correction is right. Note the
+signature in the current version: `|r_v|` sits consistently *above* `|r_u|` and the gap
+widens, whereas with the fix the two components contract at the same rate -- which is what
+a symmetric problem should do.
+
+Not fixed here: it is upstream code, unrelated to DIVA, and correcting it changes SSA
+output so it belongs in its own change with its own before/after numbers (the ones above).
+
+------------------------------------------------------------------------
+
+## Q5. The Vanka smoother's `relaxation` option is a no-op
+
+`vanka_smooth_body` (`cuda/vanka.cu`) takes `float relaxation`, then unconditionally
+overwrites it inside the Newton loop:
+
+```cuda
+    relaxation = 0.5f;
+```
+
+So `vanka_options.newton_options.relaxation` has no effect. Currently unobservable -- the
+Python default is also `0.5` and every caller in `tests/` sets `0.5` -- but the knob is
+dead, and anyone who reaches for it to stabilise a hard solve will see no change and
+conclude that under-relaxation does not help.
+
+Either the line is a debugging leftover, or it is deliberate and the parameter should be
+removed from the signature and the config so it stops advertising a control that does not
+exist. Left as-is because changing it alters SSA behaviour for any caller passing something
+other than 0.5.

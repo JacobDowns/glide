@@ -1,3 +1,30 @@
+/*=========================================================
+  ============ MULTIGRID GRID TRANSFERS ===================
+  =========================================================
+
+  Moving fields between levels of the hierarchy. Each level halves the resolution, so
+  restriction (fine -> coarse) merges 2x2 cell groups and prolongation (coarse -> fine)
+  splits them.
+
+  Restriction comes in several flavours because different fields need different ones:
+
+    avg   the default, for anything that behaves like a density or a mean
+    max   for fields where a coarse cell must not lose an extreme (e.g. a limiter)
+    min   the same in the other direction
+    var   the subgrid variance, retained where the coarse level needs to know how much
+          structure it threw away
+
+  Prolongation comes in two: INJECTION, which copies a coarse value to all its fine
+  children, and BILINEAR, which interpolates. The FAS scheme uses them for different
+  purposes -- injection where a coarse correction should not introduce new high-frequency
+  content the smoother would then have to remove, bilinear where a field's smoothness
+  matters more than its spectral cleanliness.
+
+  Facets and cells are transferred by separate kernels because they live on different
+  grids: vfacets are (ny, nx+1), hfacets (ny+1, nx), cells (ny, nx). Getting the staggering
+  right at the coarse/fine boundary is the only subtle part of this file.
+  =========================================================*/
+
 extern "C" __global__
 void restrict_vfacet(
     const float* f_fine,      // (ny_fine, nx_fine+1)

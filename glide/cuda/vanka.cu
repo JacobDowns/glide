@@ -1,5 +1,46 @@
 
 // ============================================================
+// THE VANKA SMOOTHER
+// ============================================================
+//
+// The multigrid smoother.  Its job is not to solve the system but to kill the
+// high-frequency part of the error, leaving the smooth part for the coarser levels.
+//
+// What makes it a VANKA smoother rather than a pointwise one is the choice of block: all
+// the unknowns physically coupled AT ONE CELL are updated together, by forming and solving
+// the small dense system that couples them exactly.  Here that block is FIVE unknowns --
+//
+//     index   unknown            lives on
+//       0     u_l                the cell's left  facet
+//       1     u_r                the cell's right facet
+//       2     v_t                the cell's top   facet
+//       3     v_b                the cell's bottom facet
+//       4     H_c                the cell centre
+//
+// -- and J is that 5x5 stored row-major, so J[a*5 + b] = d(r_a)/d(x_b).  Worth keeping in
+// mind while reading build_5x5_vanka, which indexes it with bare integers: J[24] is the
+// mass row's dependence on H, J[20] the mass row's dependence on u_l, and so on.
+//
+// The velocity/thickness coupling is why the block has to be solved rather than relaxed
+// componentwise: thickness sets the driving stress and the velocities set the flux, so a
+// pointwise sweep chases its own tail and the smoothing rate collapses.
+//
+// Three properties of the block that the rest of the file leans on:
+//
+//   * eta is FROZEN.  The tile arrives as plain floats and is refreshed between sweeps, so
+//     the local solve is exact in the 5 unknowns but lagged in the viscosity -- a Newton /
+//     Picard hybrid.  This is deliberate and applies to SSA and DIVA alike: the smoother is
+//     only a preconditioner, and the true d(eta)/du lives in the JVP and VJP.
+//   * Facet unknowns are SHARED between two cells, so each cell's proposed update is
+//     halved and accumulated with atomicAdd -- the average of the two neighbouring blocks'
+//     proposals, which is what makes this additive rather than multiplicative.  H is not
+//     shared, so it is stored outright.
+//   * The 5x5 is solved by Doolittle LU with NO PIVOTING (below).  That is safe only
+//     because the block is diagonally dominant by construction -- basal drag on the
+//     momentum diagonals, 1/dt on the mass diagonal -- and the ssa_damping / mc_damping
+//     knobs exist to reinforce exactly that when a hard configuration threatens it.
+//
+// ============================================================
 // LU Solve for 5x5 Systems (Vanka smoother)
 // ============================================================
 __device__ void lu_5x5_solve(
@@ -144,6 +185,17 @@ void mat5x5_vec(const float* __restrict__ A,
 // SSA evaluates the sliding law, DIVA uses the effective drag beta_eff.  When DIVA is
 // set, dr_dU_b receives d(r)/d(beta_eff of this cell) for the four momentum rows --
 // the coupling the augmented block needs; it is left untouched for SSA.
+// Assemble the local 5x5 Jacobian J and residual r for the cell (i,j).
+//
+// Every entry comes from the same get_*_jac functions the global residual uses, so this is
+// not a second discretisation -- it is a projection of the same one onto the five unknowns
+// this block owns.  Contributions from neighbouring cells' unknowns are simply dropped:
+// that is what makes it a block SMOOTHER rather than a solve, and what the outer multigrid
+// V-cycle exists to make up for.
+//
+// For DIVA it additionally returns dr_dbeta_eff, the five rows' sensitivity to this cell's
+// effective drag.  That is the vector the rank-1 condensation in vanka_smooth_body needs;
+// see the long comment there.
 template <bool DIVA, int height, int width>
 __device__ void build_5x5_vanka(
     float* __restrict__ J,
@@ -585,6 +637,13 @@ __device__ void build_5x5_vanka(
 }
 
 // Shared body for the SSA and DIVA Vanka smoothers; see build_5x5_vanka above.
+// One smoothing sweep: for every cell, take a few damped Newton steps on its local 5x5
+// block and write out the resulting increment.  Shared by SSA and DIVA.
+//
+// The Newton loop is local -- it re-assembles and re-solves the SAME 5x5 with the block's
+// own updated values, which converges the block against frozen neighbours.  Iterating here
+// rather than taking one step per sweep is cheap (the assembly is already in registers) and
+// buys robustness where the sliding law is strongly nonlinear.
 template <bool DIVA>
 __device__ void vanka_smooth_body(
     float* __restrict__ delta_u,
@@ -737,6 +796,10 @@ __device__ void vanka_smooth_body(
 		}
 	    }
 
+	    // Diagonal damping.  Note the SIGNS differ because the diagonals do: the
+	    // momentum diagonals are negative (drag resists), the mass diagonal is +1/dt.
+	    // Both of these therefore increase |diagonal|, pulling the block further from
+	    // singular and shortening the step -- the local analogue of a trust region.
             J[0]  -= ssa_damping;
             J[6]  -= ssa_damping;
             J[12] -= ssa_damping;
@@ -789,8 +852,18 @@ __device__ void vanka_smooth_body(
 
 	    rnorm = r[0]*r[0] + r[1]*r[1] + r[2]*r[2] + r[3]*r[3] + r[4]*r[4];
 
+	    // NOTE: this overwrites the relaxation passed in from Python, making
+	    // vanka_options.newton_options.relaxation a no-op.  Currently unobservable --
+	    // the Python default is also 0.5 and every caller sets 0.5 -- but the knob does
+	    // not work.  Recorded in notes/open_questions.md; left as-is because changing it
+	    // would alter SSA behaviour for any caller that passes something else.
 	    relaxation = 0.5f;
 
+	    // The updates are accumulated with KAHAN COMPENSATED SUMMATION: c_* carries the
+	    // rounding error lost from the previous step and is folded into the next one.  In
+	    // float32, several damped Newton steps of steadily shrinking size would otherwise
+	    // lose the tail of the correction to round-off, which shows up as a stalled
+	    // smoother rather than as a wrong answer.
 	    float y_u_l = -relaxation*delta_x[0] - c_u_l;
 	    float t_u_l = u_l + y_u_l;
 	    c_u_l = (t_u_l - u_l) - y_u_l;
@@ -816,6 +889,9 @@ __device__ void vanka_smooth_body(
 	    c_H_c = (t_H_c - H_c) - y_H_c;
 	    H_c = t_H_c;
 
+	    // Thickness floor, enforced inside the loop so subsequent steps see the clamped
+	    // value.  Cells pinned here are the ones the mask then converts to H = thklim
+	    // rows outright.
 	    H_c = fmaxf(H_c,thklim);
 	    k++;
 
@@ -827,6 +903,9 @@ __device__ void vanka_smooth_body(
 	float v_b_prev = get_hfacet(v, i + 1, j, ny, nx);
 	float H_c_prev = get_cell(H, i, j, ny, nx);
 
+	// Write the NET increment, not the state: the caller applies it as
+	// x -= omega*delta.  The 0.5 halves each cell's claim on a shared facet, so the two
+	// neighbouring blocks' proposals average rather than double.
 	atomicAdd(&delta_u[i * (nx + 1) + j],       0.5f*(u_l - u_l_prev));
 	atomicAdd(&delta_u[i * (nx + 1) + j + 1],   0.5f*(u_r - u_r_prev));
 	atomicAdd(&delta_v[i * nx + j],             0.5f*(v_t - v_t_prev));
@@ -1048,6 +1127,10 @@ __device__ void vanka_smooth_adjoint_body(
 	    rhs[4] = 0.0f;
 	} 
 
+        // The adjoint block is the literal transpose of the forward block.  Forming it
+        // explicitly (rather than assuming symmetry) is what lets the same lu_5x5_solve
+        // serve both, and it keeps the smoother honest for the terms that are genuinely
+        // asymmetric -- the upwind flux and the mass row above all.
         float J_T[25];
         #pragma unroll
         for(int r=0; r<5; ++r) {
@@ -1137,6 +1220,8 @@ void vanka_smooth_adjoint_diva(
 	    ssa_damping,mc_damping);
 }
 
+// Debug/verification hook: assemble the local blocks and copy them out to host arrays
+// without smoothing.  Used to compare an extracted J against an independently formed one.
 extern "C" __global__
 void vanka_dump(
     float* __restrict__ J_array,

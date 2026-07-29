@@ -1,5 +1,46 @@
 /*=======================================================
+  =============== STRESS TERMS: OVERVIEW ================
+  =======================================================
+
+  The four families of term the momentum rows are built from.  residual_body differences
+  them; jvp_body and vjp_body contract the same partials forwards and transposed.
+
+    sigma_xx, sigma_yy   membrane normal stress, on CELLS
+    sigma_xy             membrane shear stress, on VERTICES
+    tau_bx, tau_by       basal drag, on FACETS (SSA and DIVA variants)
+    tau_dx, tau_dy       driving stress, on FACETS
+
+  UNITS: rho*g appears NOWHERE in this file, or anywhere else in the kernels.  The whole
+  momentum balance is divided through by rho*g, and the caller is expected to have divided
+  B and beta by rho*g before handing them in (see how the tests build them).  That is why
+  the driving stress below is H*ds/dx with no density or gravity in sight.  Passing a raw,
+  un-divided B would produce a silently wrong answer rather than an error.
+
+  SIGN CONVENTION, as assembled in residual_body:
+
+    r_u = d(sigma_xx)/dx + d(sigma_xy)/dy + tau_b - tau_d
+
+  so tau_b is returned NEGATIVE (it resists) and tau_d positive (it drives).
+
+  Every term returns an identically zero Jacobian outside its valid index range, which is
+  how the no-stress boundary conditions are imposed -- there is no separate boundary kernel.
+  =======================================================*/
+
+/*=======================================================
   ================== Normal Stress ======================
+  =======================================================
+
+  sigma_xx = 2*(eta*H)*eps_xx,   eps_xx = 2*du/dx + dv/dy
+
+  so sigma_xx = H*eta*(4*du/dx + 2*dv/dy), the bracket in the momentum equation.  The
+  factor 4 and the appearance of dv/dy in an xx-stress both come from incompressibility:
+  the deviatoric stress carries -dw/dz = du/dx + dv/dy, which folds the vertical strain
+  rate back into the horizontal ones.  sigma_yy is the same expression with x and y
+  exchanged.
+
+  d_eta_H is the partial with respect to the eta*H PRODUCT, not eta -- that is the hook
+  through which both the viscosity and the thickness sensitivities reach the momentum rows
+  (see viscosity.cu for the product term itself).
  ========================================================*/
 // Stencil items that require differentiation
 struct SigmaNormalStencil {
@@ -113,6 +154,16 @@ DualFloat get_sigma_yy_dual(
 
 /*======================================================
   ==================== Shear Stress ====================
+  ======================================================
+
+  sigma_xy = 2*(eta*H)*eps_xy,   eps_xy = 0.5*(du/dy + dv/dx)
+
+  i.e. H*eta*(du/dy + dv/dx).  This one lives on VERTICES, because du/dy needs two u
+  facets stacked vertically and dv/dx two v facets side by side, and the natural place
+  those meet is the cell corner.  eta*H therefore has to be averaged over the four cells
+  sharing the vertex, which is what get_eta_H_vertex_jac does.
+
+  Zeroed on boundary vertices: no shear traction on the domain edge.
   ======================================================*/
 
 // Stencil items that require differentiation
@@ -194,6 +245,33 @@ DualFloat get_sigma_xy_dual(
 
 /*=========================================================
   ================== Basal Shear Stress ===================
+  =========================================================
+
+  SSA basal drag: tau_b = -c(|u|)*u, with the drag coefficient c set by the sliding law,
+
+    Weertman             c = beta_eff*(|u|^2 + u_reg)^((m-1)/2) + water_drag
+    regularized Coulomb  c = beta_eff/(|u| + u_c) + water_drag
+
+  Three things about these stencils are easy to miss:
+
+  1. beta_eff here is just 0.5*(beta_l*phi_l + beta_r*phi_r) -- the cell-centred drag
+     averaged onto the facet with GROUNDING FOLDED IN.  It is not the DIVA beta_eff, which
+     is a different quantity entirely (see the DIVA section below).  These SSA stencils
+     apply the grounded factor themselves; the DIVA ones must not.
+
+  2. The drag couples the velocity COMPONENTS.  c depends on the speed, so
+     d(tau_bx)/d(v) is nonzero -- hence d_v_tl..d_v_br.  Written out, the Jacobian of an
+     isotropic drag is -[c*delta_ij + (c'/|u|)*u_i*u_j], which is symmetric for any scalar
+     c whatsoever, and positive definite exactly when the law is monotone (c' >= 0).  That
+     is the property the smoother's local solve depends on, and it holds for a learned c
+     just as much as for these two.
+
+  3. |u| at a u-facet is reconstructed as sqrt(u^2 + mean of the four neighbouring v^2) --
+     the mean of squares, not the square of the mean.  u_reg keeps it and its derivative
+     finite at rest, where the power law is singular for m < 1.
+
+  d_m carries the logf factor because m sits in an exponent: d/dm x^((m-1)/2) =
+  x^((m-1)/2) * 0.5*log(x).  The water_drag term has no m in it, hence its absence there.
   =========================================================*/
 
 struct TauBxStencil {
@@ -573,6 +651,26 @@ TauByDivaJacobian get_tau_by_diva_jac(
 
 /*=========================================================
   ==================== Driving Stress =====================
+  =========================================================
+
+  tau_d = H * ds/dx, with rho*g absorbed into B and beta (see the file header).  The
+  gradient is a plain centred difference of the surface elevation across the facet, times
+  the facet-averaged thickness.
+
+  The surface elevation is not stored; it is reconstructed from the bed, the thickness and
+  the flotation state:
+
+    base = phi*bed - (1 - phi)*0.917*H      s = base + H
+
+  Grounded (phi = 1) that is s = bed + H.  Afloat (phi = 0) the base is the draft -0.917*H
+  and s = 0.083*H, the freeboard.  Blending on phi rather than branching is what keeps the
+  transition differentiable through the grounding line -- and note dbase/dH is therefore
+  nonzero only for the floating part, which is why d_H_l and d_H_r carry the extra
+  (1 + dbase_dH) factor while d_bed_l and d_bed_r are gated by phi.
+
+  As in flux.cu, phi itself is NOT differentiated: it enters the dual stencils as a plain
+  float and is updated by its own under-relaxed outer iteration.  So no gradient here sees
+  sensitivity acting through grounding-line migration.
   =========================================================*/
 
 struct TauDxStencil {

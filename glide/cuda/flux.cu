@@ -1,5 +1,26 @@
 /*=========================================================
   ====================== Mass Flux ========================
+  =========================================================
+
+  Facet fluxes for the thickness equation, dH/dt + div(u*H) = smb - calving.  One term per
+  facet; residual_body differences them to form the divergence.
+
+  The flux is FIRST-ORDER UPWIND, written in the equivalent centred-plus-diffusion form
+
+    q = H_avg*u - 0.5*|u|*(H_downwind - H_upwind)
+
+  which is exact upwinding but stays a single smooth expression.  Advecting thickness with
+  a centred flux alone would be unconditionally unstable; the |u| term is the numerical
+  diffusion that stabilises it.
+
+  |u| is SMOOTHED to sqrt(u^2 + 10) rather than fabsf(u).  That matters for the adjoint, not
+  the forward model: fabsf has a kink at u = 0 where the derivative does not exist, and
+  every grounding line and divide has cells sitting near u = 0.  The commented-out fabsf /
+  copysignf lines are the unsmoothed version.  The 10 is in (m/a)^2, so the smoothing is
+  invisible wherever the ice moves faster than a few m/a.
+
+  Both flux terms return an identically zero Jacobian on the domain boundary, which imposes
+  no-flux there.
   =========================================================*/
 
 struct HorizontalFluxStencil {
@@ -145,6 +166,29 @@ DualFloat get_vertical_flux_dual(
 
 /*==============================================
   ==========  CALVING ==========================
+  =============================================
+
+  Two calving formulations, both linear in the local thickness:
+
+    cell   -- a sink over the whole floating cell,  -rate*(1 - phi)*H
+    facet  -- a sink at a facet, active only where BOTH sides float, via the product
+              (1 - phi_this)*(1 - phi_other)*rate*H_this
+
+  The facet form is the one residual_body uses.  Gating on the product means an interior
+  floating cell surrounded by other floating cells still calves on every facet, while a
+  facet with grounded ice on either side does not calve at all -- the terminus position
+  falls out of the phi field rather than being tracked explicitly.
+
+  NOTE what is NOT differentiated here: phi enters the Dual stencils as a plain float, and
+  get_diffs() returns zero for it.  The flotation state is deliberately treated as a FROZEN
+  coefficient throughout the derivative path, because it is updated by its own
+  under-relaxed outer iteration (compute_grounded in viscosity.cu) rather than solved
+  simultaneously.  So d(calving)/d(phi) is absent by design, not by oversight -- but it does
+  mean a gradient will not see sensitivity that acts through grounding-line migration.
+
+  H_other and the calving_length / sigmoid_c parameters are carried in the stencils but
+  unused by the current expressions; the commented-out lines are smoother gatings that were
+  tried and parked.
   =============================================*/
 
 struct CellCalvingStencil {

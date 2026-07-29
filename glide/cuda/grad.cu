@@ -1,3 +1,32 @@
+/*=========================================================
+  ============== PARAMETER GRADIENTS (SSA) ================
+  =========================================================
+
+  The last step of the adjoint. With lambda solved, the gradient of the objective with
+  respect to a parameter theta is
+
+      dJ/d(theta) = lambda^T * d(r)/d(theta)
+
+  and since theta enters only through the basal drag (beta, u_c, m) or the surface
+  elevation (bed), that reduces to contracting the adjoint state with the partials the
+  get_*_jac functions already return.  No new derivatives are derived here.
+
+  Each kernel is a SCATTER, like compute_vjp: a thread owns a momentum facet, reads that
+  facet's lambda, and pushes lambda * d(tau)/d(theta) out to the CELLS holding theta --
+  each facet's drag depends on the two cells either side of it, hence the pairs of
+  atomicAdds.  For the global exponent m there is nowhere to scatter to, so every facet's
+  contribution reduces into grad_m[0] instead; the atomics make that sum's ORDER
+  nondeterministic, so dJ/dm is reproducible only to float32 round-off.
+
+  DIVA does not use these kernels.  Under DIVA the parameters reach the residual through a
+  state-dependent coefficient rather than through the stencils directly, so the whole
+  facet walk collapses to a cell-local product -- see compute_gradient_param_diva in
+  diva.cu, which replaces all of beta/u_c/m with about twenty lines.
+
+  The (nx-1)/(ny-1) guards below mean the final row and column of cells never receive a
+  contribution from their outer facet. See notes/open_questions.md Q2.
+  =========================================================*/
+
 extern "C" __global__
 void compute_gradient_beta(
     float* __restrict__ grad_beta,

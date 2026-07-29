@@ -1,6 +1,40 @@
 // =====================================================================
 // COMMON UTILITIES: DualFloat, array access helpers, LU solvers
 // =====================================================================
+//
+// HOW DERIVATIVES WORK IN THIS CODEBASE.  Every term of the residual is packaged the same
+// way.  The pattern is worth learning once, because it repeats in viscosity.cu, stress.cu
+// and flux.cu without variation:
+//
+//   struct XStencil      the term's inputs, named by position (_l, _r, _t, _b, _c)
+//   struct XStencilDual  the same inputs as DualFloats, with get_primals()/get_diffs()
+//   struct XJacobian     the value in .res, one partial per input in .d_<input>, and
+//                        apply_jvp(dot) to contract those partials with a direction
+//   get_x_jac(s)         computes .res and every partial, by hand
+//   get_x_dual(s)        get_x_jac on the primals, then apply_jvp on the diffs
+//
+// One hand-derived function therefore serves all four consumers: the residual reads .res,
+// the JVP contracts the partials forwards, the VJP scatters them transposed, and the Vanka
+// smoother picks out the few entries its local block needs.  That is why adding a term
+// costs one get_x_jac and nothing else.
+//
+// IMPORTANT: `_dual` in a name means "returns a DualFloat", NOT "differentiated
+// automatically".  DualFloat is genuine forward-mode arithmetic, but only a few functions
+// actually propagate through it -- populate_viscosity below and diva_coeffs_cell in diva.cu
+// are the notable ones.  The get_*_dual functions are hand-derived Jacobians wearing a dual
+// interface.  Change a get_x_jac and you must change its partials by hand; nothing derives
+// them for you, and no test will notice a partial that is merely wrong rather than absent
+// except the dot-product and FD checks in tests/.
+//
+// INDEX CONVENTION: get_cell / get_vfacet / get_hfacet CLAMP out-of-range indices to the
+// nearest valid one -- they do NOT return zero (see the commented-out early returns).
+// Stencils may therefore read past the boundary and will see the edge value, i.e. a
+// zero-gradient extension rather than a hole.  Where a true zero is needed the caller
+// multiplies by an explicit mask; the *_mask factors in populate_viscosity are that.
+// A value paired with its derivative along ONE seeded direction.  Arithmetic on these
+// carries (value, derivative) together by the chain rule, so an expression written once
+// yields both.  Forward mode only: one direction per pass, and the direction is fixed by
+// whatever the .d fields are seeded with at the leaves.
 struct DualFloat {
     float v; // Primal value
     float d; // Derivative/Perturbation component
@@ -129,6 +163,10 @@ __device__ __forceinline__ DualFloat sqrtf(DualFloat u) {
     return {val, u.d / (2.0f * val)};
 }
 
+// Flotation is a hard inequality in the physics, but a hard switch would make the
+// residual non-differentiable exactly where the adjoint needs it most (the grounding line).
+// So it is smoothed: `c` sets the width, and the argument is clamped to +/-20 to keep
+// __expf in range.
 __device__ __forceinline__ float sigmoid(const float z, const float c) {
    float scaled_z = fminf(fmaxf(c*z,-20.0f),20.0f);
    return 1.0f/(1.0f + __expf(-scaled_z));
@@ -154,12 +192,22 @@ __device__ __forceinline__ float sigmoid_deriv(const float z, const float c) {
 //   return fmaxf( fminf(1.0f + sigmoid_c*z,0.99f),0.01f);
 //}
 
+// Grounded fraction in [0,1]: 1 where the ice rests on the bed, 0 where it floats, with a
+// smooth transition of width ~1/sigmoid_c across flotation.  z is the flotation excess,
+// 0.917*H - depth, offset by sigmoid_k/sigmoid_c so the switch can be biased.  Everything
+// downstream multiplies basal drag by this, which is how the drag turns off under shelves.
 __device__ __forceinline__ float get_grounded(const float H, const float depth, const float sigmoid_c, const float sigmoid_k) 
 {
    float z = 0.917f*H - depth + sigmoid_k/sigmoid_c;
    return sigmoid(z,sigmoid_c);
 }
 
+// Staggered-grid accessors.  Three grids, all row-major and all clamped at the edges:
+//   cells    (ny,   nx  )   H, beta, eta, phi, ...
+//   vfacets  (ny,   nx+1)   u, on the vertical (left/right) cell faces
+//   hfacets  (ny+1, nx  )   v, on the horizontal (top/bottom) cell faces
+// The dual overloads read the same index out of a second array, which is how a perturbation
+// direction is threaded into a stencil without changing the stencil's shape.
 __device__ __forceinline__ float get_vfacet(const float* __restrict__ u, int i, int j, int ny, int nx) {
     //if (i < 0 || i >= ny || j < 0 || j > nx) return 0.0f;
     i = max(min(i,ny - 1),0);
@@ -202,6 +250,8 @@ __device__ __forceinline__ DualFloat get_cell(const float* __restrict__ arr, con
     return {arr[idx],darr[idx]};
 }
 
+// Cell read that is zeroed where the mask is set -- used to drop contributions from cells
+// whose row has been replaced by an algebraic constraint.
 __device__ __forceinline__ float get_masked_cell(const float* __restrict__ arr, const float* __restrict__ mask, int i, int j, int ny, int nx) {
     i = max(min(i,ny - 1),0);
     j = max(min(j,nx - 1),0);

@@ -1,3 +1,18 @@
+/*==================================================
+  ============ GROUNDING AND VISCOSITY =============
+  ==================================================
+
+  Two cell-centred scalar fields that the momentum stencils treat as coefficients:
+
+    grounded (phi)  smoothed grounded fraction in [0,1]; multiplies basal drag
+    eta             membrane effective viscosity from Glen's flow law
+
+  plus the eta*H products the stress terms actually consume, which live on cells
+  (sigma_xx, sigma_yy) and on vertices (sigma_xy).
+  ==================================================*/
+
+// Fill a shared tile with the grounded fraction, one value per cell.  Tiled for the same
+// reason as eta: the stencils below need several neighbours' worth.
 template <int H, int W>
 __device__ void populate_grounded(
     float (&grounded_local)[H][W],
@@ -13,6 +28,11 @@ __device__ void populate_grounded(
     grounded_local[bi][bj] = get_grounded(H_c,bed_c,sigmoid_c);
 }
 
+// Update the stored grounded fraction, UNDER-RELAXED toward the value implied by the
+// current geometry.  Grounding-line migration is the stiffest feedback in the model -- a
+// cell that ungrounds loses its drag, speeds up and thins, which ungrounds it further -- so
+// the update is lagged rather than solved simultaneously with the momentum balance.
+// relaxation_parameter = 0 takes the new value outright, 1 freezes the field.
 extern "C" __global__
 void compute_grounded(
     float* __restrict__ grounded,
@@ -35,6 +55,8 @@ void compute_grounded(
     float grounded_old = grounded[i * nx + j];
     grounded[i * nx + j] = (1.0f - relaxation_parameter) * get_grounded(H_c,depth_c,sigmoid_c, sigmoid_k) + relaxation_parameter * grounded_old;
 }
+// Superseded by compute_grounded above, which takes `depth` rather than `bed` and adds the
+// sigmoid_k offset.  Kept for reference only.
 /*
 extern "C" __global__
 void compute_phi(
@@ -59,6 +81,41 @@ void compute_phi(
 */
 /*==================================================
   ================ VISCOSITY =======================
+  ==================================================
+
+  Glen's flow law, depth-independent (SSA).  With n the Glen exponent,
+
+    eta = 0.5 * B * (eps_II + eps_reg) ^ ((1-n)/(2n))
+
+  where eps_II is the second invariant of the horizontal strain rate,
+
+    eps_II = (du/dx)^2 + (dv/dy)^2 + (du/dx)(dv/dy) + eps_xy^2
+
+  (the third term comes from incompressibility, dw/dz = -(du/dx + dv/dy), which removes the
+  vertical strain rate as an independent unknown).  The exponent is NEGATIVE for n > 1, so
+  eta falls as the ice strains faster -- shear thinning.  eps_reg keeps it finite at rest,
+  where the true expression is singular.
+
+  The shear term needs du/dy and dv/dx, which live on VERTICES, so it is evaluated at the
+  cell's four corners and averaged.  Each corner carries a mask because the accessors clamp
+  rather than zero at the domain edge (see common.cu), and a clamped read there would
+  fabricate a strain rate out of a repeated value.
+
+  --------------------------------------------------------------------------------------
+  The two functions below are OVERLOADS, not duplicates: they differ in the tile's element
+  type, and the dual one additionally takes the perturbation arrays (d_u, d_v).  Overload
+  resolution picks the float one for residual_body and the Vanka smoothers, and the dual one
+  for jvp_body and vjp_body.  Both are live.
+  --------------------------------------------------------------------------------------
+
+  This is one of the few places doing GENUINE dual propagation rather than a hand-derived
+  Jacobian: the dual overload is the same expression run in dual arithmetic, so d(eta)/du
+  falls out without anyone differentiating Glen's law by hand.  The cost is that the
+  strain-rate expression now exists in four near-identical copies -- these two, plus the
+  float and dual get_membrane_eps_sq in diva.cu, which needs the invariant UNREGULARIZED so
+  it can add the vertical shear terms before forming eta.  A change to the discretisation
+  has to be made in all four; templating on the scalar type (as diva_coeffs_cell does) would
+  collapse them to one.
   ==================================================*/
 template <int H, int W>
 __device__ void populate_viscosity(
@@ -172,6 +229,20 @@ __device__ void populate_viscosity(
 
 /*==================================================
   ========== Viscosity-Thickness Product ===========
+  ==================================================
+
+  The stress terms need the product eta*H, not eta alone, because the balance is
+  depth-INTEGRATED: sigma = H*eta*(strain rate).  It gets its own term so that the
+  derivatives with respect to eta and to H stay separate and explicit, which is what lets
+  the thickness couple into the momentum rows.
+
+  Two flavours, matching where the stresses live:
+    cell    sigma_xx, sigma_yy -- eta*H at the cell centre
+    vertex  sigma_xy           -- the average of eta*H over the four cells sharing a vertex
+
+  The Jacobians are trivial by hand (it is a product), which is exactly why these are
+  get_*_jac functions rather than dual arithmetic.  See common.cu for the
+  Stencil/Jacobian/dual idiom these follow.
   ==================================================*/
 
 struct EtaHCellStencil {

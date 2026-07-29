@@ -301,43 +301,76 @@ With $\min(\eta_A,\eta_k)$, **3 Newton iterations reach float32 round-off across
 ($\le 2.6\times10^{-7}$ up to $\tau_b=100$) — the same trip count the Picard loop used. Starting from
 $\eta_A$ alone would need 6.
 
-### 5.2.1a UNRESOLVED: the outer coupling loop in the shear-dominated regime
+### 5.2.1a The outer coupling loop is unstable at high basal drag
 
-Fixing the per-level solve exposed a separate question about the loop *around* it, which is
-**not settled** and is recorded here rather than answered.
+Fixing the per-level solve exposed a problem in the loop *around* it. Measured, not conjectured.
 
-What is observed, directly from the kernel: with the closure test's soft-ice configuration
-($B=1$, $\bar\eta_{\mathrm{mem}} = 50$) and $\beta = 0.1$, repeated calls to
-`compute_diva_coeffs` -- which is what the solver does, warm-starting `u_b` from the previous
-call -- do not settle. `u_b` alternates between $\approx 0.71$ and $\approx 5.75$ on successive
-calls, and $F_2$ with it, by a factor of ~18. The mechanism is plausible: the coupling is Picard
-on $\tau_b$ through $\tau_b \to F_2 \to U_b \to \tau_b$, where raising $\tau_b$ raises $F_2$
-which *lowers* $U_b$ which lowers $\tau_b$ — negative feedback, which oscillates rather than
-creeping if the loop gain exceeds one in magnitude.
+**The system.** Per cell the closure has $N+1$ unknowns — the viscosity at each $\sigma$ level and
+the basal speed — with $N+1$ equations:
 
-What is **not** established:
+$$(E_k)\quad \eta_k = \tfrac12 B\Big[\dot\varepsilon^2_{\mathrm{mem}} + \varepsilon_{\mathrm{reg}} + \Big(\frac{\tau_b\zeta_k}{2\eta_k}\Big)^{\!2}\Big]^{p}, \qquad k = 1\dots N$$
 
-- Whether that is a genuine 2-cycle of the underlying map or an artefact of the 3-sweep
-  truncation. An attempt to measure the loop gain was **invalid**: it differentiated around the
-  state a 400-sweep Picard landed on, and that iteration is itself oscillating, so it was never
-  at a fixed point to differentiate around. Any conclusion needs the true root found robustly
-  first — bisection on $\tau_b - \Phi(\tau_b)$, not fixed-point iteration.
-- Whether it is reachable at realistic ice stiffness. The closure test deliberately uses $B=1$
-  to make $\bar\eta_{\mathrm{mem}}$ a round number; the real $B \approx 24$ gives ice ~24x
-  stiffer, so less shear for a given $\tau_b$ and a weaker feedback. The slab configurations our
-  tests actually solve show no sign of it, and every DIVA solve in the suite converges.
-- Whether it would matter if reachable. Oscillating coefficients would show up as a stalled
-  momentum solve, which we do not see — but we have not looked in a regime where the gain is
-  large.
+$$(C)\quad U_b + f(U_b)\,F_2 = \bar U$$
 
-Worth resolving before ISMIP-HOM, since the experiments there are deliberately
-deformation-dominated. If it is real, the fix is standard: under-relax the $\tau_b$ update, or
-solve the coupled pair $(\tau_b, U_b)$ by Newton rather than by alternating Picard.
+with $\tau_b = f(U_b)$, $F_2 = H\sum_k w\,\zeta_k^2/\eta_k$ and $\bar\eta = \sum_k w\,\eta_k$ all
+*derived*. The coupling structure is what makes the algorithm possible: the $\eta_k$ interact only
+through the scalar $\tau_b$, and $U_b$ sees the $\eta_k$ only through the scalar $F_2$. So the
+whole system reduces to **one scalar fixed point**, $\tau_b = \Phi(\tau_b)$, where $\Phi$ is
+"solve every $E_k$, form $F_2$, solve $C$, return $f(U_b)$". The outer loop is plain Picard on it.
 
-Note this does not affect anything verified: `tests/diva_closure_test.py` check 5 pins the
-per-level solve against a converged reference (agreement $4\times10^{-7}$) by replicating the
-kernel's *own* coupling structure, so it isolates the piece that was fixed from the piece that is
-open.
+**Why it can oscillate.** Every link has a fixed sign, from the physics:
+
+$$\tau_b \uparrow \Rightarrow \dot\varepsilon_{xz}\uparrow \Rightarrow \eta\downarrow \Rightarrow F_2\uparrow,
+\qquad F_2\uparrow \Rightarrow U_b\downarrow \ (\bar U \text{ fixed}),
+\qquad U_b\downarrow \Rightarrow \tau_b'\downarrow$$
+
+so $\Phi'(\tau_b) < 0$ **always** — the loop is negative feedback. It converges (alternating about
+the root) when $|\Phi'|<1$ and settles into a **2-cycle** when $|\Phi'|>1$. Physically it is a
+competition between sliding and deformation for a fixed budget $\bar U$: guess high drag and the
+model reports lots of deformation, so little sliding is needed, so drag is low; guess low drag and
+the reverse. It only damps if the gain is under one.
+
+**Measured.** The root must be found by **bisection** on $\tau_b - \Phi(\tau_b)$, which is
+guaranteed since $\Phi$ decreasing makes it strictly increasing. (An earlier attempt used
+fixed-point iteration to locate the root and differentiated around whatever the 400th sweep
+returned. That was invalid — the iteration is the thing under suspicion, and it was oscillating,
+so it was never at a fixed point. The numbers below replace it.)
+
+| configuration | $\beta$ | true $\tau_b^*$ | $\Phi'$ | |
+|---|---:|---:|---:|---|
+| closure test ($B=1$, soft) | 0.02 | 0.160 | −0.256 | converges |
+| closure test ($B=1$, soft) | 0.1 | 0.263 | **−1.382** | oscillates |
+| closure test ($B=1$, soft) | 2.0 | 0.290 | **−1.890** | oscillates |
+| **realistic $B$, our slab tests** | 0.11 | 2.12 | **−0.013** | converges hard |
+| realistic $B$, high drag | 1.0 | 7.54 | **−1.210** | oscillates |
+| realistic $B$, thick, slow, high drag | 5.0 | 3.30 | −0.866 | converges |
+| realistic $B$, soft membrane | 1.0 | 7.85 | **−1.645** | oscillates |
+
+It is **not** an artefact of the soft-ice test configuration: it is reachable at realistic
+stiffness whenever the basal drag is high. That $\tau_b^*=7.54$ is ~68 kPa with a 7.5/20
+sliding–deformation split, an ordinary Greenland condition.
+
+Directly observed in the kernel: in the soft configuration at $\beta=0.1$, repeated
+`compute_diva_coeffs` calls (warm-starting `u_b` from the previous, as the solver does) leave
+`u_b` alternating between $\approx 0.71$ and $\approx 5.75$, and $F_2$ by a factor of ~18, with no
+sign of damping by call 12.
+
+**Why nothing has broken.** Our configurations sit at $\Phi' = -0.013$, three orders of magnitude
+inside the stability boundary, so every DIVA solve in the suite converges. The margin is real but
+it is luck rather than design, and ISMIP-HOM is deliberately deformation-dominated.
+
+**The fix, when we take it.** Since $\Phi'<0$ always, $g(\tau_b) = \tau_b - \Phi(\tau_b)$ has
+$g' = 1 + |\Phi'| \ge 1$: **unconditionally well conditioned**. Newton on $g$ converges in every
+row of that table, quadratically — the same move as §5.2.1, one level out. Fixed under-relaxation
+would also stabilise it but is the wrong trade: $\omega = 0.5$ rescues $\Phi'=-1.9$ while
+*degrading* our present regime from 0.013 to 0.49. And $\Phi'$ can be had the way the closure
+Newton already gets $f'$ — a primal-only dual evaluation, valid because the converged sensitivity
+does not depend on the step size used to reach it — so it needs no nested duals.
+
+Not implemented yet: it changes the forward model in every configuration, so it wants its own
+change with ISMIP-HOM available to validate against. Nothing verified depends on it;
+`tests/diva_closure_test.py` check 5 isolates the per-level solve by replicating the kernel's own
+coupling structure, so it measures §5.2.1 without entangling this.
 
 ### 5.2.2 Methodology note: how this was found
 

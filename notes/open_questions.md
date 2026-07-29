@@ -122,7 +122,7 @@ that is a change to an upstream test.
 
 ------------------------------------------------------------------------
 
-## Q4. `prolongate_hfacet` dispatches to the **v**facet kernels
+## Q4. `prolongate_hfacet` dispatched to the **v**facet kernels — FIXED on this branch
 
 `Multigrid.prolongate_hfacet` (`glide/multigrid.py`) looks up
 `prolongate_vfacet_injection` / `prolongate_vfacet_bilinear` rather than the `hfacet`
@@ -160,8 +160,32 @@ signature in the current version: `|r_v|` sits consistently *above* `|r_u|` and 
 widens, whereas with the fix the two components contract at the same rate -- which is what
 a symmetric problem should do.
 
-Not fixed here: it is upstream code, unrelated to DIVA, and correcting it changes SSA
-output so it belongs in its own change with its own before/after numbers (the ones above).
+**Fixed** on the `diva` branch. Before doing so it was checked three independent ways,
+because "the original might have been correct in some matched way" is a real possibility
+with staggered grids and the convergence evidence alone was not conclusive:
+
+1. *Strides.* `prolongate_hfacet` receives a `(ny+1, nx)` field, whose coarse row stride is
+   `nx_coarse`. The vfacet kernel reads with `nx_coarse+1`.
+2. *Linear exactness, solver-independent.* Bilinear prolongation must reproduce a linear
+   field exactly. On a linear ramp over the hfacet grid, interior error was
+   **0.000000e+00** with the hfacet kernel and **exactly 1.0** with the vfacet kernel --
+   i.e. a half-cell offset in y, which is precisely the staggering difference (an hfacet
+   value sits at `(j, i+0.5)`, a vfacet value at `(j+0.5, i)`).
+3. *Consistency with the restriction.* `restrict_hfacet` is exact for a linear field on the
+   `(ny+1, nx)` layout (error 0.000000e+00), so it was always written for the correct
+   staggering -- it was NOT matched to the buggy prolongation. Restriction and prolongation
+   were an inconsistent pair; the round trip restrict -> prolongate is now exact.
+
+The converged solution is unchanged, as expected for a coarse-grid correction: driven to 30
+V-cycles, both versions reach the same true momentum residual (2.09e-3 vs 2.12e-3) and their
+states agree to 2e-4 in v and 3e-5 in u.
+
+`tests/ssa_reference.json` was regenerated. The fingerprint moved by 3.9% in v (and only
+1e-6 in u, 1e-9 in H, which is the expected signature of a change to the v prolongation).
+That is larger than it sounds: the regression configuration stops at 15 V-cycles and stalls
+short of its tolerance (Q6), so the fingerprint records an ITERATE, not a solution, and a
+different iteration path lands on a different iterate. The fingerprint remains a valid
+change-detector, which is its job; it is not evidence about the answer.
 
 ------------------------------------------------------------------------
 
@@ -183,3 +207,44 @@ Either the line is a debugging leftover, or it is deliberate and the parameter s
 removed from the signature and the config so it stops advertising a control that does not
 exist. Left as-is because changing it alters SSA behaviour for any caller passing something
 other than 0.5.
+
+
+------------------------------------------------------------------------
+
+## Q6. The forward solve stalls an order of magnitude short of its tolerance
+
+Every forward solve in `tests/` asks for `relative_tolerance = 1e-6` and none reaches it.
+On the standard 128^2 slab configuration the V-cycles plateau at `|r|/|r0| ~ 1.0e-4` and stay
+there:
+
+    V-cycle 1: |r|/|r0| = 1.11e-04, |r_u| = 1.69e-03, |r_v| = 1.37e-03, |r_H| = 2.45e-02
+    V-cycle 2: |r|/|r0| = 1.03e-04, ...
+    V-cycle 19: |r|/|r0| = 1.02e-04, ...
+
+Quadrupling the V-cycle budget (15 -> 60) does not help, and neither does asking for 1e-12.
+The residual is dominated by `|r_H|`, about 15x the momentum components, so whatever is
+stalling is in the mass row rather than the stress balance. This is pre-existing: it happens
+on the templating commit, before the Q4 fix, and at every multigrid depth.
+
+It is not float32 round-off -- `|r0| ~ 20`, so 1e-4 relative sits three orders of magnitude
+above `eps`.
+
+**Why it matters beyond efficiency.** It sets the floor for every finite-difference check in
+the repo, and the reason is worth stating precisely: an adjoint gradient differentiates the
+*exact* solution of `r(x, theta) = 0`, while a finite difference differentiates *the solver's
+output*. The two agree only to the extent the solver has converged, so the FD-vs-adjoint gap
+partly measures the theta-sensitivity of the solver's own convergence error -- and changing
+the solver path moves that gap in either direction with no adjoint being wrong.
+
+That is exactly what the Q4 fix exposed. `dJ/d(beta)` for **SSA**, whose adjoint is exact and
+was not touched, went from 1.4e-4 to 1.4e-3; DIVA moved by the same factor. A change
+localised to the shared FD reference is the only thing that can shift both equally.
+
+Consequence for reading the earlier numbers: statements of the form "agrees to 2e-5, i.e. at
+the finite-difference floor" should be read as "at the floor set by the forward solve's
+stall", which is a weaker claim than round-off-limited. `tests/diva_gradient_test.py` was
+therefore changed to judge DIVA against the SSA control rather than against an absolute
+bound, since the control measures that shared floor directly.
+
+Diagnosing the stall would be worth doing on its own account: a solver that converged to
+1e-8 would make every gradient check in the repo an order of magnitude sharper.

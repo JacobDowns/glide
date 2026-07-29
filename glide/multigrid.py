@@ -222,11 +222,17 @@ class Multigrid:
         return fine_field
 
     def prolongate_hfacet(self,coarse_field, fine_field=None, method='injection'):
-        """Prolongate u-velocity (vertical face) field to fine grid."""
+        """Prolongate v-velocity (horizontal face) field to fine grid.
+
+        Must use the hfacet kernels, not the vfacet ones: hfacets are (ny+1, nx) and
+        vfacets (ny, nx+1), so the coarse row strides differ (nx_coarse vs nx_coarse+1).
+        On a square grid the element counts coincide, so dispatching to the vfacet kernel
+        reads in bounds but shears the field by one element per row.
+        """
         if method == 'injection':
-            kernel = self.kernels.get_function('prolongate_vfacet_injection')
+            kernel = self.kernels.get_function('prolongate_hfacet_injection')
         elif method == 'bilinear':
-            kernel = self.kernels.get_function('prolongate_vfacet_bilinear')
+            kernel = self.kernels.get_function('prolongate_hfacet_bilinear')
         else:
             raise TypeError('Valid prolongation methods: [injection, bilinear]')
 

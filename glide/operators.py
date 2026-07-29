@@ -238,6 +238,7 @@ class ForwardOperators:
         kernel(grid_size, block_size,
                    (rheology.deta_deps.data, rheology.deta_dU.data,
                     rheology.dbe_deps.data, rheology.dbe_dU.data,
+                    rheology.deta_dbeta.data, rheology.dbe_dbeta.data,
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data, state.u_b.data,
                     sliding.m.value, sliding.u_reg.value,
@@ -481,6 +482,7 @@ class AdjointOperators:
         self.r_H.fill(0)
         use_forcing=True
         diva_exact = diva and self.diva_exact_coeff_adjoint
+        self._last_dt = dt
         if diva:
             self.W_eta.fill(0.0)
             self.W_be.fill(0.0)
@@ -569,6 +571,7 @@ class AdjointOperators:
         self.vjp_v.fill(0)
         self.vjp_H.fill(0)
         diva_exact = diva and self.diva_exact_coeff_adjoint
+        self._last_dt = dt
         if diva:
             self.W_eta.fill(0.0)
             self.W_be.fill(0.0)
@@ -686,27 +689,30 @@ class AdjointOperators:
                 grid.ny, grid.nx, stride, halo))
 
     def _compute_gradient_beta_diva(self):
-        """dJ/d(beta) under DIVA: the same transpose as the SSA kernel, with the
-        sensitivity routed through beta_eff and the closure."""
+        """dJ/d(beta) under DIVA, as a cell-local product.
+
+        W_eta and W_be (filled by the VJP) already are lambda^T d(r)/d(coefficient)
+        summed over every row touching the cell, so the parameter gradient is just the
+        chain rule per cell -- no facet loop.  This is the SSA pattern plus one link:
+        compute_gradient_beta computes W for beta directly, because under SSA beta enters
+        the stencil itself rather than through a state-dependent coefficient.
+
+        A VJP evaluation is run first so W corresponds to the current (converged) lambda
+        rather than to whatever the last smoother sweep left behind."""
+        grid = self.grid
+        rheology = grid.rheology
+
+        # Refresh W at the current (converged) lambda: the last thing the adjoint solve
+        # does is smooth, so the W left behind corresponds to lambda before that update.
+        self.compute_residual(getattr(self, '_last_dt', cp.float32(1.0)), use_mask=False)
+        grid.forward_operators.compute_diva_derivs()
+
         kernel = self.kernels.get_function('compute_gradient_beta_diva')
         grid_size, block_size, stride, halo = self._kernel_config
-
-        grid = self.grid
-        state = grid.state
-        adjoint = grid.adjoint
-        rheology = grid.rheology
-        sliding = grid.sliding
-
-        sliding.beta.grad.fill(0)
         kernel(grid_size, block_size,
-               (sliding.beta.grad,
-                state.u.data, state.v.data,
-                adjoint.lambda_u.data, adjoint.lambda_v.data,
-                state.phi.data,
-                sliding.beta.data, sliding.u_c.data, sliding.beta_eff.data,
-                state.u_b.data, rheology.F2.data,
-                sliding.m.value, sliding.u_reg.value,
-                sliding.water_drag.value, sliding.sliding_law.value,
+               (grid.sliding.beta.grad,
+                self.W_eta, self.W_be,
+                rheology.deta_dbeta.data, rheology.dbe_dbeta.data,
                 grid.ny, grid.nx, stride, halo))
 
     def compute_gradient_m(self):

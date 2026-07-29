@@ -99,7 +99,7 @@ __device__ __forceinline__ void diva_from_float(DualFloat& x, float v) { x = {v,
 template <typename T>
 __device__ __forceinline__
 T get_diva_c_of_U(
-    T U, float beta_grounded, float m, float u_reg, float water_drag,
+    T U, T beta_grounded, float m, float u_reg, float water_drag,
     float u_c, float sliding_law){
 
     // The drag coefficient c(U) of get_diva_drag_coeff (stress.cu), templated on the
@@ -111,7 +111,7 @@ T get_diva_c_of_U(
     if (sliding_law < 0.5f) {
         c = beta_grounded * __powf(U_sq_reg, 0.5f*(m - 1.0f));
     } else {
-        c = beta_grounded / (sqrtf(U_sq_reg) + u_c);
+        c = beta_grounded / (T(sqrtf(U_sq_reg) + u_c));
     }
 
     return c + water_drag;
@@ -120,7 +120,7 @@ T get_diva_c_of_U(
 template <typename T>
 __device__ void diva_coeffs_cell(
     T eps_mem_sq, T U_bar,                       // the two velocity-dependent inputs
-    float H_c, float B_c, float beta_grounded, float u_c_c,
+    float H_c, float B_c, T beta_grounded, float u_c_c,
     float m, float u_reg, float water_drag, float sliding_law,
     float glen_exp, float eps_reg, int n_sigma,
     float U_b_warm,
@@ -170,7 +170,7 @@ __device__ void diva_coeffs_cell(
             T f = coeff * U_b;
             T R = U_b + f*F2_c - U_bar;
             // f'(U_b) from the primals: a separate differentiation from the seeded one.
-            DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},beta_grounded,m,u_reg,water_drag,u_c_c,sliding_law);
+            DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},diva_primal(beta_grounded),m,u_reg,water_drag,u_c_c,sliding_law);
             DualFloat fs = cs * DualFloat{diva_primal(U_b),1.0f};
             float dR = 1.0f + fs.d*diva_primal(F2_c);
             U_b = fmaxf(U_b - R/dR, 0.0f);
@@ -281,7 +281,7 @@ __device__ void populate_diva_coeffs_dual(
 
     DualFloat eta_d, F2_d, U_b_d, beta_eff_d;
     diva_coeffs_cell<DualFloat>(eps_mem_sq, U_bar,
-            H_c, B_c, beta_grounded, u_c_c,
+            H_c, B_c, DualFloat{beta_grounded, 0.0f}, u_c_c,
             m, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma,
             U_b_warm,
@@ -375,6 +375,8 @@ void compute_diva_derivs(
     float* __restrict__ deta_dU,
     float* __restrict__ dbe_deps,
     float* __restrict__ dbe_dU,
+    float* __restrict__ deta_dbeta,
+    float* __restrict__ dbe_dbeta,
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
@@ -426,7 +428,7 @@ void compute_diva_derivs(
 
     // Seed 1: d/d(eps_mem^2)
     diva_coeffs_cell<DualFloat>({eps_mem_v,1.0f}, {U_bar_v,0.0f},
-            H_c, B_c, beta_grounded, u_c_c,
+            H_c, B_c, {beta_grounded,0.0f}, u_c_c,
             m, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
             eta_d, F2_d, U_b_d, be_d);
@@ -435,18 +437,33 @@ void compute_diva_derivs(
 
     // Seed 2: d/d(Ubar)
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,1.0f},
-            H_c, B_c, beta_grounded, u_c_c,
+            H_c, B_c, {beta_grounded,0.0f}, u_c_c,
             m, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
             eta_d, F2_d, U_b_d, be_d);
     float d_eta_dU = eta_d.d;
     float d_be_dU  = be_d.d;
 
+    // Seed 3: d/d(beta).  The perturbation is `grounded` rather than 1 because the
+    // closure is given beta*grounded, so this yields the derivative with respect to the
+    // raw beta the inversion actually controls.  Note beta moves eta_bar as well as
+    // beta_eff (beta -> c -> tau_b -> shear term), which is the path the parameter
+    // gradient was missing.
+    diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
+            H_c, B_c, {beta_grounded,grounded}, u_c_c,
+            m, u_reg, water_drag, sliding_law,
+            glen_exp, eps_reg, n_sigma, U_b_warm,
+            eta_d, F2_d, U_b_d, be_d);
+    float d_eta_dbeta = eta_d.d;
+    float d_be_dbeta  = be_d.d;
+
     if (is_active) {
         deta_deps[idx] = d_eta_deps;
         deta_dU[idx]   = d_eta_dU;
         dbe_deps[idx]  = d_be_deps;
         dbe_dU[idx]    = d_be_dU;
+        deta_dbeta[idx] = d_eta_dbeta;
+        dbe_dbeta[idx]  = d_be_dbeta;
     }
 }
 
@@ -575,4 +592,46 @@ void compute_diva_vjp_coeffs(
 
     #undef DIVA_ADD_U
     #undef DIVA_ADD_V
+}
+
+/*=========================================================
+  ====== dJ/d(beta) under DIVA: cell-local W product =======
+  =========================================================*/
+/*
+  W_eta and W_be, filled by vjp_body, already ARE lambda^T d(r)/d(coefficient) summed
+  over every row that touches the cell.  So the parameter gradient is just the chain
+  rule applied per cell, with no facet loop at all:
+
+      dJ/d(beta)_c = W_eta_c * d(eta_bar_c)/d(beta_c) + W_be_c * d(beta_eff_c)/d(beta_c)
+
+  This replaces compute_gradient_beta_diva, which walked the facets and carried only the
+  beta_eff path -- beta also moves eta_bar through beta -> c -> tau_b -> shear term.
+  The same expression gives u_c and m by swapping the two derivative fields.
+
+  Note this is the SSA pattern with one extra link: compute_gradient_beta already
+  computes W for beta directly, because under SSA beta enters the stencil itself rather
+  than through a state-dependent coefficient.
+*/
+extern "C" __global__
+void compute_gradient_beta_diva(
+    float* __restrict__ grad_beta,
+    const float* __restrict__ W_eta,
+    const float* __restrict__ W_be,
+    const float* __restrict__ deta_dbeta,
+    const float* __restrict__ dbe_dbeta,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+    if (!is_active) return;
+
+    int idx = i * nx + j;
+    grad_beta[idx] = W_eta[idx]*deta_dbeta[idx] + W_be[idx]*dbe_dbeta[idx];
 }

@@ -346,7 +346,22 @@ adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
 
 ## 7. Not yet done
 
-- **Complete `dJ/d(beta)`.** The adjoint operator is now exact (dot-product identity
+- ~~**Complete `dJ/d(beta)`.**~~ **DONE.** `dJ/d(beta)` is now the cell-local product
+`W_eta_c*d(eta_bar_c)/d(beta_c) + W_be_c*d(beta_eff_c)/d(beta_c)`, from a third dual
+seeding of the closure (seeded with `grounded` so the result is w.r.t. the raw beta). It
+agrees with finite differences at the FD floor -- best 2.2e-5, against an SSA control of
+1.4e-4 -- and it *replaced* the facet-walking kernel with ~15 lines. The same expression
+gives `u_c` and `m` by swapping which derivative field is used.
+
+  Historical note worth keeping: with the frozen adjoint this read 9.6e-4 and with the
+  exact adjoint 2.2e-2, because a wrong lambda had been partly cancelling the missing
+  `eta_bar` path. Neither number was evidence about the gradient on its own.
+
+- **`u_c` and `m` gradients.** Same shape as above. `u_c` and `m` are still plain floats
+  in `diva_coeffs_cell`; templating them the way `beta` now is makes them seedable, and
+  then each needs only its own pair of derivative fields plus one kernel line.
+
+- ~~**Turn on the exact coefficient adjoint.**~~ The adjoint operator is now exact (dot-product identity
 5.6e-7) and the adjoint solve converges, but the *parameter* sensitivity is not yet
 complete: `get_diva_dbeta_eff_dbeta` covers only the `beta -> beta_eff` path, while beta
 also moves `eta_bar` through `beta -> c -> tau_b -> shear term`. Against finite differences

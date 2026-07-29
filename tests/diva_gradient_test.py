@@ -37,12 +37,11 @@ L = 20000.0
 RHO_I = cp.float32(917.0)
 GRAV = cp.float32(9.81)
 
-# Perturbation scale. A Taylor sweep (3e-4, 1e-4, 3e-5) shows the FD error is NOT
-# monotonic in eps -- float32 round-off scales like 1/eps and dominates below ~1e-4 --
-# so 3e-4 is the best-conditioned point. There the SSA control reaches 1.4e-4, which is
-# what establishes the harness; DIVA reaches ~1e-3, and that gap is the
-# frozen-coefficient error (~0.1%).
-EPS = 3e-4
+# The FD error is NOT monotonic in eps -- float32 round-off scales like 1/eps -- so no
+# single step is trustworthy.  Sweep and take the best.  Observed floors: SSA 1.4e-4,
+# DIVA 2.2e-5, i.e. both limited by the finite-difference reference rather than by the
+# adjoint.
+EPS_SWEEP = (1e-3, 3e-4, 1e-4)
 SEED = 12345
 
 
@@ -156,40 +155,43 @@ def run(stress_balance, tag):
 
     gvp_adj = float(np.sum(grad * d))
 
-    _, up, vp = forward(beta_0 + EPS * d_cp, stress_balance)
-    _, um, vm = forward(beta_0 - EPS * d_cp, stress_balance)
-    Jp = objective(up, vp, u_obs, v_obs, w_u, w_v)
-    Jm = objective(um, vm, u_obs, v_obs, w_u, w_v)
-    gvp_fd = (Jp - Jm) / (2 * EPS)
-
-    rel = abs(gvp_fd - gvp_adj) / max(abs(gvp_fd), 1e-30)
+    # Sweep the step and judge on the best agreement.  Necessary, not fastidious: the FD
+    # error here is non-monotonic in eps (float32 round-off grows like 1/eps), and a
+    # single step gives a number that can be an order of magnitude off the achievable
+    # floor in either direction.  Same discipline as tests/diva_derivs_test.py.
     print(f"{tag}: J0 = {J0:.6e}, adjoint |r|/|r0| = {adj_res:.2e}")
-    print(f"      FD = {gvp_fd:+.6e}   adjoint = {gvp_adj:+.6e}   rel diff = {rel:.3e}")
-    return rel
+    best = (np.inf, None, None)
+    for eps in EPS_SWEEP:
+        _, up, vp = forward(beta_0 + eps * d_cp, stress_balance)
+        _, um, vm = forward(beta_0 - eps * d_cp, stress_balance)
+        Jp = objective(up, vp, u_obs, v_obs, w_u, w_v)
+        Jm = objective(um, vm, u_obs, v_obs, w_u, w_v)
+        gvp_fd = (Jp - Jm) / (2 * eps)
+        rel = abs(gvp_fd - gvp_adj) / max(abs(gvp_fd), 1e-30)
+        print(f"      eps={eps:<8g} FD = {gvp_fd:+.6e}  adjoint = {gvp_adj:+.6e}  "
+              f"rel diff = {rel:.3e}")
+        if rel < best[0]:
+            best = (rel, gvp_fd, eps)
+    print(f"      best: rel diff = {best[0]:.3e} at eps = {best[2]:g}")
+    return best[0]
 
 
 def main():
     # Control: the SSA adjoint is exact, so this validates the harness itself.
     rel_ssa = run(0.0, "SSA  (control, exact adjoint)")
-    assert rel_ssa < 5e-3, \
+    assert rel_ssa < 1e-3, \
         f"harness or SSA adjoint is broken: rel diff {rel_ssa:.3e} (expected ~1e-4)"
 
     # Under test: frozen-coefficient DIVA adjoint.
-    rel_diva = run(1.0, "DIVA (frozen-coefficient adjoint)")
-    # Loose bound: catches sign errors, missing chain factors and gross plumbing bugs,
-    # while tolerating the deliberately omitted velocity paths.
-    # Knowingly incomplete: dF/d(beta) currently carries only the beta_eff path.  beta
-    # also moves eta_bar (beta -> c -> tau_b -> shear term -> eta_bar), and that term is
-    # missing.  With the frozen adjoint this read 9.6e-4 because a wrong lambda partly
-    # cancelled it; now that lambda is exact (dot-product identity 5.6e-7) the gap is
-    # exposed at 2.2e-2.  See notes/diva_numerics.md for the fix, which is a cell-local
-    # product with W_eta / W_be and simpler than the present kernel.
-    assert rel_diva < 5e-2, \
-        f"DIVA gradient worse than the missing eta_bar-vs-beta path explains: {rel_diva:.3e}"
+    rel_diva = run(1.0, "DIVA (exact adjoint + cell-local dJ/dbeta)")
+    # dJ/d(beta)_c = W_eta_c*d(eta_bar)/d(beta) + W_be_c*d(beta_eff)/d(beta).  Both
+    # coefficient paths are present now, so this should sit at the FD floor alongside the
+    # SSA control rather than above it.
+    assert rel_diva < 1e-3, \
+        f"DIVA gradient above the finite-difference floor: {rel_diva:.3e}"
 
     print(f"\nSSA control {rel_ssa:.3e} | DIVA {rel_diva:.3e}")
-    print("OK: dJ/dbeta agrees with finite differences (SSA exactly; DIVA up to the "
-          "frozen-coefficient approximation)")
+    print("OK: dJ/dbeta agrees with finite differences to the FD floor, for SSA and DIVA")
 
 
 if __name__ == '__main__':

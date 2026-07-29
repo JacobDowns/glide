@@ -75,6 +75,8 @@ class Rheology:
     deta_dU: Field | None = None      # d(eta_bar)/d(Ubar)
     dbe_deps: Field | None = None     # d(beta_eff)/d(eps_mem^2)
     dbe_dU: Field | None = None       # d(beta_eff)/d(Ubar)
+    deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)   -- for the parameter gradient
+    dbe_dbeta: Field | None = None    # d(beta_eff)/d(beta)
     n: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(3.0),
@@ -432,7 +434,9 @@ class Grid:
                 deta_deps=_cell('deta_deps','Pa a^3','DIVA d(eta_bar)/d(eps_mem^2)'),
                 deta_dU=_cell('deta_dU','Pa a^2 m^{-1}','DIVA d(eta_bar)/d(Ubar)'),
                 dbe_deps=_cell('dbe_deps','?','DIVA d(beta_eff)/d(eps_mem^2)'),
-                dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'))
+                dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'),
+                deta_dbeta=_cell('deta_dbeta','?','DIVA d(eta_bar)/d(beta)'),
+                dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'))
 
     def _allocate_sliding(self):
         beta = Field(

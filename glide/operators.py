@@ -3,6 +3,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+# Kernel translation units, in dependency order.  Single source of truth: tests that
+# compile the kernels standalone import this rather than repeating the list.
+# diva.cu sits right after stress.cu -- it depends only on common.cu and stress.cu, and
+# residuals.cu / vanka.cu need diva_coeffs_cell<T> from it.
+CUDA_FILES = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
+              'residuals.cu', 'vanka.cu', 'grad.cu']
+
 class ForwardOperators:
     def __init__(self,grid,
             use_fast_math=True):
@@ -12,11 +19,7 @@ class ForwardOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        # diva.cu sits right after stress.cu: it depends only on common.cu and
-        # stress.cu, and placing it here lets residuals.cu and vanka.cu use
-        # diva_coeffs_cell<T> for the DIVA JVP and smoother.
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu']
+        cuda_files = CUDA_FILES
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:
@@ -399,11 +402,7 @@ class AdjointOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        # diva.cu sits right after stress.cu: it depends only on common.cu and
-        # stress.cu, and placing it here lets residuals.cu and vanka.cu use
-        # diva_coeffs_cell<T> for the DIVA JVP and smoother.
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu']
+        cuda_files = CUDA_FILES
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:
@@ -432,14 +431,11 @@ class AdjointOperators:
         # DIVA: per-cell adjoints of the closure coefficients -- the intermediate the
         # transpose is split at (see _apply_diva_coeff_adjoints).
         #
-        # Gated OFF by default.  Enabling it makes the adjoint residual the exact
-        # transpose (dot-product identity 9.7e-2 -> 9.4e-5), but the adjoint SMOOTHER
-        # still assembles the frozen block, so it no longer approximates the operator it
-        # preconditions and the adjoint V-cycles stall (1.1e-6 -> 1.1e-1). The forward
-        # solve avoids this by lagging the coefficients, so within a sweep its operator
-        # matches its smoother. Turning this on therefore needs a matching smoother
-        # upgrade -- see notes/diva_numerics.md.
-        self.diva_exact_coeff_adjoint = False
+        # On by default: the adjoint residual is then the exact transpose (dot-product
+        # identity 9.7e-2 -> 5e-7, i.e. round-off).  The smoother still assembles the
+        # frozen block, which is fine -- it is only a preconditioner, exactly as in SSA,
+        # where the VJP carries d(eta)/du and the smoother does not.
+        self.diva_exact_coeff_adjoint = True
         self.W_eta = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.W_be = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 

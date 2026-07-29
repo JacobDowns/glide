@@ -27,8 +27,7 @@ import cupy as cp
 import numpy as np
 
 CUDA = Path(__file__).resolve().parents[1] / "glide" / "cuda"
-CUDA_FILES = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu', 'flux.cu',
-              'residuals.cu', 'vanka.cu', 'grad.cu']
+from glide.operators import CUDA_FILES
 
 PROBE = r'''
 extern "C" __global__

@@ -31,8 +31,7 @@ import numpy as np
 from glide.multigrid import Multigrid, FASCDSolver
 
 CUDA = Path(__file__).resolve().parents[1] / "glide" / "cuda"
-CUDA_FILES = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
-              'residuals.cu', 'vanka.cu', 'grad.cu', 'diva.cu']
+from glide.operators import CUDA_FILES
 
 PROBE = r'''
 extern "C" __global__

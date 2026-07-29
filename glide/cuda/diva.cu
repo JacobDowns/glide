@@ -550,9 +550,12 @@ void compute_diva_vjp_coeffs(
     float dU_dv = 0.5f*v_ctr*inv_U;      // for both v_t and v_b
 
     // Scatter.  u facets are (ny, nx+1); v facets are (ny+1, nx).
-    #define DIVA_ADD_U(I,J,VAL) if ((I) >= 0 && (I) < ny && (J) >= 0 && (J) <= nx) \
+    // Skip the Dirichlet facets.  The main VJP kernel replaces those rows with an
+    // identity (lambda = 0), so anything added here could never be reduced by the
+    // smoother and would sit in the residual forever as a convergence floor.
+    #define DIVA_ADD_U(I,J,VAL) if ((I) >= 0 && (I) < ny && (J) > 0 && (J) < nx) \
         atomicAdd(&r_u[(I)*(nx + 1) + (J)], (VAL));
-    #define DIVA_ADD_V(I,J,VAL) if ((I) >= 0 && (I) <= ny && (J) >= 0 && (J) < nx) \
+    #define DIVA_ADD_V(I,J,VAL) if ((I) > 0 && (I) < ny && (J) >= 0 && (J) < nx) \
         atomicAdd(&r_v[(I)*nx + (J)], (VAL));
 
     DIVA_ADD_U(i,   j,     A*(-P*dx_inv - R_tl*h + R_bl*h) + B*dU_du)

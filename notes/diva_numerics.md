@@ -346,18 +346,33 @@ adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
 
 ## 7. Not yet done
 
+- **Complete `dJ/d(beta)`.** The adjoint operator is now exact (dot-product identity
+5.6e-7) and the adjoint solve converges, but the *parameter* sensitivity is not yet
+complete: `get_diva_dbeta_eff_dbeta` covers only the `beta -> beta_eff` path, while beta
+also moves `eta_bar` through `beta -> c -> tau_b -> shear term`. Against finite differences
+`dJ/d(beta)` therefore reads 2.2e-2, having read 9.6e-4 with the frozen adjoint only
+because a wrong lambda partly cancelled the missing term -- a good reminder that agreement
+with FD is not evidence of correctness when two errors can offset.
+
+The fix is simpler than the current kernel. `W_eta` and `W_be` already *are*
+`lambda^T d(r)/d(coefficient)`, so the parameter gradient is a purely cell-local product
+with no facet loop:
+
+      dJ/d(beta)_c = W_eta_c * d(eta_bar_c)/d(beta_c) + W_be_c * d(beta_eff_c)/d(beta_c)
+
+which needs one more dual seeding in compute_diva_derivs (seed beta) and replaces
+compute_gradient_beta_diva entirely. The same shape then gives `u_c` and `m` for free.
+
 - **Turn on the exact coefficient adjoint.** The four closure terms are implemented and
 verified -- `AdjointOperators.diva_exact_coeff_adjoint = True` takes the adjoint identity
 from 9.7e-2 to **5.0e-7**, i.e. round-off against an SSA control of 1.2e-7, with no
-symmetry assumed. They are gated **off** by default because the adjoint *smoother* still
-assembles the frozen block: with the exact terms in the residual it no longer approximates
-the operator it preconditions, and the adjoint V-cycles stall (1.1e-6 -> 1.1e-1). Note the
-forward solve does not have this problem because it *lags* the coefficients, so within a
-sweep its operator matches its smoother. Options: give the adjoint smoother the
-condensation transpose (helps only for nonlinear laws, since c' = 0 makes it inert for
-m = 1); damp or under-relax the adjoint iteration; or treat the coefficient terms as a
-deferred correction with an outer Picard. Until then the usable DIVA gradient is the
-frozen one, which the dot-product test shows is about 10% wrong in operator action.
+symmetry assumed. They are **on** by default. An earlier attempt appeared to stall the adjoint V-cycles at
+1.1e-1; the cause was not the smoother but the Dirichlet rows -- the coefficient gather ran
+after the main VJP kernel had replaced those rows with an identity, so what it added there
+could never be reduced and sat in the residual as a floor. Skipping the Dirichlet facets in
+the gather fixed it, and the adjoint now converges to 1.0e-6 exactly as the frozen version
+does. The smoother is still the frozen block, which is fine: it is only a preconditioner,
+exactly as in SSA where the VJP carries d(eta)/du and the smoother does not.
 
 - **The adjoint.** `vanka_smooth_adjoint` is still SSA-only (it passes `nullptr` for the DIVA fields). This is the next piece of work and the condition under which the author endorsed the effort. The pieces are in place: `get_diva_dbeta_eff_du_b` already supplies $\partial\beta_{\mathrm{eff}}/\partial U_b$, and the parameter chain factor is $f_\theta(U_b)/(1+f'(U_b)F_2)$ — closed-form via the implicit function theorem at the converged $U_b$, so the adjoint never re-runs the per-cell Newton in reverse.
 - **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. To be done once the adjoint is in, so the forward model and the gradients are validated together.

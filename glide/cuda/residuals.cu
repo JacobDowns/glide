@@ -7,6 +7,32 @@
 // balance sees -- so they share this body rather than a second copy of every stencil.
 // DIVA is a compile-time flag, so each instantiation keeps only its own branch and the
 // SSA kernel below is unchanged.
+//
+// One thread owns one cell and evaluates THREE residual rows, each written exactly once:
+//
+//   r_H  cell centre          mass conservation
+//   r_u  cell's LEFT  facet   x-momentum
+//   r_v  cell's TOP   facet   y-momentum
+//
+// The right and bottom facets belong to the neighbouring threads, so no atomics are
+// needed.  This is a GATHER: read wide, write one row.  (compute_vjp below is the
+// opposite -- see the note there.)
+//
+// The momentum rows discretise the depth-integrated stress balance
+//
+//   d/dx[ H*eta*(4*du/dx + 2*dv/dy) ] + d/dy[ H*eta*(dv/dx + du/dy) ] - tau_b - tau_d = 0
+//   \_____________________________________________________________/
+//                     membrane stress divergence
+//
+// as differences of cell-centred normal stresses (sigma_xx, sigma_yy) and vertex-centred
+// shear stresses (sigma_xy).  SSA and DIVA are the SAME expression here -- only eta and
+// tau_b change meaning (Goldberg eq 43).  The mass row discretises
+//
+//   H/dt - (H_prev/dt + smb) + div(u*H) + calving = 0.
+//
+// Each brace-delimited block below contributes ONE term to one accumulator, and declares
+// its own stencil names relative to THAT term's centre.  That is why the bare scopes are
+// there, and why e.g. eta_l means a different cell in each of them.
 template <bool DIVA>
 __device__ void residual_body(
     float* __restrict__ r_u,
@@ -43,6 +69,9 @@ __device__ void residual_body(
     int j = blockIdx.x * stride + (threadIdx.x - halo);
     int i = blockIdx.y * stride + (threadIdx.y - halo);
 
+    // Membrane viscosity, one value per cell, shared across the thread block: the
+    // stencils below each need several neighbouring cells' worth, so the tile is built
+    // once rather than re-forming eta per stencil.
     __shared__ float eta_local[bny][bnx];
 
     if (i > ny || j > nx) return;
@@ -69,17 +98,25 @@ __device__ void residual_body(
 
 	if (has_cell){
 
+	    // ---- r_H: mass conservation at the cell centre --------------------------------
+	    // r_H = H/dt - (H_prev/dt + smb) + div(u*H) + calving.  f_H carries the explicit
+	    // part (H_prev/dt + smb); H and the velocities are the implicit unknowns.
 	    float H_c        = get_cell(H,i,j,ny,nx);
 	    float phi_c = get_cell(phi,i,j,ny,nx);
 
 	    float rH = H_c/dt;
             if (use_forcing) rH -= get_cell(f_H,i,j,ny,nx);
 
+	    // d(u*H)/dx as (flux out the right facet) - (flux in the left facet).  Each facet
+	    // flux is first-order upwind, written as a centred flux plus |u| diffusion, with |u|
+	    // smoothed to sqrt(u^2 + 10) so the Jacobian stays continuous through u = 0.
 	    float H_l = get_cell(H,i,j-1,ny,nx);
 	    float u_l = get_vfacet(u,i,j,ny,nx);
 	    HorizontalFluxJacobian j_l = get_horizontal_flux_jac({u_l,H_l,H_c}, i, j, ny, nx);
 	    rH -= j_l.res*dx_inv;
 	    
+	    // Calving, applied per facet and summed over all four: a sink where the facet exposes
+	    // an ice cliff, gated by the flotation state phi on either side.
 	    float phi_l = get_cell(phi,i,j-1,ny,nx);
 	    FacetCalvingJacobian j_calve_l = get_facet_calving_jac({H_c,H_l,phi_c,phi_l,calving_rate,flotation_reg_calving},i,j,ny,nx);
 	    rH += j_calve_l.res*dx_inv;
@@ -93,6 +130,7 @@ __device__ void residual_body(
 	    FacetCalvingJacobian j_calve_r = get_facet_calving_jac({H_c,H_r,phi_c,phi_r,calving_rate,flotation_reg_calving},i,j+1,ny,nx);
 	    rH += j_calve_r.res*dx_inv;
 
+	    // d(v*H)/dy, the same construction on the top and bottom facets.
 	    float H_t = get_cell(H,i-1,j,ny,nx);
 	    float v_t = get_hfacet(v,i,j,ny,nx);
 	    VerticalFluxJacobian j_t = get_vertical_flux_jac({v_t,H_t,H_c}, i, j, ny, nx);
@@ -113,6 +151,9 @@ __device__ void residual_body(
 	    FacetCalvingJacobian j_calve_b = get_facet_calving_jac({H_c,H_b,phi_c,phi_b,calving_rate,flotation_reg_calving},i+1,j,ny,nx);
 	    rH += j_calve_b.res*dx_inv;
 
+	    // Where the mask is set, the PDE row is replaced by the algebraic constraint
+	    // H = gamma (the thickness floor).  Blended rather than branched, so the row stays
+	    // differentiable and the Jacobian's sparsity pattern does not change.
 	    float masked = use_mask ? get_cell(mask,i,j,ny,nx) : 0.0f;
 	    float thklim = get_cell(gamma,i,j,ny,nx);
             r_H[i * nx + j] = (1.0f - masked) * rH + masked * (H_c - thklim);
@@ -123,10 +164,15 @@ __device__ void residual_body(
 	
 	if (has_u){
 
+	    // ---- r_u: x-momentum at the cell's LEFT facet ---------------------------------
+	    // r_u = d(sigma_xx)/dx + d(sigma_xy)/dy + tau_bx - tau_dx, accumulated term by term.
 	    float ru_l = 0.0f;
 	    if (use_forcing) ru_l -= get_vfacet(f_u,i,j,ny,nx);
 
 	    {
+	    // d(sigma_xx)/dx, half 1 of 2: the normal stress in the cell to the RIGHT of this
+	    // facet, (i,j).  sigma_xx = H*eta*(4*du/dx + 2*dv/dy), so it needs that cell's four
+	    // bounding facets.
 	    float eta_c = eta_local[bi][bj];
 	    float H_c = get_cell(H,i,j,ny,nx);
 	    EtaHCellJacobian eta_H_c = get_eta_H_cell_jac({eta_c,H_c});
@@ -141,6 +187,8 @@ __device__ void residual_body(
 	    }
 
 	    {
+	    // half 2: the same stress in the cell to the LEFT, (i,j-1).  Subtracting the two and
+	    // dividing by dx is the x-derivative at the facet.
 	    float eta_l  = eta_local[bi][bj - 1];
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
 	    EtaHCellJacobian eta_H_l = get_eta_H_cell_jac({eta_l,H_l});
@@ -155,6 +203,9 @@ __device__ void residual_body(
 	    }
 	    
 	    {
+	    // d(sigma_xy)/dy, half 1 of 2: the shear stress at the vertex ABOVE this facet.
+	    // sigma_xy = H*eta*(dv/dx + du/dy) lives on vertices, so eta and H are averaged from
+	    // the four cells meeting there -- hence the tl/t/l/c stencil.
 	    float eta_tl = eta_local[bi - 1][bj - 1];
 	    float eta_t  = eta_local[bi - 1][bj];
 	    float eta_l  = eta_local[bi][bj - 1];
@@ -180,6 +231,7 @@ __device__ void residual_body(
 	    {
 	    float eta_l  = eta_local[bi][bj - 1];
 	    float eta_c  = eta_local[bi][bj];
+	    // half 2: the vertex BELOW this facet.  Difference over dx gives the y-derivative.
 	    float eta_bl = eta_local[bi + 1][bj - 1];
 	    float eta_b  = eta_local[bi + 1][bj];
 	    
@@ -200,6 +252,9 @@ __device__ void residual_body(
 	    }
 	
         {    
+		// Basal drag tau_bx, resisting.  This is the one momentum term where SSA and DIVA
+		// differ in substance: SSA evaluates the sliding law right here, DIVA reads the
+		// effective drag its cell-local closure already solved for.
 		float u_l    = get_vfacet(u,i,j,ny,nx);
 		float v_tl   = get_hfacet(v,i,j-1,ny,nx);
 	    float v_tr   = get_hfacet(v,i,j,ny,nx);
@@ -231,6 +286,8 @@ __device__ void residual_body(
 	    {
 	    float H_l    = get_cell(H,i,j-1,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
+	    // Driving stress tau_dx = rho*g*H*ds/dx, the only forcing term.  phi enters because
+	    // the surface elevation follows flotation wherever the ice is afloat.
 	    float bed_l  = get_cell(bed,i,j-1,ny,nx);
 	    float bed_c  = get_cell(bed,i,j,ny,nx);
 	    float phi_l = get_cell(phi,i,j-1,ny,nx);
@@ -239,6 +296,9 @@ __device__ void residual_body(
 	    ru_l -= tau_dx.res;
 	    }
 
+	    // Dirichlet u = 0 on the east/west domain edges: the PDE row is replaced outright by
+	    // an identity row.  The adjoint kernels must respect the same rows -- anything placed
+	    // on them there is unreducible and shows up as a convergence floor.
 	    if (j == 0 || j == nx) {
 			ru_l = get_vfacet(u,i,j,ny,nx);
 	    }	
@@ -247,10 +307,15 @@ __device__ void residual_body(
 
 	if (has_v){
 
+	    // ---- r_v: y-momentum at the cell's TOP facet ----------------------------------
+	    // Mirror of r_u with x and y exchanged:
+	    // r_v = d(sigma_yy)/dy + d(sigma_xy)/dx + tau_by - tau_dy.
 	    float rv_t = 0.0f;
 	    if (use_forcing) rv_t -= get_hfacet(f_v,i,j,ny,nx);
 
 	    {
+	    // d(sigma_yy)/dy, half 1 of 2: the cell ABOVE this facet, (i-1,j).
+	    // sigma_yy = H*eta*(4*dv/dy + 2*du/dx).
 	    float eta_t = eta_local[bi - 1][bj];
 	    float H_t  = get_cell(H,i-1,j,ny,nx);
 	    EtaHCellJacobian eta_H_t = get_eta_H_cell_jac({eta_t,H_t});
@@ -264,6 +329,7 @@ __device__ void residual_body(
 	    }
 
 	    {
+	    // half 2: the cell BELOW this facet, (i,j).
 	    float eta_c = eta_local[bi][bj];
 	    float H_c = get_cell(H,i,j,ny,nx);
 	    EtaHCellJacobian eta_H_c = get_eta_H_cell_jac({eta_c,H_c});
@@ -277,6 +343,7 @@ __device__ void residual_body(
 	    }
 
 	    {
+	    // d(sigma_xy)/dx, half 1 of 2: the vertex at the LEFT end of this facet.
 	    float eta_tl = eta_local[bi - 1][bj - 1];
 	    float eta_t  = eta_local[bi - 1][bj];
 	    float eta_l  = eta_local[bi][bj - 1];
@@ -301,6 +368,7 @@ __device__ void residual_body(
 
 	    {
 	    float eta_t  = eta_local[bi - 1][bj];
+	    // half 2: the vertex at the RIGHT end.  Difference over dx gives the x-derivative.
 	    float eta_tr = eta_local[bi - 1][bj + 1];
 	    float eta_c  = eta_local[bi][bj];
 	    float eta_r = eta_local[bi][bj + 1];
@@ -321,6 +389,7 @@ __device__ void residual_body(
 	    }
 
 	    {
+	    // Basal drag tau_by; see the tau_bx block above for the SSA/DIVA split.
 	    float v_t = get_hfacet(v,i,j,ny,nx);
 		float u_tl = get_vfacet(u,i-1,j,ny,nx);
 		float u_tr = get_vfacet(u,i-1,j+1,ny,nx);
@@ -350,6 +419,7 @@ __device__ void residual_body(
 	    {
 	    float H_t    = get_cell(H,i-1,j,ny,nx);
 	    float H_c    = get_cell(H,i,j,ny,nx);
+	    // Driving stress tau_dy = rho*g*H*ds/dy.
 	    float bed_t = get_cell(bed,i-1,j,ny,nx);
 	    float bed_c = get_cell(bed,i,j,ny,nx);
 	    float phi_t = get_cell(phi,i-1,j,ny,nx);
@@ -359,6 +429,7 @@ __device__ void residual_body(
 	    rv_t -= tau_dy.res;
 	    }
 
+	    // Dirichlet v = 0 on the north/south domain edges.
 	    if (i == 0 || i == ny) {
 			rv_t = get_hfacet(v,i,j,ny,nx);
 	    }	
@@ -368,6 +439,7 @@ __device__ void residual_body(
     }
 }
 
+// r = F(x) for the SSA stress balance and mass conservation.  Writes r_u, r_v, r_H.
 extern "C" __global__
 void compute_residual(
     float* __restrict__ r_u,
@@ -400,6 +472,9 @@ void compute_residual(
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
 }
 
+// r = F(x) for DIVA.  Same rows and same stencils as compute_residual; the caller must
+// have run compute_diva_coeffs first, since eta_bar and beta_eff are read as inputs here
+// rather than formed inline.
 extern "C" __global__
 void compute_residual_diva(
     float* __restrict__ r_u,
@@ -439,10 +514,19 @@ void compute_residual_diva(
   ==================== JVP Computation ====================
   =========================================================*/
 
-// Shared body for the SSA and DIVA JVPs.  Forward mode is a gather by construction --
-// each thread owns one row, reads whatever it needs, writes one value -- so unlike the
-// transpose there is no reach constraint, and the DIVA path carries the FULL
-// d(eta_bar)/du and d(beta_eff)/du with no special machinery.
+// Shared body for the SSA and DIVA JVPs: given a direction (d_u, d_v, d_H), evaluate
+//
+//     J * d,      J = d(r)/d(x),   x = (u, v, H)
+//
+// without ever forming J.  The structure mirrors residual_body block for block -- same
+// terms, same stencils, same signs -- with every quantity carried as a DualFloat, so each
+// term contributes both its value and its directional derivative.  Read a block here
+// against the corresponding block there.
+//
+// Forward mode is a gather by construction -- each thread owns one row, reads whatever it
+// needs, writes one value -- so unlike the transpose there is no reach constraint, and the
+// DIVA path carries the FULL d(eta_bar)/du and d(beta_eff)/du with no special machinery:
+// populate_diva_coeffs_dual just runs the closure in dual arithmetic.
 template <bool DIVA>
 __device__ void jvp_body(
     float* __restrict__ jvp_u,
@@ -795,6 +879,8 @@ __device__ void jvp_body(
 }
 
 
+// J*d for SSA, evaluated matrix-free at the current state.  Used by the dot-product
+// consistency test and available as the tangent-linear model.
 extern "C" __global__
 void compute_jvp(
     float* __restrict__ jvp_u,
@@ -829,6 +915,9 @@ void compute_jvp(
 	    calving_rate,flotation_reg_calving,dx,dt,0,ny,nx,stride,halo);
 }
 
+// J*d for DIVA.  Carries the exact closure sensitivity: eta_bar and beta_eff are
+// recomputed in dual arithmetic here rather than read as frozen fields, so this is the
+// true tangent of compute_residual_diva.
 extern "C" __global__
 void compute_jvp_diva(
     float* __restrict__ jvp_u,
@@ -1444,6 +1533,10 @@ __device__ void vjp_body(
 }
 
 
+// J^T*lambda for SSA -- the adjoint residual.  Note this is a SCATTER: each thread owns
+// a row of J, and pushes that row's contribution out to every COLUMN the row touches.
+// That is the transpose of residual_body's gather, and it is why the shared-memory
+// accumulators and the halo exist.
 extern "C" __global__
 void compute_vjp(
     float* __restrict__ vjp_u,
@@ -1479,6 +1572,8 @@ void compute_vjp(
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo);
 }
 
+// J^T*lambda for DIVA.  Handles the direct route and accumulates the coefficient route
+// into W_eta/W_be for compute_diva_vjp_coeffs to finish -- see the note above vjp_body.
 extern "C" __global__
 void compute_vjp_diva(
     float* __restrict__ vjp_u,

@@ -12,8 +12,9 @@ value known independently rather than against a stored regression:
   3. Coulomb law -- no closed form; require the closure residual itself to vanish.
   4. determinism -- repeated calls must agree bit-for-bit (the kernel reads u_b in place,
                     so only interior threads may write it).
-  5. shear-dominated -- eta_bar and F2 against a float64 reference that solves the per-level
-                    viscosity fixed point to convergence. This is the check the first four
+  5. shear-dominated -- eta_bar, F2 and u_b against the TRUE root of the closure, found by
+                    bisection in float64 with the per-level viscosity solved to convergence.
+  6. idempotence -- repeated calls must agree, which an unconverged closure does not. This is the check the first four
                     miss: check 1 sets tau_b = 0, where the per-level solve is exact in one
                     step, and checks 2-3 validate the Newton against the COMPUTED F2, so they
                     pass whatever F2 happens to be. A truncated per-level solve was wrong by
@@ -79,23 +80,22 @@ def exact_level_viscosity(A, k, glen_exp):
     return eta
 
 
-def reference_closure(beta, glen_exp, coupling_iters=3):
-    """Faithful float64 replica of diva_coeffs_cell for a LINEAR sliding law, with the
-    per-level viscosity solved EXACTLY.
+def reference_closure(beta, glen_exp):
+    """The TRUE root of F(U_b) = U_b + f(U_b)*F2(f(U_b)) - U_bar = 0, found by BISECTION.
 
-    Same structure as the kernel: cold warm-start (u_b = 0), `coupling_iters` sweeps, and
-    within each sweep the midpoint quadrature then the closure root.  For a linear law
-    R(U_b) = U_b*(1 + beta*F2) - U_bar is linear, so the kernel's 4 Newton steps land on the
-    exact root and there is nothing to approximate there.
+    Deliberately independent of the kernel's algorithm in both nesting levels: bisection rather
+    than Newton for the closure, and plain Picard run to convergence rather than Newton for the
+    per-level viscosity. Bisection is guaranteed here because F' >= 1, so F is strictly
+    increasing and F(0) = -U_bar < 0 < F(U_bar).
 
-    Any disagreement with the kernel is therefore attributable to the per-level solve.
+    An earlier version of this reference replicated the kernel's own 3-sweep block structure,
+    which made it a self-consistency check rather than a correctness one -- it would have
+    passed the block iteration's 2-cycle. See notes/diva_numerics.md 5.2.0.
     """
     A = EPS_REG                      # membrane strain rates vanish in this configuration
     w = 1.0 / N_SIGMA
-    U_b = 0.0
-    tau_b = beta * U_b
-    eta_avg = F2 = 0.0
-    for _ in range(coupling_iters):
+
+    def quadrature(tau_b):
         eta_avg = 0.0
         F2 = 0.0
         for k in range(N_SIGMA):
@@ -103,20 +103,35 @@ def reference_closure(beta, glen_exp, coupling_iters=3):
             eta = exact_level_viscosity(A, (tau_b * zeta / 2.0) ** 2, glen_exp)
             eta_avg += w * eta
             F2 += w * zeta * zeta / eta
-        F2 *= H0
-        U_b = U0 / (1.0 + beta * F2)
-        tau_b = beta * U_b
+        return eta_avg, F2 * H0
+
+    # linear law here, so f(U_b) = beta*U_b
+    F = lambda U_b: U_b + beta * U_b * quadrature(beta * U_b)[1] - U0
+    lo, hi = 0.0, U0
+    assert F(lo) < 0.0, "bracket lost: F(0) should be -U_bar"
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if F(mid) < 0.0:
+            lo = mid
+        else:
+            hi = mid
+    U_b = 0.5 * (lo + hi)
+    eta_avg, F2 = quadrature(beta * U_b)
     return eta_avg, F2, U_b
 
 
 def check_shear_dominated(glen_exp):
-    """Push tau_b until the vertical shear dominates the membrane term, and require the
-    kernel to match a reference whose per-level viscosity is solved to convergence.
+    """Push tau_b until the vertical shear dominates the membrane term, and require the kernel
+    to match the true root of the closure.
 
-    This is the check the first four miss.  Check 1 sets tau_b = 0, where the per-level solve
-    is exact in one step; checks 2-3 validate the Newton against the COMPUTED F2, so they pass
-    whatever F2 happens to be.  A truncated per-level Picard was wrong by 16% in F2 at
-    tau_b ~ 4 and 75% at tau_b ~ 30 with all four passing -- see notes/diva_numerics.md 5.2.1.
+    This is the check the first four miss. Check 1 sets tau_b = 0, where both nested solves are
+    exact in one step; checks 2-3 validate U_b against the COMPUTED F2, so they pass whatever
+    F2 is. Two separate defects hid behind them -- a truncated per-level Picard (F2 wrong by
+    16% at our own tau_b, 75% at ~250 kPa) and a block closure iteration that 2-cycled at high
+    drag. See notes/diva_numerics.md 5.2.0 and 5.2.1.
+
+    Run from a COLD start, so it also pins that one call converges rather than relying on the
+    warm start from a previous one.
     """
     worst = 0.0
     for beta in (0.02, 0.1, 0.5, 2.0):
@@ -131,8 +146,28 @@ def check_shear_dominated(glen_exp):
               f"F2 err = {d_F2:.2e}   u_b err = {d_ub:.2e}")
         worst = max(worst, d_eta, d_F2, d_ub)
     assert worst < 1e-4, (
-        f"per-level viscosity solve disagrees with a converged reference: {worst:.2e}. "
-        f"A truncated Picard gives ~1e-1 here; see notes/diva_numerics.md 5.2.1.")
+        f"closure does not reach the true root: worst relative error {worst:.2e}. "
+        f"see notes/diva_numerics.md 5.2.0")
+    return worst
+
+
+def check_idempotent():
+    """Repeated calls must return the same answer.
+
+    u_b is read in place as the warm start, so a call that has genuinely converged reproduces
+    itself. The block iteration did not: it sat in a stable 2-cycle, u_b alternating between
+    ~0.71 and ~5.75 at beta = 0.1, with F2 swinging by a factor of 18. That is invisible to
+    every other check here, and it is the sharpest single symptom of an unconverged closure.
+    """
+    worst = 0.0
+    for beta in (0.1, 2.0):
+        mg = build()
+        mg.sliding.beta.set(cp.full((ny, nx), beta, dtype=cp.float32))
+        seq = [coeffs(mg)[2] for _ in range(6)]
+        spread = (max(seq) - min(seq)) / max(abs(sum(seq) / len(seq)), 1e-30)
+        print(f"[repeat x6] beta = {beta:<5g} u_b spread over 6 calls = {spread:.2e}")
+        worst = max(worst, spread)
+    assert worst < 1e-5, f"repeated calls disagree ({worst:.2e}): the closure has not converged"
     return worst
 
 
@@ -196,7 +231,9 @@ def main():
 
     print()
     worst = check_shear_dominated(glen_exp)
-    print(f"            worst coefficient error vs converged reference: {worst:.2e}")
+    print(f"            worst coefficient error vs the true root: {worst:.2e}")
+    print()
+    check_idempotent()
 
     print("\nOK: DIVA coefficients and sliding closure behave as derived")
 

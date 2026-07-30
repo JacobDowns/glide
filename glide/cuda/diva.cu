@@ -135,27 +135,26 @@ __device__ void diva_coeffs_cell(
     // It is not a closed form because F2 depends on U_b: more basal drag means more vertical
     // shear, which thins the ice, which raises F2.  Hence the iteration.
     //
-    // METHOD, outermost to innermost:
+    // METHOD: Newton on F, with the true slope
     //
-    //   coupling_iters   refresh F2 at the updated U_b, since F2 depends on it
-    //     n_sigma loop   midpoint quadrature forming eta_bar and F2 -- a sum, not a solve
+    //     F'(U_b) = 1 + f'*F2 + f*f' * dF2/dtau_b
+    //
+    // Every term is non-negative -- f, f' >= 0 for a monotone sliding law, F2 > 0, and
+    // dF2/dtau_b > 0 because more drag means more shear means thinner ice -- so F' >= 1.  The
+    // root is therefore unique and the iteration needs no safeguarding or relaxation.
+    //
+    //   newton_iters     solve F(U_b) = 0
+    //     n_sigma loop   midpoint quadrature forming eta_bar, F2 and dF2/dtau_b -- a sum
     //       eta_iters    per level, solve Glen's law against the shear ansatz for eta
     //                    (a scalar root problem; Newton -- see the note at that loop)
-    //   newton_iters     solve the constraint above for U_b, with F2 held frozen
     //
-    // The last two together are a block Gauss-Seidel on F: the closure Newton uses the slope
-    // R' = 1 + f'*F2, and coupling_iters supplies the missing F2 dependence from outside.
-    //
-    // KNOWN DEFICIENCY, being replaced -- see notes/diva_numerics.md 5.2.0.  The true slope is
-    //
-    //     F'(U_b) = [1 + f'*F2] + [f * f' * dF2/dtau_b]
-    //               \_  R'    _/   \_ not computed here _/
-    //
-    // Every term is non-negative, so F' >= 1 and the root is unique: the PROBLEM is benign.
-    // But using R' under-estimates the slope of a monotone increasing function, so the block
-    // iteration's gain is exactly (1 - F'/R') and it 2-cycles once F' > 2R'.  That is 1.4% of
-    // the slope in the configurations we test and the dominant term at high basal drag.  The
-    // fix is to use F', which makes this true Newton and removes coupling_iters entirely.
+    // The quadrature sits INSIDE the Newton loop because F2 depends on U_b.  There is
+    // deliberately no outer 'coupling' iteration: an earlier version froze F2 during the
+    // closure Newton and refreshed it outside, which drops the third term of F' above.  That
+    // makes the scheme block Gauss-Seidel with gain exactly (1 - F'/R'), where
+    // R' = 1 + f'*F2, so it 2-CYCLED once F' > 2R' -- reachable at ordinary Greenland basal
+    // stresses, and only ~1.4% away from it in the configurations we happened to test.  See
+    // notes/diva_numerics.md 5.2.0.
     //
     // Shared by compute_diva_coeffs (T = float) and the JVP/derivative kernels (T =
     // DualFloat).  Note the Newton denominator dR stays a plain float even when T is dual.
@@ -163,9 +162,14 @@ __device__ void diva_coeffs_cell(
     // root and its sensitivity are independent of the step size used to reach them, so an
     // inexact denominator costs iterations, never accuracy.  A term dropped from a RESIDUAL
     // has no such licence, which is why the deficiency above is worth fixing and this is not.
-    const int coupling_iters = 3;
     const int eta_iters = 3;
-    const int newton_iters = 4;
+    // 8, not 4.  Newton is quadratic near the root but the COLD start (U_b = 0, hence
+    // tau_b = 0, hence F2 at its shear-free minimum) badly under-estimates F2 at the root, so
+    // the first step overshoots and it takes ~6 to recover.  Measured from cold: 4 steps leave
+    // U_b 53% high at beta = 2; 8 reach |F|/U_bar ~ 1e-6.  Warm-started -- which is every call
+    // after the first, since u_b persists -- 2 to 3 would do, but the count has to cover the
+    // cold case or the first refresh of a run is silently wrong.
+    const int newton_iters = 8;
 
     float w = 1.0f/(float)n_sigma;
 
@@ -176,9 +180,19 @@ __device__ void diva_coeffs_cell(
     T eta_avg = T();
     T F2_c = T();
 
-    for (int c = 0; c < coupling_iters; ++c) {
+    // TRUE Newton on F(U_b) = 0.  The quadrature is INSIDE the loop because F2 depends on
+    // U_b -- there is no separate coupling iteration to lag it.  The extra trip
+    // (it == newton_iters) takes no step; it only re-evaluates the quadrature at the final
+    // U_b so eta_bar, F2 and beta_eff are mutually consistent on output.  Without it the
+    // coefficients would lag the basal speed by one iteration.
+    for (int it = 0; it <= newton_iters; ++it) {
+        coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
+        tau_b = coeff * U_b;
+
         eta_avg = T();
         F2_c = T();
+        float dF2_dtau = 0.0f;              // primal only; see the Newton step below
+        float tau_p = diva_primal(tau_b);
 
         for (int k = 0; k < n_sigma; ++k) {
             float zeta = ((float)k + 0.5f)*w;
@@ -233,22 +247,52 @@ __device__ void diva_coeffs_cell(
 
             eta_avg = eta_avg + w*eta_k;
             F2_c    = F2_c + w*zeta*zeta/eta_k;
-        }
-        F2_c = F2_c * H_c;
 
-        for (int it = 0; it < newton_iters; ++it) {
-            coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
-            T f = coeff * U_b;
-            T R = U_b + f*F2_c - U_bar;
-            // f'(U_b) from the primals: a separate differentiation from the seeded one.
-            DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},diva_primal(beta_grounded),diva_primal(m),u_reg,water_drag,diva_primal(u_c_c),sliding_law);
-            DualFloat fs = cs * DualFloat{diva_primal(U_b),1.0f};
-            float dR = 1.0f + fs.d*diva_primal(F2_c);
-            U_b = fmaxf(U_b - R/dR, 0.0f);
+            // d(F2)/d(tau_b), accumulated here because everything it needs is already in
+            // registers.  Differentiating the converged level root eta = G(eta; tau_b) by the
+            // implicit function theorem:
+            //
+            //   d(eta)/d(tau_b) = G_tau / (1 - G_eta),
+            //       G_tau  = 2p*s*eta/(E*tau_b),   G_eta = -2p*s/E
+            //
+            // and s/tau_b is written as tau_b*zeta^2/(4*eta^2) so nothing divides by tau_b --
+            // the expression is then correctly zero at tau_b = 0 rather than 0/0.  The
+            // denominator 1 - G_eta lies in (1/3, 1] for Glen n = 3, so it never pinches.
+            // Then d(F2)/d(tau_b) = H * sum w*zeta^2 * (-1/eta^2) * d(eta)/d(tau_b) > 0:
+            // more drag, more shear, thinner ice, larger F2.
+            float eta_p = diva_primal(eta_k);
+            float s_p   = diva_primal(k_shear)/(eta_p*eta_p);
+            float E_p   = diva_primal(A_mem) + s_p;
+            float dnm   = 1.0f + 2.0f*glen_exp*(s_p/E_p);       // = 1 - G_eta
+            float deta_dtau = glen_exp*tau_p*zeta*zeta/(2.0f*eta_p*E_p*dnm);
+            dF2_dtau += w*zeta*zeta*(-deta_dtau/(eta_p*eta_p));
         }
+        F2_c     = F2_c * H_c;
+        dF2_dtau = dF2_dtau * H_c;
 
-        coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
-        tau_b = coeff * U_b;
+        if (it == newton_iters) break;      // outputs are now consistent; take no step
+
+        // ---- the Newton step on F(U_b) = U_b + f(U_b)*F2(f(U_b)) - U_bar ----
+        //
+        //   F'(U_b) = 1 + f'*F2 + f*f'*dF2/dtau_b
+        //
+        // All three terms are non-negative (f, f' >= 0 for a monotone law, F2 > 0,
+        // dF2/dtau_b > 0), so F' >= 1: the root is unique and this needs no safeguarding.
+        // The third term is what the previous block iteration omitted, which made its gain
+        // 1 - F'/R' and let it 2-cycle once F' > 2R' -- see notes/diva_numerics.md 5.2.0.
+        //
+        // F' is built from PRIMALS even when T is dual.  Legitimate for the same reason as
+        // any Newton denominator: by the implicit function theorem the converged root and its
+        // sensitivity do not depend on the step size used to reach them, so an inexact
+        // denominator costs iterations, never accuracy.  The residual F itself is typed T, so
+        // the seeded derivative propagates exactly.
+        DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},diva_primal(beta_grounded),diva_primal(m),u_reg,water_drag,diva_primal(u_c_c),sliding_law);
+        DualFloat fs = cs * DualFloat{diva_primal(U_b),1.0f};
+        float F2_p = diva_primal(F2_c);
+        float Fp   = 1.0f + fs.d*F2_p + fs.v*fs.d*dF2_dtau;
+
+        T F = U_b + coeff*U_b*F2_c - U_bar;
+        U_b = fmaxf(U_b - F/Fp, 0.0f);
     }
 
     eta_bar_out  = eta_avg;

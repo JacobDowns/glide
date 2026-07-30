@@ -179,16 +179,16 @@ $\zeta=0$ is the surface, $\zeta=1$ the bed. **No 3-D array is stored**: the loo
 
 ```         
 U_b <- stored u_b, clamped to [0, U_bar]            (warm start; the root is unique)
-repeat newton_iters (8) + 1:                        NEWTON on F(U_b) = 0
+repeat until converged, cap 20:                     NEWTON on F(U_b) = 0
     tau_b = c(U_b)*U_b
     for k in 0..N_sigma-1:                          the vertical quadrature
         eta_k <- min(shear-free, shear-dominated) asymptote     (both overestimate)
-        repeat eta_iters (3):                       NEWTON on eta = G(eta)
+        repeat until converged, cap 10:             NEWTON on eta = G(eta)
             s = k_shear/eta_k^2;  E = eps_mem^2 + eps_reg + s
             G = 0.5*B*E^((1-n)/2n);  G' = -2p*(s/E)*(G/eta_k)
             eta_k -= (eta_k - G)/(1 - G')
         accumulate eta_bar, F2, and dF2/dtau_b
-    (last trip stops here: the outputs are now consistent with the final U_b)
+    (breaks only right after a quadrature, so the outputs match the final U_b)
     F  = U_b + c(U_b)*U_b*F2 - U_bar
     F' = 1 + f'*F2 + f*f'*dF2/dtau_b                the FULL slope -- see 5.2.0
     U_b = max(U_b - F/F', 0)
@@ -200,7 +200,7 @@ outer "coupling" iteration; an earlier version had one and it 2-cycled (§5.2.0)
 
 Design choices worth reviewing:
 
-- **Fixed iteration counts, no convergence test.** Uniform cost per thread and no warp divergence. The counts are chosen to CONVERGE from a cold start, not sized by a scaling argument and left for the outer iteration to absorb -- that reasoning is what produced both defects in §5.2.0 and §5.2.1. `newton_iters = 8` because the cold start under-estimates $F_2$ badly enough that the first step overshoots; `eta_iters = 3` because the two-sided asymptotic guess starts close. Both are pinned by `diva_closure_test` checks 5 and 6, from cold.
+- **Adaptive iteration counts with caps, not fixed counts.** See §5.2.3 -- fixed counts sized by a scaling argument are what let both closure defects hide, and a count validated at $n=3$ was silently wrong at $n=4$.
 - **Only interior (non-halo) threads write.** `u_b` is read in place as the warm start, so each cell must have exactly one writer or the result would depend on block scheduling. This is what makes the kernel deterministic.
 - **Grounding is folded into `beta_eff` here** (via $\beta\cdot\phi$). The momentum kernels must therefore *not* apply the grounded factor again — unlike the SSA basal stencils, which do it internally. This asymmetry is deliberate and is the thing most likely to be mis-edited later; `tests/diva_residual_test.py` pins it.
 
@@ -265,7 +265,8 @@ the thing that was under suspicion — from a single COLD call, in the regimes t
 | 2.0  | 4.2e-07 | 3.9e-07 | 2.1e-07 | 5.9e-07 |
 
 and repeated calls now agree exactly, where the block iteration sat in a stable 2-cycle. Cost:
-DIVA went from ~11% more expensive than SSA to **12.5%**.
+DIVA went from ~11% more expensive than SSA to 12.5%, and to **13.8%** once the iteration counts
+became adaptive (§5.2.3).
 
 One trap worth recording. `newton_iters` was first left at 4, and the result *looked* converged --
 repeated calls were idempotent -- while sitting at a non-root, $U_b$ 53% high at $\beta=2$. That
@@ -534,6 +535,55 @@ bisection, and check 6 asserts idempotence.
   by `diva_closure_test` check 1. So nothing to change — but worth knowing before comparing any
   frozen-bed result against a published figure, in case the figure used (42).
 
+### 5.2.3 Adaptive iteration, and the three things it took to get right
+
+Both nested solves now run to a tolerance with a cap, rather than a fixed count. The motivation is
+Jake's, and it is the standing directive applied to iteration counts: a fixed count is an
+assumption that holds in the regimes you tested, a tolerance is a guarantee. Both defects above
+were silent, and an adaptive loop would have exposed each of them immediately.
+
+Three things had to be right, and only the first was obvious.
+
+**1. Non-convergence must be observable.** An adaptive loop that silently caps is *worse* than a
+fixed count, because it looks converged. So `diva_coeffs_cell` returns a per-cell `cap_flags`
+bitmask, `compute_diva_coeffs` writes it, and the solver reports any nonzero count next to
+$|r_{U_b}|$. `diva_closure_test` asserts it is zero across its whole matrix. This earned its keep
+within minutes of being added: it immediately flagged that at $n=4$ the per-level solve was
+hitting its cap in every cell.
+
+**2. Terminate on stagnation, not only on a tolerance.** These kernels use `__powf` under
+`--use_fast_math`, so $G(\eta)$ carries a few ulp of error and the Newton correction does not go
+to zero -- it enters a limit cycle. Measured at $n=4$, the relative step alternates
+2.1e-7 / 4.3e-7 indefinitely. A pure tolerance therefore has to be tuned *above* a floor that is
+itself parameter-dependent, which is the same kind of tested-regime number the whole exercise is
+meant to eliminate. Accepting "the correction stopped decreasing" is floor-agnostic. It is armed
+only once the correction is already below 1e-4 relative, so an early non-monotone step from a poor
+start cannot trip it.
+
+**3. The criterion is on the value, but the ADJOINT needs the derivative converged too.** This was
+the flagged risk that turned out to be real. Breaking the instant the primal criterion fires
+leaves the seeded `.d` one step stale, and the DIVA JVP degraded against finite differences from
+2.3e-4 to **2.3e-3** while the SSA control sat unchanged at 2.33e-4 -- the localisation that says
+it is DIVA's derivative, not the harness.
+
+The fix is one extra iteration after the criterion fires, and it is exact rather than a safety
+margin. The Newton map $N$ has $N'(\text{root}) = 0$, so once the value sits at the root a further
+step leaves it there while replacing the derivative with $\mathrm{d}(\text{root})/\mathrm{d}(\text{seed})$
+exactly. With it, JVP vs FD is back to 2.352e-4 and the dot-product identity to 3.75e-7.
+
+**Cost, and a prediction that was wrong.** I predicted adaptivity would take DIVA from 12.5% over
+SSA back to ~11%, reasoning that the closure loop would drop from 8 iterations to 1--2 when
+warm-started (which it does -- $|r_{U_b}| \approx 2$e-8 between refreshes means the warm start is
+essentially at the root). It went to **13.8%** instead. The reason is instructive: the $\eta$ loop
+now does *more* work than its fixed 3, because 3 was under-converged. The saving on one loop was
+more than offset by the other loop finally doing the work it should always have done. The old
+number was partly cheap because it was wrong.
+
+Measured worst cases, now known rather than assumed: the deepest $\sigma$ level at $n=4$ needs 7--8
+$\eta$ iterations (the old fixed 3 left it at **2.8e-3** relative error), and the cold-start closure
+Newton needs more than 12 at $n=4$, $\beta=2$. Typical counts are far lower -- most levels exit at
+2--5, and a warm-started closure exits at 1--2.
+
 ### 5.2.2 Methodology note: how this was found
 
 Worth recording, because the finding was a by-product rather than the object of a search, and the
@@ -685,7 +735,7 @@ The closure path enters only through `Ū_c = |ū_c|`, which `compute_diva_coeffs
 
 Done and verified (see `tests/` for each):
 
-- **The forward model.** Converges as well as SSA, **12.5%** more expensive, consistent across multigrid depths. SSA is bit-identical with `stress_balance = 0`.
+- **The forward model.** Converges as well as SSA, **13.8%** more expensive, consistent across multigrid depths. SSA is bit-identical with `stress_balance = 0`.
 
 - **The closure solves properly.** Both nested root problems are Newton with the full slope: the per-level viscosity (§5.2.1) and the $U_b$ partition (§5.2.0). Verified against roots found by bisection from a cold start, agreement 5e-7, in the regimes where the previous block iteration 2-cycled. `diva_closure_test` checks 5 and 6 pin it; the closure residual $|r_{U_b}|/|\bar U|$ is reported every V-cycle (§5.2.0a) and reads ~2e-8.
 

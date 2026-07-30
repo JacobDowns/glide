@@ -46,30 +46,31 @@ void deriv_probe(const float* eps, const float* Ubar, const float* beta,
     if (i >= n) return;
     float e = eps[i], U = Ubar[i], bg = beta[i], u_c_c = u_cs[i], m = ms[i];
 
+    int cap = 0;
     float eta_f, F2_f, Ub_f, be_f;
     diva_coeffs_cell<float>(e, U, H_c,B_c,bg,u_c_c, m,u_reg,wd,law,
-                            glen_exp,eps_reg,n_sigma,U_b_warm, eta_f,F2_f,Ub_f,be_f);
+                            glen_exp,eps_reg,n_sigma,U_b_warm, eta_f,F2_f,Ub_f,be_f, cap);
     eta_v[i]=eta_f; be_v[i]=be_f;
 
     DualFloat a,b,c,d;
     diva_coeffs_cell<DualFloat>({e,1.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
     deta_deps[i]=a.d; dbe_deps[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,1.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
     deta_dU[i]=a.d; dbe_dU[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,1.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
     deta_dbeta[i]=a.d; dbe_dbeta[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,1.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
     deta_duc[i]=a.d; dbe_duc[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,1.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d);
+                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
     deta_dm[i]=a.d; dbe_dm[i]=d.d;
 }
 '''

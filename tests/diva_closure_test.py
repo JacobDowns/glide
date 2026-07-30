@@ -14,6 +14,10 @@ value known independently rather than against a stored regression:
                     so only interior threads may write it).
   5. shear-dominated -- eta_bar, F2 and u_b against the TRUE root of the closure, found by
                     bisection in float64 with the per-level viscosity solved to convergence.
+                    Run at n = 3 AND n = 4: the per-level contraction bound is (n-1)/n, so the
+                    larger exponent is genuinely harder, and everything here was originally
+                    validated at n = 3 only. Also asserts no cell hit an iteration cap, since
+                    an adaptive loop that caps silently looks converged.
   6. idempotence -- repeated calls must agree, which an unconverged closure does not. This is the check the first four
                     miss: check 1 sets tau_b = 0, where the per-level solve is exact in one
                     step, and checks 2-3 validate the Newton against the COMPUTED F2, so they
@@ -43,7 +47,7 @@ GLEN_N = 3.0
 U_REG = 1e-12    # negligible, so f(U) is the clean law
 
 
-def build():
+def build(glen_n=GLEN_N):
     """Uniform-flow state: all membrane strain rates vanish identically."""
     mg = Multigrid(2, ny=ny, nx=nx, dx=dx)
     mg.state.u.set(cp.full((ny, nx + 1), U0, dtype=cp.float32))
@@ -51,7 +55,7 @@ def build():
     mg.state.H.set(cp.full((ny, nx), H0, dtype=cp.float32))
     mg.state.phi.set(cp.ones((ny, nx), dtype=cp.float32))        # fully grounded
     mg.rheology.B.set(cp.full((ny, nx), B0, dtype=cp.float32))
-    mg.rheology.n.set(GLEN_N)
+    mg.rheology.n.set(glen_n)
     mg.rheology.eps_reg.set(EPS_REG)
     mg.rheology.n_sigma.set(float(N_SIGMA))
     mg.sliding.u_reg.set(U_REG)
@@ -134,16 +138,28 @@ def check_shear_dominated(glen_exp):
     warm start from a previous one.
     """
     worst = 0.0
-    for beta in (0.02, 0.1, 0.5, 2.0):
-        mg = build()
+    # Both Glen exponents in use.  n matters here and not only cosmetically: the per-level
+    # solve's contraction bound is (n-1)/n, so n = 4 is materially harder than n = 3 (0.75 vs
+    # 0.67), and the shear-dominated asymptotic guess carries an n in its exponent.  Everything
+    # was originally validated at n = 3 only.
+    for glen_n in (3.0, 4.0):
+      glen_exp = (1.0 - glen_n) / (2.0 * glen_n)
+      for beta in (0.02, 0.1, 0.5, 2.0):
+        mg = build(glen_n)
         mg.sliding.beta.set(cp.full((ny, nx), beta, dtype=cp.float32))
         eta_bar, F2, u_b, _ = coeffs(mg)
         eta_ref, F2_ref, u_b_ref = reference_closure(beta, glen_exp)
         d_eta = abs(eta_bar - eta_ref) / eta_ref
         d_F2 = abs(F2 - F2_ref) / F2_ref
         d_ub = abs(u_b - u_b_ref) / max(abs(u_b_ref), 1e-30)
-        print(f"[shear]     beta = {beta:<5g} eta_bar err = {d_eta:.2e}   "
-              f"F2 err = {d_F2:.2e}   u_b err = {d_ub:.2e}")
+        n_cl, n_eta = mg.levels[0].forward_operators.diva_cap_counts()
+        print(f"[shear]     n = {glen_n:g}  beta = {beta:<5g} eta_bar err = {d_eta:.2e}   "
+              f"F2 err = {d_F2:.2e}   u_b err = {d_ub:.2e}   capped = {n_cl}/{n_eta}")
+        # An adaptive loop that hits its backstop looks converged.  Assert it did not.
+        assert n_cl == 0 and n_eta == 0, (
+            f"n={glen_n} beta={beta}: local solves hit their iteration cap "
+            f"(closure {n_cl} cells, eta {n_eta} cells) -- the coefficients there are not "
+            f"converged")
         worst = max(worst, d_eta, d_F2, d_ub)
     assert worst < 1e-4, (
         f"closure does not reach the true root: worst relative error {worst:.2e}. "

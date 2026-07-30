@@ -122,7 +122,8 @@ __device__ void diva_coeffs_cell(
     T m, float u_reg, float water_drag, float sliding_law,
     float glen_exp, float eps_reg, int n_sigma,
     float U_b_warm,
-    T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out)
+    T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out,
+    int& cap_flags_out)          // bit 0: closure Newton hit its cap; bit 1: an eta solve did
 {
     // WHAT THIS SOLVES.  The 2-D momentum operator (Goldberg eq 43-44) is SSA's, and needs
     // two coefficients per cell -- eta_bar and beta_eff -- but all the momentum solve can
@@ -173,14 +174,47 @@ __device__ void diva_coeffs_cell(
     // root and its sensitivity are independent of the step size used to reach them, so an
     // inexact denominator costs iterations, never accuracy.  A term dropped from a RESIDUAL
     // has no such licence, which is why the deficiency above is worth fixing and this is not.
-    const int eta_iters = 3;
-    // 8, not 4.  Newton is quadratic near the root but the COLD start (U_b = 0, hence
-    // tau_b = 0, hence F2 at its shear-free minimum) badly under-estimates F2 at the root, so
-    // the first step overshoots and it takes ~6 to recover.  Measured from cold: 4 steps leave
-    // U_b 53% high at beta = 2; 8 reach |F|/U_bar ~ 1e-6.  Warm-started -- which is every call
-    // after the first, since u_b persists -- 2 to 3 would do, but the count has to cover the
-    // cold case or the first refresh of a run is silently wrong.
-    const int newton_iters = 8;
+    // ADAPTIVE, with caps.  Both loops run to a tolerance and stop; the caps are backstops,
+    // not the operating count.  Fixed counts were what let both of this file's bugs hide: a
+    // count sized by a scaling argument is an assumption that holds in the regimes you tested,
+    // and neither failure announced itself.  A tolerance is a guarantee -- but ONLY if failing
+    // to reach it is visible, hence cap_flags_out.  A loop that silently caps is worse than a
+    // fixed count, because it looks converged.
+    //
+    // The caps are generous because they are almost never reached.  Cold (U_b = 0, so tau_b = 0,
+    // so F2 at its shear-free minimum) the first closure step overshoots badly and it takes ~8
+    // to recover; warm-started -- every call after the first, since u_b persists -- the velocity
+    // has moved the closure by ~2e-8 relative (the |r_Ub| diagnostic) so 1 or 2 steps suffice.
+    // Caps sized so the HARDEST level converges, not the typical one -- the adaptivity means
+    // easy levels cost what they cost.  Measured worst case is the deepest sigma level at
+    // n = 4, which needs 7 to 8; most levels exit at 2 to 5.  (The old fixed count of 3 left
+    // that level at 2.8e-3 relative error -- another count validated at n = 3 only.)
+    const int eta_iters_max    = 10;
+    const int newton_iters_max = 20;
+    // Convergence is accepted on EITHER a tolerance or STAGNATION -- the correction having
+    // stopped decreasing, which in float32 is what convergence actually looks like.  These
+    // kernels use __powf under --use_fast_math, so G(eta) carries a few ulp of error and the
+    // Newton correction bottoms out in a limit cycle rather than going to zero: measured at
+    // n = 4, the relative step alternates 2.1e-7 / 4.3e-7 forever.  A pure tolerance would
+    // then have to be tuned above that floor, which is a number validated on the cases we
+    // happened to probe -- exactly the kind of assumption that hid the earlier defects.
+    // Stagnation is floor-agnostic and needs no such number.
+    //
+    // The stagnation test is armed only once the correction is already small (below
+    // near_tol), so an early non-monotone step from a poor start cannot trip it.
+    //
+    // BOTH loops take exactly ONE MORE iteration after their criterion fires, because the
+    // criterion is on the PRIMAL and the seeded derivative rides one step behind it.  That is
+    // not a fudge, it is the structure of Newton: the Newton map N has N'(root) = 0, so once
+    // the value sits at the root a further step leaves it there while replacing the derivative
+    // with d(root)/d(seed) exactly.  Breaking the instant the primal converges leaves .d one
+    // step stale, which showed up as the DIVA JVP degrading against finite differences from
+    // 2.3e-4 to 2.3e-3 while the SSA control was untouched.
+    const float eta_tol     = 1e-7f;    // on the relative Newton step in eta
+    const float closure_tol = 1e-7f;    // on |F| relative to the velocity scale
+    const float near_tol    = 1e-4f;    // arm stagnation detection below this
+
+    cap_flags_out = 0;
 
     float w = 1.0f/(float)n_sigma;
 
@@ -192,11 +226,16 @@ __device__ void diva_coeffs_cell(
     T F2_c = T();
 
     // TRUE Newton on F(U_b) = 0.  The quadrature is INSIDE the loop because F2 depends on
-    // U_b -- there is no separate coupling iteration to lag it.  The extra trip
-    // (it == newton_iters) takes no step; it only re-evaluates the quadrature at the final
-    // U_b so eta_bar, F2 and beta_eff are mutually consistent on output.  Without it the
-    // coefficients would lag the basal speed by one iteration.
-    for (int it = 0; it <= newton_iters; ++it) {
+    // U_b -- there is no separate coupling iteration to lag it.
+    //
+    // The loop always breaks immediately AFTER a quadrature, never after a step, so eta_bar,
+    // F2 and beta_eff are always mutually consistent with the U_b returned.  Breaking after a
+    // step would leave the coefficients lagging the basal speed by one iteration.
+    int newton_used = 0;
+    bool closure_ok = false;
+    bool closure_primal_ok = false;
+    float closure_prev = 3.4e38f;
+    for (int it = 0; ; ++it) {
         coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
         tau_b = coeff * U_b;
 
@@ -247,14 +286,27 @@ __device__ void diva_coeffs_cell(
                                      1.0f/(1.0f + 2.0f*glen_exp));
                 eta_k = fminf(eta_k, eta_shear);
             }
-            for (int e = 0; e < eta_iters; ++e) {
+            bool eta_ok = false;
+            bool eta_primal_ok = false;
+            float eta_prev_step = 3.4e38f;
+            for (int e = 0; e < eta_iters_max; ++e) {
                 T s_sh = k_shear/(eta_k*eta_k);           // s = k/eta^2
                 T E_sh = A_mem + s_sh;                    // E = A + s
                 T G_of = 0.5f*B_c*__powf(E_sh, glen_exp); // G(eta)
                 // G'(eta) = -2p * (s/E) * G(eta)/eta   (exact, not the at-the-root form)
                 T Gp = (-2.0f*glen_exp)*(s_sh/E_sh)*(G_of/eta_k);
-                eta_k = eta_k - (eta_k - G_of)/(1.0f - Gp);
+                T step = (eta_k - G_of)/(1.0f - Gp);
+                eta_k = eta_k - step;
+                // Relative, so the criterion does not depend on the scale of eta -- which spans
+                // four orders of magnitude across depth and stiffness.
+                float rel = fabsf(diva_primal(step))/fmaxf(fabsf(diva_primal(eta_k)), 1e-30f);
+                if (eta_primal_ok) { eta_ok = true; break; }   // this was the derivative's pass
+                if (rel <= eta_tol || (rel < near_tol && rel >= eta_prev_step)) {
+                    eta_primal_ok = true;
+                }
+                eta_prev_step = rel;
             }
+            if (!eta_ok) cap_flags_out |= 2;
 
             eta_avg = eta_avg + w*eta_k;
             F2_c    = F2_c + w*zeta*zeta/eta_k;
@@ -281,7 +333,19 @@ __device__ void diva_coeffs_cell(
         F2_c     = F2_c * H_c;
         dF2_dtau = dF2_dtau * H_c;
 
-        if (it == newton_iters) break;      // outputs are now consistent; take no step
+        // The closure residual at the CURRENT U_b, scaled by a velocity that cannot vanish
+        // (U_bar is zero in stagnant and ice-free cells).  u_reg has units of velocity^2, so
+        // its square root is the natural floor.
+        T F = U_b + coeff*U_b*F2_c - U_bar;
+        float F_scale = diva_primal(U_bar) + sqrtf(u_reg);
+        float F_rel = fabsf(diva_primal(F))/F_scale;
+        newton_used = it;
+        if (closure_primal_ok) { closure_ok = true; break; }   // the derivative's pass
+        if (F_rel <= closure_tol || (F_rel < near_tol && F_rel >= closure_prev)) {
+            closure_primal_ok = true;
+        }
+        closure_prev = F_rel;
+        if (it >= newton_iters_max) break;
 
         // ---- the Newton step on F(U_b) = U_b + f(U_b)*F2(f(U_b)) - U_bar ----
         //
@@ -302,9 +366,9 @@ __device__ void diva_coeffs_cell(
         float F2_p = diva_primal(F2_c);
         float Fp   = 1.0f + fs.d*F2_p + fs.v*fs.d*dF2_dtau;
 
-        T F = U_b + coeff*U_b*F2_c - U_bar;
         U_b = fmaxf(U_b - F/Fp, 0.0f);
     }
+    if (!closure_ok) cap_flags_out |= 1;
 
     eta_bar_out  = eta_avg;
     F2_out       = F2_c;
@@ -361,12 +425,13 @@ __device__ void populate_diva_coeffs_dual(
     float U_b_warm = fminf(fmaxf(get_cell(u_b, i, j, ny, nx), 0.0f), U_bar.v);
 
     DualFloat eta_d, F2_d, U_b_d, beta_eff_d;
+    int cap_sink = 0;      // the diagnostic path (compute_diva_coeffs) owns cap reporting
     diva_coeffs_cell<DualFloat>(eps_mem_sq, U_bar,
             H_c, B_c, DualFloat{beta_grounded, 0.0f}, DualFloat{u_c_c, 0.0f},
             DualFloat{m, 0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma,
             U_b_warm,
-            eta_d, F2_d, U_b_d, beta_eff_d);
+            eta_d, F2_d, U_b_d, beta_eff_d, cap_sink);
 
     eta_local[bi][bj] = eta_d;
     beta_eff_local[bi][bj] = beta_eff_d;
@@ -378,6 +443,7 @@ void compute_diva_coeffs(
     float* __restrict__ F2,
     float* __restrict__ u_b,
     float* __restrict__ beta_eff,
+    float* __restrict__ cap_flags,     // per-cell: which local solve failed to reach tolerance
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
@@ -433,12 +499,13 @@ void compute_diva_coeffs(
     float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar);
 
     float eta_avg, F2_c, U_b, beta_eff_c;
+    int caps = 0;
     diva_coeffs_cell<float>(eps_mem_sq, U_bar,
             H_c, B_c, beta_grounded, u_c_c,
             m, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma,
             U_b_warm,
-            eta_avg, F2_c, U_b, beta_eff_c);
+            eta_avg, F2_c, U_b, beta_eff_c, caps);
 
     if (is_active) {
         eta_bar[idx] = eta_avg;
@@ -447,6 +514,10 @@ void compute_diva_coeffs(
         // Goldberg eq 41: the secant drag the 2D momentum solve sees, tau_b = beta_eff*U_bar.
         // Strictly non-negative, and finite at rest (no division by the speed).
         beta_eff[idx] = beta_eff_c;
+        // Non-convergence must be OBSERVABLE.  A loop that silently caps looks converged, and
+        // that is exactly how the two earlier closure defects survived.  The caller reduces
+        // this and reports it alongside |r_Ub|.
+        cap_flags[idx] = (float)caps;
     }
 }
 
@@ -592,13 +663,14 @@ void compute_diva_derivs(
     float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar_v);
 
     DualFloat eta_d, F2_d, U_b_d, be_d;
+    int cap_sink = 0;      // derivative path; compute_diva_coeffs owns cap reporting
 
     // Seed 1: d/d(eps_mem^2)
     diva_coeffs_cell<DualFloat>({eps_mem_v,1.0f}, {U_bar_v,0.0f},
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d);
+            eta_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_deps = eta_d.d;
     float d_be_deps  = be_d.d;
 
@@ -607,7 +679,7 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d);
+            eta_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_dU = eta_d.d;
     float d_be_dU  = be_d.d;
 
@@ -620,7 +692,7 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,grounded}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d);
+            eta_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_dbeta = eta_d.d;
     float d_be_dbeta  = be_d.d;
 
@@ -630,7 +702,7 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,1.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d);
+            eta_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_duc = eta_d.d;
     float d_be_duc  = be_d.d;
 
@@ -642,7 +714,7 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,1.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d);
+            eta_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_dm = eta_d.d;
     float d_be_dm  = be_d.d;
 

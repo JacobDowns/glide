@@ -645,6 +645,12 @@ class FASCDSolver:
                 # (notes/open_questions.md Q6).
                 if r_ub is not None:
                     line += f", |r_Ub|/|Ubar| = {float(r_ub)/max(float(u_bar),1e-30):.2e}"
+                    # Any cell whose local solve hit its iteration backstop.  Silent by
+                    # construction otherwise, which is the failure mode adaptivity is meant to
+                    # remove rather than relocate.
+                    n_cl, n_eta = start_level_.forward_operators.diva_cap_counts()
+                    if n_cl or n_eta:
+                        line += f", CAPPED closure={n_cl} eta={n_eta}"
                 print(line)
             iteration += 1
 

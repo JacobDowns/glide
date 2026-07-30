@@ -53,9 +53,10 @@ class ForwardOperators:
         self._jvp_v = None
         self._jvp_H = None
 
-        # DIVA closure-residual diagnostics, allocated on first use
+        # DIVA closure diagnostics, allocated on first use
         self._r_ub = None
         self._u_bar = None
+        self._diva_caps = None
 
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
@@ -209,6 +210,8 @@ class ForwardOperators:
         path never calls this."""
         kernel = self.kernels.get_function('compute_diva_coeffs')
         grid_size, block_size, stride, halo = self._kernel_config
+        if self._diva_caps is None:
+            self._diva_caps = cp.zeros((self.grid.ny, self.grid.nx), dtype=cp.float32)
 
         grid = self.grid
         state = grid.state
@@ -217,7 +220,7 @@ class ForwardOperators:
 
         kernel(grid_size, block_size,
                    (rheology.eta_bar.data, rheology.F2.data, state.u_b.data,
-                    sliding.beta_eff.data,
+                    sliding.beta_eff.data, self._diva_caps,
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data,
                     sliding.m.value, sliding.u_reg.value,
@@ -259,6 +262,20 @@ class ForwardOperators:
                 sliding.water_drag.value, sliding.sliding_law.value,
                 grid.ny, grid.nx, stride, halo))
         return cp.linalg.norm(self._r_ub), cp.linalg.norm(self._u_bar)
+
+    def diva_cap_counts(self):
+        """How many cells failed to reach tolerance in the local closure solves.
+
+        Returns (closure_capped, eta_capped) as cell counts.  Both should be zero; a nonzero
+        value means an adaptive loop hit its backstop and the coefficients in those cells are
+        not converged.  Exists because an adaptive loop that silently caps is worse than a
+        fixed count -- it looks converged, which is how the two earlier closure defects
+        survived undetected."""
+        if self._diva_caps is None:
+            return 0, 0
+        flags = self._diva_caps
+        return int(cp.count_nonzero(cp.mod(flags, 2.0) >= 0.5)), \
+               int(cp.count_nonzero(flags >= 2.0))
 
     def compute_diva_derivs(self):
         """Total derivatives of the cell-local DIVA closure, one dual seeding per input:

@@ -20,24 +20,14 @@
 
      F(U_b) = U_b + f(U_b)*F2( f(U_b) ) - U_bar = 0.
 
-  Note F2 depends on U_b too, through tau_b -- more drag, more shear, thinner ice,
-  larger F2 -- so this is a genuine root find for EVERY sliding law, linear included.
-  (It would invert in closed form only with F2 held frozen, which is what an earlier
-  version did and why it misbehaved; see diva_coeffs_cell.)  It is cell-local:
-  Goldberg's eqs 38-39, "solved at a location along the base independently of other
-  locations".
+  F2 depends on U_b through tau_b -- more drag, more shear, thinner ice, larger F2 --
+  so this is a genuine root find for every sliding law, linear included.  It is
+  cell-local: Goldberg's eqs 38-39, "solved at a location along the base independently
+  of other locations".  No spatial coupling, so no multigrid transfer is involved, and
+  nothing in this file is reached unless stress_balance = 1.
 
-  It is well behaved.  The slope is
-
-     F'(U_b) = 1 + f'(U_b)*F2 + f(U_b)*f'(U_b)*dF2/dtau_b
-
-  and every term is non-negative -- monotone laws give f, f' >= 0, F2 > 0, and
-  dF2/dtau_b > 0 by the shear-thinning argument above -- so F' >= 1, F is strictly
-  increasing and the root is unique.  Do not be tempted to quote just the first two
-  terms: dropping the third is exactly the defect that made this 2-cycle.
-
-  Everything here is cell-local -- no spatial coupling -- so no multigrid transfer
-  is involved.  Nothing in this file is reached unless stress_balance = 1.
+  The full derivation, the convergence analysis and the measurements behind the
+  iteration counts are in notes/diva_numerics.md sections 5.2.0 to 5.2.3.
   ==================================================*/
 
 // Thin wrappers over membrane_eps_sq<T> (viscosity.cu), which is the single definition of
@@ -125,94 +115,63 @@ __device__ void diva_coeffs_cell(
     T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out,
     int& cap_flags_out)          // bit 0: closure Newton hit its cap; bit 1: an eta solve did
 {
-    // WHAT THIS SOLVES.  The 2-D momentum operator (Goldberg eq 43-44) is SSA's, and needs
-    // two coefficients per cell -- eta_bar and beta_eff -- but all the momentum solve can
-    // supply is the depth-averaged speed U_bar.  This function inverts that: given U_bar,
-    // produce the two coefficients.
+    // Given U_bar, produce the two coefficients the momentum operator needs.  One unknown --
+    // how much of U_bar is sliding rather than internal deformation -- fixed by
     //
-    // THE UNKNOWN is a single scalar: how much of U_bar is SLIDING rather than internal
-    // deformation.  Call it U_b.  The constraint fixing it is Goldberg eq 34,
-    //
-    //     F(U_b) = U_b + f(U_b)*F2( f(U_b) ) - U_bar = 0
+    //     F(U_b) = U_b + f(U_b)*F2( f(U_b) ) - U_bar = 0        (Goldberg eq 34)
     //              ^^^^   ^^^^^^^^^^^^^^^^^
     //            sliding      deformation
     //
-    // where f is the sliding law (tau_b = f(U_b) = c(U_b)*U_b) and F2 = H*int zeta^2/eta
-    // is the vertical shear integral -- Goldberg's omega/H.  Once U_b is known BOTH outputs
-    // are formulas:
+    // with f the sliding law (tau_b = f(U_b) = c(U_b)*U_b) and F2 = H*int zeta^2/eta the
+    // vertical shear integral (his omega/H).  Both outputs then follow:
     //
-    //     eta_bar  = int eta(zeta) dzeta          (the depth average)
-    //     beta_eff = c(U_b)/(1 + c(U_b)*F2)       (eq 41)
+    //     eta_bar  = int eta(zeta) dzeta
+    //     beta_eff = c(U_b)/(1 + c(U_b)*F2)                     (eq 41)
     //
-    // It is not a closed form because F2 depends on U_b: more basal drag means more vertical
-    // shear, which thins the ice, which raises F2.  Hence the iteration.
-    //
-    // METHOD: Newton on F, with the true slope
+    // Newton on F, with the FULL slope
     //
     //     F'(U_b) = 1 + f'*F2 + f*f' * dF2/dtau_b
     //
-    // Every term is non-negative -- f, f' >= 0 for a monotone sliding law, F2 > 0, and
-    // dF2/dtau_b > 0 because more drag means more shear means thinner ice -- so F' >= 1.  The
-    // root is therefore unique and the iteration needs no safeguarding or relaxation.
+    // Every term is non-negative (monotone law => f, f' >= 0; F2 > 0; dF2/dtau_b > 0 because
+    // more drag means more shear means thinner ice), so F' >= 1: the root is unique and no
+    // safeguarding or relaxation is needed.  All three terms matter -- dropping the third
+    // makes the iteration 2-cycle at high basal drag (notes/diva_numerics.md 5.2.0).
     //
-    //   newton_iters     solve F(U_b) = 0
-    //     n_sigma loop   midpoint quadrature forming eta_bar, F2 and dF2/dtau_b -- a sum
-    //       eta_iters    per level, solve Glen's law against the shear ansatz for eta
-    //                    (a scalar root problem; Newton -- see the note at that loop)
+    //   closure Newton   solve F(U_b) = 0
+    //     n_sigma loop   quadrature for eta_bar, F2 and dF2/dtau_b -- a sum, not a solve
+    //       eta Newton   per level, eta against the shear ansatz (see that loop)
     //
-    // The quadrature sits INSIDE the Newton loop because F2 depends on U_b.  There is
-    // deliberately no outer 'coupling' iteration: an earlier version froze F2 during the
-    // closure Newton and refreshed it outside, which drops the third term of F' above.  That
-    // makes the scheme block Gauss-Seidel with gain exactly (1 - F'/R'), where
-    // R' = 1 + f'*F2, so it 2-CYCLED once F' > 2R' -- reachable at ordinary Greenland basal
-    // stresses, and only ~1.4% away from it in the configurations we happened to test.  See
-    // notes/diva_numerics.md 5.2.0.
+    // The quadrature sits inside the Newton loop because F2 depends on U_b.
     //
-    // Shared by compute_diva_coeffs (T = float) and the JVP/derivative kernels (T =
-    // DualFloat).  Note the Newton denominator dR stays a plain float even when T is dual.
-    // That is deliberate and costs nothing: by the implicit function theorem the converged
-    // root and its sensitivity are independent of the step size used to reach them, so an
-    // inexact denominator costs iterations, never accuracy.  A term dropped from a RESIDUAL
-    // has no such licence, which is why the deficiency above is worth fixing and this is not.
-    // ADAPTIVE, with caps.  Both loops run to a tolerance and stop; the caps are backstops,
-    // not the operating count.  Fixed counts were what let both of this file's bugs hide: a
-    // count sized by a scaling argument is an assumption that holds in the regimes you tested,
-    // and neither failure announced itself.  A tolerance is a guarantee -- but ONLY if failing
-    // to reach it is visible, hence cap_flags_out.  A loop that silently caps is worse than a
-    // fixed count, because it looks converged.
-    //
-    // The caps are generous because they are almost never reached.  Cold (U_b = 0, so tau_b = 0,
-    // so F2 at its shear-free minimum) the first closure step overshoots badly and it takes ~8
-    // to recover; warm-started -- every call after the first, since u_b persists -- the velocity
-    // has moved the closure by ~2e-8 relative (the |r_Ub| diagnostic) so 1 or 2 steps suffice.
-    // Caps sized so the HARDEST level converges, not the typical one -- the adaptivity means
-    // easy levels cost what they cost.  Measured worst case is the deepest sigma level at
-    // n = 4, which needs 7 to 8; most levels exit at 2 to 5.  (The old fixed count of 3 left
-    // that level at 2.8e-3 relative error -- another count validated at n = 3 only.)
+    // Shared by compute_diva_coeffs (T = float) and the JVP/derivative kernels
+    // (T = DualFloat).  Newton DENOMINATORS are taken from primals even when T is dual: by the
+    // implicit function theorem the converged root and its sensitivity do not depend on the
+    // step size used to reach them, so an inexact denominator costs iterations, never
+    // accuracy.  A term dropped from a residual has no such licence.
+    // Both loops are ADAPTIVE: they run to a tolerance and stop, with the counts below as
+    // backstops rather than the operating cost.  Typical usage is far lower -- most sigma
+    // levels exit in 2 to 5, and a warm-started closure in 1 to 2.
     const int eta_iters_max    = 10;
     const int newton_iters_max = 20;
-    // Convergence is accepted on EITHER a tolerance or STAGNATION -- the correction having
-    // stopped decreasing, which in float32 is what convergence actually looks like.  These
-    // kernels use __powf under --use_fast_math, so G(eta) carries a few ulp of error and the
-    // Newton correction bottoms out in a limit cycle rather than going to zero: measured at
-    // n = 4, the relative step alternates 2.1e-7 / 4.3e-7 forever.  A pure tolerance would
-    // then have to be tuned above that floor, which is a number validated on the cases we
-    // happened to probe -- exactly the kind of assumption that hid the earlier defects.
-    // Stagnation is floor-agnostic and needs no such number.
-    //
-    // The stagnation test is armed only once the correction is already small (below
-    // near_tol), so an early non-monotone step from a poor start cannot trip it.
-    //
-    // BOTH loops take exactly ONE MORE iteration after their criterion fires, because the
-    // criterion is on the PRIMAL and the seeded derivative rides one step behind it.  That is
-    // not a fudge, it is the structure of Newton: the Newton map N has N'(root) = 0, so once
-    // the value sits at the root a further step leaves it there while replacing the derivative
-    // with d(root)/d(seed) exactly.  Breaking the instant the primal converges leaves .d one
-    // step stale, which showed up as the DIVA JVP degrading against finite differences from
-    // 2.3e-4 to 2.3e-3 while the SSA control was untouched.
     const float eta_tol     = 1e-7f;    // on the relative Newton step in eta
     const float closure_tol = 1e-7f;    // on |F| relative to the velocity scale
     const float near_tol    = 1e-4f;    // arm stagnation detection below this
+    //
+    // Three properties of the termination that are not obvious, all three necessary:
+    //
+    //  1. Accepted on a tolerance OR on STAGNATION (the correction having stopped
+    //     decreasing).  __powf under --use_fast_math leaves a few ulp in G(eta), so the
+    //     correction bottoms out in a limit cycle instead of reaching zero; a pure tolerance
+    //     would have to be tuned above a parameter-dependent floor.  Armed only below
+    //     near_tol so an early non-monotone step cannot trip it.
+    //
+    //  2. Exactly ONE MORE iteration after the criterion fires.  The criterion is on the
+    //     primal and the seeded derivative rides one step behind it.  Newton's map N has
+    //     N'(root) = 0, so a further step leaves the value at the root while replacing the
+    //     derivative with d(root)/d(seed) exactly.
+    //
+    //  3. Failure to converge is REPORTED, via cap_flags_out.  A loop that silently caps is
+    //     worse than a fixed count, because it looks converged.
 
     cap_flags_out = 0;
 
@@ -225,12 +184,8 @@ __device__ void diva_coeffs_cell(
     T eta_avg = T();
     T F2_c = T();
 
-    // TRUE Newton on F(U_b) = 0.  The quadrature is INSIDE the loop because F2 depends on
-    // U_b -- there is no separate coupling iteration to lag it.
-    //
-    // The loop always breaks immediately AFTER a quadrature, never after a step, so eta_bar,
-    // F2 and beta_eff are always mutually consistent with the U_b returned.  Breaking after a
-    // step would leave the coefficients lagging the basal speed by one iteration.
+    // Breaks only immediately AFTER a quadrature, never after a step, so eta_bar, F2 and
+    // beta_eff are always mutually consistent with the U_b returned.
     int newton_used = 0;
     bool closure_ok = false;
     bool closure_primal_ok = false;
@@ -247,39 +202,32 @@ __device__ void diva_coeffs_cell(
         for (int k = 0; k < n_sigma; ++k) {
             float zeta = ((float)k + 0.5f)*w;
 
-            // ---- per-level viscosity: solve eta = G(eta) by NEWTON, not Picard ----
+            // ---- per-level viscosity ----
             //
-            // Glen's law plus the DIVA shear ansatz eps_xz = tau_b*zeta/(2*eta) give a scalar
-            // fixed point with eta on both sides:
+            // Glen's law plus the DIVA shear ansatz eps_xz = tau_b*zeta/(2*eta) leave eta on
+            // both sides, so it is a scalar root problem per level:
             //
             //   eta = 0.5*B*[ A + k/eta^2 ]^p  =  G(eta),   A = eps_mem^2 + eps_reg,
             //                                               k = (tau_b*zeta/2)^2,  p = glen_exp
             //
-            // Picard (eta <- G(eta)) contracts at |G'| <= 2|p| = (n-1)/n, i.e. 2/3 for n = 3,
-            // which sounds like a licence to take three sweeps.  It is not: the bound is only
-            // approached as the shear term comes to dominate A, which is exactly the regime DIVA
-            // exists for, and there three sweeps from a starting value hundreds of times off the
-            // root left F2 wrong by 16% at the tau_b of our own tests and 53% at ~100 kPa.
-            // See notes/diva_numerics.md 5.2.1 for the measurements.
+            // Solved by Newton on eta - G(eta).  G' lies in (0, 2|p|) subset (0,1), so 1 - G'
+            // is bounded away from zero and the step needs no safeguarding, for any p.
             //
-            // Newton on Phi(eta) = eta - G(eta) instead.  Three reasons over the alternatives:
-            //   * G' lies in (0, 2|p|) subset (0,1), so 1 - G' is bounded away from zero and the
-            //     step needs no safeguarding.
-            //   * G' below holds for any p, so unlike the n = 3 closed form (a depressed cubic,
-            //     8A*eta^3 + 8k*eta - B^3 = 0) there is no special case -- and that closed form
-            //     is unusable here anyway: Cardano's two cube roots nearly cancel when the shear
-            //     dominates, losing three digits in float32 in precisely the regime of interest.
-            //   * It needs no new dual overloads, so the derivative rides along as before.
-            // k must be typed T, not taken from primals: it carries tau_b, which carries the
-            // seeded perturbation, so a primal-only k would silently drop d(eta)/d(tau_b).
+            // For n = 3 this is a depressed cubic, 8A*eta^3 + 8k*eta - B^3 = 0, with a Cardano
+            // solution -- deliberately NOT used: its two cube roots nearly cancel when the
+            // shear dominates and it loses three digits in float32, precisely in the regime of
+            // interest.  See notes/diva_numerics.md 5.2.1.
+            //
+            // k must be typed T, not taken from primals: it carries tau_b, hence the seeded
+            // perturbation, so a primal-only k would silently drop d(eta)/d(tau_b).
             T k_shear = tau_b*(0.5f*zeta);
             k_shear = k_shear*k_shear;
             T A_mem = eps_mem_sq + eps_reg;
 
-            // Start from the smaller of the two asymptotic limits.  Both overestimate, since
-            // dropping either positive term of the cubic inflates eta; taking the min puts the
-            // guess close enough that three Newton steps reach float32 round-off everywhere,
-            // where starting from the shear-free value alone would need six.
+            // Start from the smaller of the two asymptotic limits (shear-free and
+            // shear-dominated).  Both overestimate, since dropping either positive term of the
+            // cubic inflates eta, so the min is the better bracket and roughly halves the
+            // iteration count against using the shear-free value alone.
             T eta_k = 0.5f*B_c*__powf(A_mem, glen_exp);
             if (diva_primal(k_shear) > 0.0f) {
                 T eta_shear = __powf(0.5f*B_c*__powf(k_shear, glen_exp),
@@ -311,18 +259,16 @@ __device__ void diva_coeffs_cell(
             eta_avg = eta_avg + w*eta_k;
             F2_c    = F2_c + w*zeta*zeta/eta_k;
 
-            // d(F2)/d(tau_b), accumulated here because everything it needs is already in
-            // registers.  Differentiating the converged level root eta = G(eta; tau_b) by the
-            // implicit function theorem:
+            // d(F2)/d(tau_b) for the closure Newton's slope, accumulated here because
+            // everything it needs is already in registers.  From the implicit function theorem
+            // on the converged level root eta = G(eta; tau_b):
             //
-            //   d(eta)/d(tau_b) = G_tau / (1 - G_eta),
-            //       G_tau  = 2p*s*eta/(E*tau_b),   G_eta = -2p*s/E
+            //   d(eta)/d(tau_b) = G_tau/(1 - G_eta),
+            //       G_tau = 2p*s*eta/(E*tau_b),   G_eta = -2p*s/E
             //
-            // and s/tau_b is written as tau_b*zeta^2/(4*eta^2) so nothing divides by tau_b --
-            // the expression is then correctly zero at tau_b = 0 rather than 0/0.  The
-            // denominator 1 - G_eta lies in (1/3, 1] for Glen n = 3, so it never pinches.
-            // Then d(F2)/d(tau_b) = H * sum w*zeta^2 * (-1/eta^2) * d(eta)/d(tau_b) > 0:
-            // more drag, more shear, thinner ice, larger F2.
+            // s/tau_b is written as tau_b*zeta^2/(4*eta^2) so nothing divides by tau_b, making
+            // the expression correctly zero at tau_b = 0 rather than 0/0.  1 - G_eta lies in
+            // (1/3, 1] for n = 3, so the denominator never pinches.
             float eta_p = diva_primal(eta_k);
             float s_p   = diva_primal(k_shear)/(eta_p*eta_p);
             float E_p   = diva_primal(A_mem) + s_p;
@@ -347,20 +293,8 @@ __device__ void diva_coeffs_cell(
         closure_prev = F_rel;
         if (it >= newton_iters_max) break;
 
-        // ---- the Newton step on F(U_b) = U_b + f(U_b)*F2(f(U_b)) - U_bar ----
-        //
-        //   F'(U_b) = 1 + f'*F2 + f*f'*dF2/dtau_b
-        //
-        // All three terms are non-negative (f, f' >= 0 for a monotone law, F2 > 0,
-        // dF2/dtau_b > 0), so F' >= 1: the root is unique and this needs no safeguarding.
-        // The third term is what the previous block iteration omitted, which made its gain
-        // 1 - F'/R' and let it 2-cycle once F' > 2R' -- see notes/diva_numerics.md 5.2.0.
-        //
-        // F' is built from PRIMALS even when T is dual.  Legitimate for the same reason as
-        // any Newton denominator: by the implicit function theorem the converged root and its
-        // sensitivity do not depend on the step size used to reach them, so an inexact
-        // denominator costs iterations, never accuracy.  The residual F itself is typed T, so
-        // the seeded derivative propagates exactly.
+        // The Newton step.  F' from primals (see the note on denominators at the top); the
+        // residual F itself is typed T, so the seeded derivative propagates exactly.
         DualFloat cs = get_diva_drag_coeff({diva_primal(U_b),1.0f},diva_primal(beta_grounded),diva_primal(m),u_reg,water_drag,diva_primal(u_c_c),sliding_law);
         DualFloat fs = cs * DualFloat{diva_primal(U_b),1.0f};
         float F2_p = diva_primal(F2_c);
@@ -398,12 +332,11 @@ __device__ void populate_diva_coeffs_dual(
     float n, float eps_reg, float dx, int n_sigma,
     int ny, int nx){
 
-    // Fills the eta_bar and beta_eff tiles as DUALS, i.e. with the exact
-    // d/d(velocity direction) of the whole cell-local closure -- the vertical quadrature,
-    // the per-level eta Newton and the U_b Newton all differentiated by running them in
-    // dual arithmetic, with nothing hand-derived.  This is the path the frozen-coefficient
-    // adjoint drops (it is still selectable, and tests/diva_dotproduct_test.py measures what
-    // dropping it costs: ~1e-1 against 5.6e-7 for the exact one).
+    // Fills the eta_bar and beta_eff tiles as DUALS: the exact d/d(velocity direction) of the
+    // whole cell-local closure -- quadrature, per-level eta Newton and closure Newton all
+    // differentiated by running them in dual arithmetic, nothing hand-derived.  The
+    // frozen-coefficient adjoint (still selectable) drops this path;
+    // tests/diva_dotproduct_test.py measures what that costs.
     float glen_exp = (1.0f - n)/(2.0f * n);
 
     DualFloat eps_mem_sq = get_membrane_eps_sq(u, v, du, dv, i, j, dx, ny, nx);
@@ -514,9 +447,7 @@ void compute_diva_coeffs(
         // Goldberg eq 41: the secant drag the 2D momentum solve sees, tau_b = beta_eff*U_bar.
         // Strictly non-negative, and finite at rest (no division by the speed).
         beta_eff[idx] = beta_eff_c;
-        // Non-convergence must be OBSERVABLE.  A loop that silently caps looks converged, and
-        // that is exactly how the two earlier closure defects survived.  The caller reduces
-        // this and reports it alongside |r_Ub|.
+        // Reduced and reported by the caller alongside |r_Ub|; should always be zero.
         cap_flags[idx] = (float)caps;
     }
 }
@@ -525,29 +456,17 @@ void compute_diva_coeffs(
   ====== THE CLOSURE RESIDUAL: DIVA's second criterion ====
   =========================================================*/
 /*
-  DIVA has TWO residuals and the solver historically monitored one.
-
-  eta_bar and beta_eff enter the momentum rows as FROZEN fields, refreshed between sweeps.
-  So r_u = r_v = 0 means "the SSA-shaped equations with THESE coefficients are satisfied",
-  not "the DIVA equations are satisfied".  The second condition is that the coefficients are
-  consistent with the velocity they are supposed to describe, i.e. that the closure
+  The closure residual at the CURRENT velocity, using the STORED coefficients:
 
       r_Ub = U_b + f(U_b)*F2 - |Ubar|
 
-  still vanishes at the CURRENT velocity.  Both must go to zero:
+  eta_bar and beta_eff are frozen during a V-cycle, so this measures how far they have drifted
+  out of consistency with the velocity while the smoother worked -- and doubles as a standing
+  check that the closure solve converges at all.  Must be evaluated BEFORE the next
+  compute_diva_coeffs call, or it is zero by construction and says nothing.
 
-      |r_u|,|r_v|,|r_H| -> 0   momentum and mass hold for the frozen coefficients
-      |r_Ub|            -> 0   the coefficients are consistent with the velocity
-
-  This is not trivially satisfied.  compute_diva_coeffs leaves r_Ub at round-off by
-  construction, but the smoother then moves u and v, so |Ubar| changes and r_Ub grows again.
-  It measures coefficient STALENESS, and only vanishes once the velocity stops moving -- so it
-  is a genuine convergence criterion, and the one that says whether the segregated
-  coefficient refresh has actually converged rather than merely stopped changing.
-
-  Reported separately and scaled by |Ubar|, never folded into the combined norm: r_Ub is a
-  VELOCITY residual while r_u is a momentum one, and mixing incommensurable units into one norm
-  is exactly the defect recorded in notes/open_questions.md Q6.
+  Reported separately and scaled by |Ubar|, never folded into the combined momentum norm:
+  r_Ub is a velocity residual and r_u a momentum one (notes/open_questions.md Q6).
 */
 extern "C" __global__
 void compute_diva_closure_residual(

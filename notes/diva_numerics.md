@@ -717,6 +717,86 @@ Thermomechanical coupling does **not** threaten it: `B(T)` enters as a coefficie
 
 The closure path enters only through `Ū_c = |ū_c|`, which `compute_diva_coeffs` builds from the cell's own four facets, so its transpose is a small local scatter. The DIVA adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
 
+### 5.9 How the scheme compares to Goldberg (2011) and Arthern et al. (2015)
+
+Both published DIVA implementations use the **same outer scheme**: Picard on the momentum
+equations with $\bar\eta$ and $\beta_{\mathrm{eff}}$ lagged, re-diagnosed between solves. Arthern
+converges it on the momentum residual "expressed as a fraction of the norm of $f$", which is what
+our reported $|r|/|r_0|$ is. Nothing we do differs there.
+
+Everything that differs is in the two **implicit local problems**, and this is where the papers are
+thin — Jake's observation, and largely right, though Arthern is much more explicit than Goldberg.
+
+**The implicit viscosity.** $\eta$ appears on both sides, because the vertical shear strain rate
+$\dot\varepsilon_{xz} = \tau_b\zeta/(2\eta)$ depends on it. Arthern states the problem outright:
+
+> "The reason that equation (3) is an implicit definition for viscosity $\eta$ is that the strain
+> rates for vertical shear themselves depend on viscosity."
+
+and gives the resolution in one sentence:
+
+> "...given estimates of $s, h, B, \tau_{bx}, \tau_{by}, \partial_x\bar u, \dots$ the viscosity
+> $\eta$ can be found by **solving a cubic equation** obtained by substituting equations (5) and (4)
+> into equation (3) and rearranging. Integration over depth is then carried out by numerical
+> quadrature."
+
+That cubic is exactly the one derived independently in §5.2.1, $8A\eta^3 + 8k\eta - B^3 = 0$ — a
+useful confirmation of the algebra, arrived at from the other direction. **Goldberg does not solve
+it at all**: he lags it, computing $u_z^{(i+1)}$ from his eq (31) using $\nu^{(i)}$, so the
+viscosity advances one Picard step per momentum iteration and is never locally converged.
+
+**The sliding closure.** Note what Arthern's sentence takes as *given*: $\tau_{bx},\tau_{by}$. So the
+cubic is solved with $\tau_b$ **lagged** — the viscosity and the closure are not resolved against
+each other. Goldberg's eqs (38)–(39) are the local root find, and he is explicit that it is
+cell-local ("solved at a location along the base independently of other locations"), but in his
+actual scheme $\tau$ is likewise set after the momentum solve from the previous $\beta_{\mathrm{eff}}$.
+
+|  | implicit $\eta(\zeta)$ | closure for $U_b$, $\tau_b$ | outer |
+|---|---|---|---|
+| **Goldberg 2011** | lagged, one Picard step per momentum iteration | lagged | Picard on momentum |
+| **Arthern 2015** | solved exactly: cubic for $n=3$, then quadrature | lagged (given to the cubic) | Picard, residual tolerance |
+| **GLIDE (here)** | solved by Newton to tolerance | solved by Newton to tolerance, **jointly** with $\eta$ | multigrid + refresh; both residuals reported |
+
+So we are strictly more converged locally than either, and the joint resolution is the part neither
+paper does: our quadrature sits *inside* the closure Newton, so $\eta$, $F_2$ and $U_b$ are mutually
+consistent before the coefficients are handed to the momentum solve. §5.2.0 is why that turned out
+to matter — lagging $F_2$ against the closure is precisely the block Gauss–Seidel that 2-cycles at
+high basal drag.
+
+Two smaller divergences, both deliberate:
+
+- **We use Newton on the cubic rather than Cardano**, despite having the closed form. Arthern
+  presumably works in double precision, where Cardano is exact (verified: 2e-12). In float32 its two
+  cube roots nearly cancel when the shear dominates and it loses three digits — 1.9e-3 at
+  $\tau_b = 100$ against Newton's 3.5e-7 (§5.2.1). Newton is also $n$-general where the cubic is not.
+- **We solve to a tolerance with stagnation detection, not a fixed sweep count** (§5.2.3). Neither
+  paper says how many local iterations it takes, which is the detail that would have saved us the
+  most time.
+
+**The adjoint is where the divergence is largest.** Arthern does not compute a discrete adjoint at
+all. He uses the Kohn–Vogelius functional with a Neumann/Dirichlet pair (Arthern & Gudmundsson
+2010): solve the forward problem twice under different upper-surface boundary conditions and the
+gradient falls out of the difference. That buys a gradient without an adjoint, at the cost of being
+frankly approximate — his own words on the viscosity in the Dirichlet solve:
+
+> "We do not recompute viscosity $\eta(z)$ but simply reuse the viscosity field that was computed
+> for the Neumann solution. This choice is somewhat heuristic but practically convenient."
+
+and on the stiffness update: *"Strictly, this applies only for a linear rheology. Nevertheless, at
+each iteration, we updated the ice stiffness coefficient $B$ heuristically as follows..."*
+
+That is entirely reasonable for a fixed-point inversion scheme, and it is the opposite of what we
+need. Our exact coefficient adjoint — dot-product identity 3.75e-7, no symmetry assumed, every
+closure path differentiated — exists because the gradient has to be consumed by a general optimizer,
+and because a learned sliding law needs a derivative that is exact by construction rather than by
+regime.
+
+**Worth noting for the sliding-law work.** Arthern's headline conclusion is that
+*"no simple sliding law adequately represents basal shear stress as a function of sliding speed"* --
+his recovered basal drag varies by factors exceeding $10^{10}$ and resists any $\tau_b(u_b)$ fit.
+That is an argument from the observational side for the learned-closure direction, from an author
+with no stake in it.
+
 ## 6. Verification status
 
 | test | what it establishes |

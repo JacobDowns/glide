@@ -113,14 +113,56 @@ __device__ void diva_coeffs_cell(
     float U_b_warm,
     T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out)
 {
-    // Per-cell DIVA closure, shared by compute_diva_coeffs (T = float) and the JVP
-    // (T = DualFloat, seeded with a velocity perturbation direction).
+    // WHAT THIS SOLVES.  The 2-D momentum operator (Goldberg eq 43-44) is SSA's, and needs
+    // two coefficients per cell -- eta_bar and beta_eff -- but all the momentum solve can
+    // supply is the depth-averaged speed U_bar.  This function inverts that: given U_bar,
+    // produce the two coefficients.
     //
-    // Note the Newton denominator dR stays a plain float even when T is dual.  That is
-    // deliberate and costs nothing: for U <- U - R(U)/c with any constant c, the
-    // converged derivative satisfies dU = -R_dir/R', independent of c.  So the step
-    // size does not affect the sensitivity, and the second differentiation (f' w.r.t.
-    // U_b, which is not the direction being seeded) can be taken from the primals.
+    // THE UNKNOWN is a single scalar: how much of U_bar is SLIDING rather than internal
+    // deformation.  Call it U_b.  The constraint fixing it is Goldberg eq 34,
+    //
+    //     F(U_b) = U_b + f(U_b)*F2( f(U_b) ) - U_bar = 0
+    //              ^^^^   ^^^^^^^^^^^^^^^^^
+    //            sliding      deformation
+    //
+    // where f is the sliding law (tau_b = f(U_b) = c(U_b)*U_b) and F2 = H*int zeta^2/eta
+    // is the vertical shear integral -- Goldberg's omega/H.  Once U_b is known BOTH outputs
+    // are formulas:
+    //
+    //     eta_bar  = int eta(zeta) dzeta          (the depth average)
+    //     beta_eff = c(U_b)/(1 + c(U_b)*F2)       (eq 41)
+    //
+    // It is not a closed form because F2 depends on U_b: more basal drag means more vertical
+    // shear, which thins the ice, which raises F2.  Hence the iteration.
+    //
+    // METHOD, outermost to innermost:
+    //
+    //   coupling_iters   refresh F2 at the updated U_b, since F2 depends on it
+    //     n_sigma loop   midpoint quadrature forming eta_bar and F2 -- a sum, not a solve
+    //       eta_iters    per level, solve Glen's law against the shear ansatz for eta
+    //                    (a scalar root problem; Newton -- see the note at that loop)
+    //   newton_iters     solve the constraint above for U_b, with F2 held frozen
+    //
+    // The last two together are a block Gauss-Seidel on F: the closure Newton uses the slope
+    // R' = 1 + f'*F2, and coupling_iters supplies the missing F2 dependence from outside.
+    //
+    // KNOWN DEFICIENCY, being replaced -- see notes/diva_numerics.md 5.2.0.  The true slope is
+    //
+    //     F'(U_b) = [1 + f'*F2] + [f * f' * dF2/dtau_b]
+    //               \_  R'    _/   \_ not computed here _/
+    //
+    // Every term is non-negative, so F' >= 1 and the root is unique: the PROBLEM is benign.
+    // But using R' under-estimates the slope of a monotone increasing function, so the block
+    // iteration's gain is exactly (1 - F'/R') and it 2-cycles once F' > 2R'.  That is 1.4% of
+    // the slope in the configurations we test and the dominant term at high basal drag.  The
+    // fix is to use F', which makes this true Newton and removes coupling_iters entirely.
+    //
+    // Shared by compute_diva_coeffs (T = float) and the JVP/derivative kernels (T =
+    // DualFloat).  Note the Newton denominator dR stays a plain float even when T is dual.
+    // That is deliberate and costs nothing: by the implicit function theorem the converged
+    // root and its sensitivity are independent of the step size used to reach them, so an
+    // inexact denominator costs iterations, never accuracy.  A term dropped from a RESIDUAL
+    // has no such licence, which is why the deficiency above is worth fixing and this is not.
     const int coupling_iters = 3;
     const int eta_iters = 3;
     const int newton_iters = 4;

@@ -1,6 +1,6 @@
 # DIVA in GLIDE: mathematics and numerical method
 
-**Branch:** `diva` (off `sliding-laws`) · **Status:** forward model, exact adjoint and `dJ/d(beta)` all implemented and verified; ISMIP-HOM validation outstanding · **Companion:** `notes/diva.md` (the design proposal and staged plan)
+**Branch:** `diva` (off `sliding-laws`) · **Status:** forward model, exact adjoint, all three sliding-parameter gradients, and both nested closure solves implemented and verified; ISMIP-HOM validation outstanding · **Companion:** `notes/diva.md` (the design proposal and staged plan)
 
 **See also:** `notes/diva.md` (design and staged plan) and `notes/open_questions.md` (issues found in existing upstream code while doing this work -- not addressed here).
 
@@ -178,22 +178,29 @@ $\zeta=0$ is the surface, $\zeta=1$ the bed. **No 3-D array is stored**: the loo
 `compute_diva_coeffs` (`cuda/diva.cu`) is the one genuinely novel kernel. Per cell:
 
 ```         
-ThanU_b <- stored u_b, clamped to [0, U_bar]        (warm start; the root is unique)
-repeat coupling_iters (3):
-    for k in 0..N_sigma-1:
-        eta_k <- membrane-only value            (this is exactly the SSA viscosity)
-        repeat eta_iters (3):
-            eps_shear = tau_b * zeta_k / (2*eta_k)
-            eta_k     = 0.5*B*(eps_mem^2 + eps_shear^2 + eps_reg)^((1-n)/2n)
-        accumulate eta_bar, F2
-    Newton on R(U_b) = U_b + f(U_b)*F2 - U_bar  (newton_iters = 4)
+U_b <- stored u_b, clamped to [0, U_bar]            (warm start; the root is unique)
+repeat newton_iters (8) + 1:                        NEWTON on F(U_b) = 0
     tau_b = c(U_b)*U_b
+    for k in 0..N_sigma-1:                          the vertical quadrature
+        eta_k <- min(shear-free, shear-dominated) asymptote     (both overestimate)
+        repeat eta_iters (3):                       NEWTON on eta = G(eta)
+            s = k_shear/eta_k^2;  E = eps_mem^2 + eps_reg + s
+            G = 0.5*B*E^((1-n)/2n);  G' = -2p*(s/E)*(G/eta_k)
+            eta_k -= (eta_k - G)/(1 - G')
+        accumulate eta_bar, F2, and dF2/dtau_b
+    (last trip stops here: the outputs are now consistent with the final U_b)
+    F  = U_b + c(U_b)*U_b*F2 - U_bar
+    F' = 1 + f'*F2 + f*f'*dF2/dtau_b                the FULL slope -- see 5.2.0
+    U_b = max(U_b - F/F', 0)
 write eta_bar, F2, u_b, beta_eff = c/(1 + c*F2)
 ```
 
+Note the quadrature sits INSIDE the Newton loop, because $F_2$ depends on $U_b$. There is no
+outer "coupling" iteration; an earlier version had one and it 2-cycled (§5.2.0).
+
 Design choices worth reviewing:
 
-- **Fixed iteration counts, no convergence test.** Uniform cost per thread and no warp divergence; the outer nonlinear iteration absorbs the remainder.
+- **Fixed iteration counts, no convergence test.** Uniform cost per thread and no warp divergence. The counts are chosen to CONVERGE from a cold start, not sized by a scaling argument and left for the outer iteration to absorb -- that reasoning is what produced both defects in §5.2.0 and §5.2.1. `newton_iters = 8` because the cold start under-estimates $F_2$ badly enough that the first step overshoots; `eta_iters = 3` because the two-sided asymptotic guess starts close. Both are pinned by `diva_closure_test` checks 5 and 6, from cold.
 - **Only interior (non-halo) threads write.** `u_b` is read in place as the warm start, so each cell must have exactly one writer or the result would depend on block scheduling. This is what makes the kernel deterministic.
 - **Grounding is folded into `beta_eff` here** (via $\beta\cdot\phi$). The momentum kernels must therefore *not* apply the grounded factor again — unlike the SSA basal stencils, which do it internally. This asymmetry is deliberate and is the thing most likely to be mis-edited later; `tests/diva_residual_test.py` pins it.
 
@@ -230,20 +237,41 @@ Every term is non-negative ($f,f'\ge0$, $F_2>0$, and $\mathrm{d}F_2/\mathrm{d}\t
 drag means more shear means thinner ice), so $F'\ge 1$: **$F$ is strictly increasing, the root is
 unique, and full Newton is unconditionally well conditioned.** The problem is benign.
 
-What the code does instead is block Gauss–Seidel: the closure Newton uses $R'$, i.e. holds $F_2$
-frozen, and `coupling_iters` refreshes $F_2$ around it. Its gain is exactly
+**This is what the code now does.** It did not always: an earlier version ran block Gauss–Seidel,
+with the closure Newton using $R'$ (holding $F_2$ frozen) and a `coupling_iters` loop refreshing
+$F_2$ around it. That scheme's gain is exactly
 
 $$\Phi'(\tau_b) \;=\; 1 - \frac{F'}{R'} \qquad\Longrightarrow\qquad |\Phi'|>1 \iff F' > 2R'$$
 
 (verified against bisection-found roots to $10^{-11}$; see §5.2.1a for the table). So the mechanism
 is simply that the iteration **under-estimates the slope of a monotone increasing function**, and
 Newton with an under-estimated slope overshoots — by more than $2\times$, it oscillates. Our
-configurations sit at $F'/R' = 1.013$, the omitted term being 1.4% of the total, which is why
-nothing has ever misbehaved.
+configurations sat at $F'/R' = 1.013$, the omitted term being 1.4% of the total, which is why
+nothing had ever visibly misbehaved -- stable by accident rather than by construction.
 
-Using $F'$ in place of $R'$ makes it true Newton on $F(U_b)=0$: gain zero, quadratic, and
-`coupling_iters` **disappears** rather than being wrapped in anything. $\mathrm{d}F_2/\mathrm{d}\tau_b$
-is what a dual seeded on $\tau_b$ returns, so the machinery already exists.
+**Resolved** by using $F'$: true Newton, gain zero, quadratic, and `coupling_iters` gone rather
+than wrapped in anything. $\mathrm{d}F_2/\mathrm{d}\tau_b$ is accumulated in the $\sigma$ loop from
+the implicit function theorem on the converged level root, taken from primals as any Newton
+denominator may be (verified against a finite difference of the exact quadrature: 2e-9).
+
+Verified against the true root found by **bisection** — never by fixed-point iteration, which is
+the thing that was under suspicion — from a single COLD call, in the regimes that used to 2-cycle:
+
+| $\beta$ | $\bar\eta$ err | $F_2$ err | $U_b$ err | $\|F\|/\bar U$ |
+|--------:|---------------:|----------:|----------:|---------------:|
+| 0.02 | 1.1e-07 | 2.2e-07 | 1.7e-08 | 2.1e-08 |
+| 0.1  | 3.4e-08 | 5.0e-07 | 3.9e-08 | 9.3e-08 |
+| 0.5  | 2.8e-08 | 1.1e-07 | 8.3e-09 | 2.3e-08 |
+| 2.0  | 4.2e-07 | 3.9e-07 | 2.1e-07 | 5.9e-07 |
+
+and repeated calls now agree exactly, where the block iteration sat in a stable 2-cycle. Cost:
+DIVA went from ~11% more expensive than SSA to **12.5%**.
+
+One trap worth recording. `newton_iters` was first left at 4, and the result *looked* converged --
+repeated calls were idempotent -- while sitting at a non-root, $U_b$ 53% high at $\beta=2$. That
+is what a too-short Newton looks like from outside: the warm start is the previous answer, so
+successive calls reproduce it. Idempotence alone is necessary, not sufficient; `diva_closure_test`
+check 5 compares against the true root from COLD for exactly this reason.
 
 ### 5.2.0a The closure residual, and a correction about "two residuals"
 
@@ -385,7 +413,12 @@ With $\min(\eta_A,\eta_k)$, **3 Newton iterations reach float32 round-off across
 ($\le 2.6\times10^{-7}$ up to $\tau_b=100$) — the same trip count the Picard loop used. Starting from
 $\eta_A$ alone would need 6.
 
-### 5.2.1a The outer coupling loop is unstable at high basal drag
+### 5.2.1a RESOLVED: the outer coupling loop was unstable at high basal drag
+
+**Historical.** The loop this describes no longer exists — §5.2.0 replaced it with true Newton on
+$F(U_b)=0$, whose gain is zero. Kept because the analysis is the reason for that change, because it
+records how the diagnosis was and was not done, and because the same failure mode can reappear in
+any segregated scheme.
 
 Fixing the per-level solve exposed a problem in the loop *around* it. Measured, not conjectured.
 
@@ -451,7 +484,9 @@ $\bar u^{(i)}$ diagnose $\nu^{(i)}, \omega^{(i)}, \beta^{(i)}_{\mathrm{eff}}$, s
 system (43–44) for $\bar u^{(i+1)}$, and then — in his words — "$\tau_x^{(i+1)}$ is set to
 $\beta^{(i)}_{\mathrm{eff}}\bar u^{(i+1)}$, and $u_z^{(i+1)}$ is found from Equation (31) using
 $\nu^{(i)}_{\mathrm{(hy)}}$". So $\tau$ and $u_z$ are **lagged across the outer loop** and the local
-diagnosis is a single pass. There is no local sub-iteration to oscillate. `coupling_iters` is ours.
+diagnosis is a single pass. There is no local sub-iteration to oscillate. `coupling_iters` was ours,
+and is now gone (§5.2.0) -- so on this point we have converged back onto Goldberg's structure, with
+the local closure solved properly rather than swept.
 
 This also inverts part of the earlier recommendation: *more* coupling sweeps make the between-call
 behaviour worse, not better, since three sweeps carry gain $(\Phi')^3 = -2.6$ where one carries
@@ -459,11 +494,15 @@ $-1.38$. What survives is the Newton argument — a robustly solved local closur
 iteration a well-defined function of $\bar U$ whatever the gain, which beats any Picard sweep count
 and is what Goldberg's single lagged pass is implicitly relying on being well behaved.
 
-**Why nothing has broken.** Our configurations sit at $\Phi' = -0.013$, three orders of magnitude
-inside the local stability boundary, so every DIVA solve in the suite converges. The margin is real
-but it is luck rather than design, and ISMIP-HOM is deliberately deformation-dominated.
+**Why nothing had broken.** Our configurations sat at $\Phi' = -0.013$, three orders of magnitude
+inside the local stability boundary, so every DIVA solve in the suite converged. The margin was real
+but it was luck rather than design — which is why this was fixed before ISMIP-HOM rather than after,
+those experiments being deliberately deformation-dominated. Jake's call, and the right one: no
+configuration can be called validated while the closure is stable only by accident.
 
-**The fix, when we take it.** Since $\Phi'<0$ always, $g(\tau_b) = \tau_b - \Phi(\tau_b)$ has
+**The fix, as taken.** Superseded by the cleaner form in §5.2.0 — Newton on $F(U_b)=0$ directly,
+which removes the outer loop instead of wrapping it — but the argument that got there was: since
+$\Phi'<0$ always, $g(\tau_b) = \tau_b - \Phi(\tau_b)$ has
 $g' = 1 + |\Phi'| \ge 1$: **unconditionally well conditioned**. Newton on $g$ converges in every
 row of that table, quadratically — the same move as §5.2.1, one level out. Fixed under-relaxation
 would also stabilise it but is the wrong trade: $\omega = 0.5$ rescues $\Phi'=-1.9$ while
@@ -471,10 +510,10 @@ would also stabilise it but is the wrong trade: $\omega = 0.5$ rescues $\Phi'=-1
 Newton already gets $f'$ — a primal-only dual evaluation, valid because the converged sensitivity
 does not depend on the step size used to reach it — so it needs no nested duals.
 
-Not implemented yet: it changes the forward model in every configuration, so it wants its own
-change with ISMIP-HOM available to validate against. Nothing verified depends on it;
-`tests/diva_closure_test.py` check 5 isolates the per-level solve by replicating the kernel's own
-coupling structure, so it measures §5.2.1 without entangling this.
+Implemented in the cleaner form of §5.2.0. Note that `diva_closure_test` check 5 had to change
+with it: it previously replicated the kernel's own coupling structure, which made it a
+self-consistency check that would have PASSED this 2-cycle. It now targets the true root by
+bisection, and check 6 asserts idempotence.
 
 ### 5.2.1b Two places where we knowingly differ from Goldberg
 
@@ -646,7 +685,9 @@ The closure path enters only through `Ū_c = |ū_c|`, which `compute_diva_coeffs
 
 Done and verified (see `tests/` for each):
 
-- **The forward model.** Converges as well as SSA, ~11% more expensive, consistent across multigrid depths. SSA is bit-identical with `stress_balance = 0`.
+- **The forward model.** Converges as well as SSA, **12.5%** more expensive, consistent across multigrid depths. SSA is bit-identical with `stress_balance = 0`.
+
+- **The closure solves properly.** Both nested root problems are Newton with the full slope: the per-level viscosity (§5.2.1) and the $U_b$ partition (§5.2.0). Verified against roots found by bisection from a cold start, agreement 5e-7, in the regimes where the previous block iteration 2-cycled. `diva_closure_test` checks 5 and 6 pin it; the closure residual $|r_{U_b}|/|\bar U|$ is reported every V-cycle (§5.2.0a) and reads ~2e-8.
 
 - **The exact coefficient adjoint.** `AdjointOperators.diva_exact_coeff_adjoint = True`, on by default. Dot-product identity $\langle J^T\lambda, x\rangle$ vs $\langle\lambda, Jx\rangle$ = **5.6e-7** against an SSA control of 1.2e-7, with **no symmetry assumed anywhere** in the DIVA path. `vanka_smooth_adjoint` is templated on DIVA and uses the uncondensed block; the smoother stays frozen-coefficient, which is fine because it is only a preconditioner -- exactly as in SSA, where the VJP carries $\partial\eta/\partial u$ and the smoother does not.
 
@@ -675,15 +716,6 @@ Done and verified (see `tests/` for each):
 - **Methodological note, worth keeping.** $\partial J/\partial\beta$ read 9.6e-4 with a *wrong* (frozen) adjoint and 2.2e-2 with the right one, because a wrong $\lambda$ was partly cancelling the missing `eta_bar` path. Neither number was evidence about the gradient on its own. Relatedly, no single FD step is trustworthy here: two-sided truncation falls like $\varepsilon^2$ while float32 round-off grows like $1/\varepsilon$, so the tests sweep $\varepsilon$ to bracket the crossover and print the whole curve. $\partial J/\partial u_c$ under DIVA reads 1.6e-4 at $\varepsilon = 2$ and 1.4e-3 at $\varepsilon = 1$; judging on one step would have manufactured a defect that is not there.
 
 Remaining, in order:
-
-- **Replace the closure's block iteration with true Newton on $F(U_b)=0$ -- do this FIRST.**
-  Spelled out in §5.2.0. The current iteration omits the $f f' \,\mathrm{d}F_2/\mathrm{d}\tau_b$
-  term from the slope, so its gain is $1 - F'/R'$ and it oscillates once $F' > 2R'$. Our
-  configurations sit at $F'/R' = 1.013$ and are therefore stable **by luck rather than by
-  construction**, which is not a basis for calling any configuration validated -- including the
-  ISMIP-HOM runs below, whose experiments are deliberately deformation-dominated and will sit at
-  much larger $F'/R'$. Using $F'$ makes it true Newton, drives the gain to zero, and removes
-  `coupling_iters` entirely.
 
 - **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. The forward model and the gradients are both in place now, so they can be validated together.
 

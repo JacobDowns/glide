@@ -18,12 +18,23 @@
 
   and the law supplies |tau_b| = f(U_b), so U_b solves
 
-     R(U_b) = U_b + f(U_b)*F2 - U_bar = 0.
+     F(U_b) = U_b + f(U_b)*F2( f(U_b) ) - U_bar = 0.
 
-  For a linear law this inverts in closed form; in general it is a per-cell root
-  find (Goldberg's eqs 38-39, "solved at a location along the base independently of
-  other locations").  It is well behaved: physical laws are monotone (f' >= 0) and
-  F2 > 0, so R' = 1 + f'*F2 > 0 and the root is unique.
+  Note F2 depends on U_b too, through tau_b -- more drag, more shear, thinner ice,
+  larger F2 -- so this is a genuine root find for EVERY sliding law, linear included.
+  (It would invert in closed form only with F2 held frozen, which is what an earlier
+  version did and why it misbehaved; see diva_coeffs_cell.)  It is cell-local:
+  Goldberg's eqs 38-39, "solved at a location along the base independently of other
+  locations".
+
+  It is well behaved.  The slope is
+
+     F'(U_b) = 1 + f'(U_b)*F2 + f(U_b)*f'(U_b)*dF2/dtau_b
+
+  and every term is non-negative -- monotone laws give f, f' >= 0, F2 > 0, and
+  dF2/dtau_b > 0 by the shear-thinning argument above -- so F' >= 1, F is strictly
+  increasing and the root is unique.  Do not be tempted to quote just the first two
+  terms: dropping the third is exactly the defect that made this 2-cycle.
 
   Everything here is cell-local -- no spatial coupling -- so no multigrid transfer
   is involved.  Nothing in this file is reached unless stress_balance = 1.
@@ -324,9 +335,11 @@ __device__ void populate_diva_coeffs_dual(
     int ny, int nx){
 
     // Fills the eta_bar and beta_eff tiles as DUALS, i.e. with the exact
-    // d/d(velocity direction) of the whole cell-local closure -- the vertical
-    // quadrature, the eta_k fixed point and the U_b Newton all differentiated by
-    // running them in dual arithmetic.  This is what the frozen adjoint omits.
+    // d/d(velocity direction) of the whole cell-local closure -- the vertical quadrature,
+    // the per-level eta Newton and the U_b Newton all differentiated by running them in
+    // dual arithmetic, with nothing hand-derived.  This is the path the frozen-coefficient
+    // adjoint drops (it is still selectable, and tests/diva_dotproduct_test.py measures what
+    // dropping it costs: ~1e-1 against 5.6e-7 for the exact one).
     float glen_exp = (1.0f - n)/(2.0f * n);
 
     DualFloat eps_mem_sq = get_membrane_eps_sq(u, v, du, dv, i, j, dx, ny, nx);

@@ -245,6 +245,42 @@ Using $F'$ in place of $R'$ makes it true Newton on $F(U_b)=0$: gain zero, quadr
 `coupling_iters` **disappears** rather than being wrapped in anything. $\mathrm{d}F_2/\mathrm{d}\tau_b$
 is what a dual seeded on $\tau_b$ returns, so the machinery already exists.
 
+### 5.2.0a The closure residual, and a correction about "two residuals"
+
+Implemented alongside the Newton fix, and it corrects something stated too strongly earlier in
+this note's history.
+
+**The claim was: DIVA has two residuals and the solver monitors one, so it can report
+convergence with the closure unsatisfied. That is wrong.** `compute_residual` calls
+`compute_diva_coeffs` before evaluating (`operators.py`), so the reported $|r_u|,|r_v|,|r_H|$
+are the residuals of the FULL DIVA system with coefficients consistent with the current
+velocity — not of a frozen-coefficient surrogate. The refresh-before-residual ordering already
+couples the two halves.
+
+What the closure residual
+
+$$r_{U_b} = U_b + f(U_b)F_2 - |\bar U|$$
+
+does add is worth having, but it is two other things:
+
+1. **Coefficient drift.** $\bar\eta$ and $\beta_{\mathrm{eff}}$ ARE frozen inside a V-cycle,
+   so measuring $r_{U_b}$ *before* the refresh says how far they drifted out of consistency
+   while the smoother worked, i.e. whether the segregated refresh keeps up. Measured *after* the
+   refresh it is zero by construction and says nothing — a trap worth noting, since that is
+   where it naturally lands if you add it to the reporting line without thinking.
+2. **A standing guard that the closure solve converges at all.** This is what regressed silently
+   before: the block iteration 2-cycled, so `u_b` and $F_2$ were simply wrong, and no test or
+   diagnostic noticed.
+
+Measured on the 128² 5-level slab after the Newton fix: $|r_{U_b}|/|\bar U|$ = 3.4e-6 after the
+first V-cycle and ~2e-8 thereafter. So the coefficients track the velocity to round-off and the
+segregated refresh is comfortably keeping up in this configuration — which is the evidence the
+earlier §5.2.1a caveat asked for, at least here.
+
+Reported separately and scaled by $|\bar U|$, never folded into the combined norm: $r_{U_b}$ is a
+velocity residual and $r_u$ a momentum one, and mixing incommensurable units in one norm is
+precisely the defect in `notes/open_questions.md` Q6.
+
 ### 5.2.1 The per-level viscosity solve, and why Picard was not enough
 
 The innermost loop above solves a genuine scalar fixed point. At depth $\zeta$, Glen's law and

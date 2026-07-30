@@ -53,6 +53,10 @@ class ForwardOperators:
         self._jvp_v = None
         self._jvp_H = None
 
+        # DIVA closure-residual diagnostics, allocated on first use
+        self._r_ub = None
+        self._u_bar = None
+
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
 
@@ -222,6 +226,39 @@ class ForwardOperators:
                     int(rheology.n_sigma.value),
                     grid.ny, grid.nx,
                     stride, halo))
+
+    def compute_diva_closure_residual(self):
+        """DIVA's SECOND convergence criterion: does the closure still hold at the current
+        velocity?
+
+        eta_bar and beta_eff are frozen fields refreshed between sweeps, so a zero momentum
+        residual only says the equations hold for THOSE coefficients.  This returns
+        (|r_Ub|, |Ubar|) so the caller can report |r_Ub|/|Ubar| -- the coefficients' staleness.
+        Zero right after a refresh, grows as the smoother moves the velocity, and vanishes only
+        at convergence.
+
+        Deliberately returned separately rather than folded into the momentum norm: r_Ub is a
+        velocity residual and r_u is a momentum one (see notes/open_questions.md Q6).
+        """
+        if float(self.grid.rheology.stress_balance.value) < 0.5:
+            return None, None
+        grid = self.grid
+        if self._r_ub is None:
+            self._r_ub = cp.zeros((grid.ny, grid.nx), dtype=cp.float32)
+            self._u_bar = cp.zeros((grid.ny, grid.nx), dtype=cp.float32)
+
+        kernel = self.kernels.get_function('compute_diva_closure_residual')
+        grid_size, block_size, stride, halo = self._kernel_config
+        sliding = grid.sliding
+        kernel(grid_size, block_size,
+               (self._r_ub, self._u_bar,
+                grid.state.u.data, grid.state.v.data, grid.state.phi.data,
+                sliding.beta.data, sliding.u_c.data,
+                grid.state.u_b.data, grid.rheology.F2.data,
+                sliding.m.value, sliding.u_reg.value,
+                sliding.water_drag.value, sliding.sliding_law.value,
+                grid.ny, grid.nx, stride, halo))
+        return cp.linalg.norm(self._r_ub), cp.linalg.norm(self._u_bar)
 
     def compute_diva_derivs(self):
         """Total derivatives of the cell-local DIVA closure, one dual seeding per input:

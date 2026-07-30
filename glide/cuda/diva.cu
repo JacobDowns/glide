@@ -437,6 +437,82 @@ void compute_diva_coeffs(
     }
 }
 
+/*=========================================================
+  ====== THE CLOSURE RESIDUAL: DIVA's second criterion ====
+  =========================================================*/
+/*
+  DIVA has TWO residuals and the solver historically monitored one.
+
+  eta_bar and beta_eff enter the momentum rows as FROZEN fields, refreshed between sweeps.
+  So r_u = r_v = 0 means "the SSA-shaped equations with THESE coefficients are satisfied",
+  not "the DIVA equations are satisfied".  The second condition is that the coefficients are
+  consistent with the velocity they are supposed to describe, i.e. that the closure
+
+      r_Ub = U_b + f(U_b)*F2 - |Ubar|
+
+  still vanishes at the CURRENT velocity.  Both must go to zero:
+
+      |r_u|,|r_v|,|r_H| -> 0   momentum and mass hold for the frozen coefficients
+      |r_Ub|            -> 0   the coefficients are consistent with the velocity
+
+  This is not trivially satisfied.  compute_diva_coeffs leaves r_Ub at round-off by
+  construction, but the smoother then moves u and v, so |Ubar| changes and r_Ub grows again.
+  It measures coefficient STALENESS, and only vanishes once the velocity stops moving -- so it
+  is a genuine convergence criterion, and the one that says whether the segregated
+  coefficient refresh has actually converged rather than merely stopped changing.
+
+  Reported separately and scaled by |Ubar|, never folded into the combined norm: r_Ub is a
+  VELOCITY residual while r_u is a momentum one, and mixing incommensurable units into one norm
+  is exactly the defect recorded in notes/open_questions.md Q6.
+*/
+extern "C" __global__
+void compute_diva_closure_residual(
+    float* __restrict__ r_ub,
+    float* __restrict__ U_bar_out,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ phi,
+    const float* __restrict__ beta,
+    const float* __restrict__ u_c,
+    const float* __restrict__ u_b,
+    const float* __restrict__ F2,
+    float m, float u_reg, float water_drag, float sliding_law,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+    if (!is_active) return;
+
+    float u_l = get_vfacet(u, i, j, ny, nx);
+    float u_r = get_vfacet(u, i, j + 1, ny, nx);
+    float v_t = get_hfacet(v, i, j, ny, nx);
+    float v_b = get_hfacet(v, i + 1, j, ny, nx);
+    float u_ctr = 0.5f*(u_l + u_r);
+    float v_ctr = 0.5f*(v_t + v_b);
+    float U_bar = sqrtf(u_ctr*u_ctr + v_ctr*v_ctr);
+
+    int idx = i * nx + j;
+    float grounded = get_cell(phi, i, j, ny, nx);
+    float beta_g = get_cell(beta, i, j, ny, nx) * grounded;
+    float u_c_c = get_cell(u_c, i, j, ny, nx);
+    float U_b = u_b[idx];
+    float F2_c = F2[idx];
+
+    // c(U_b) from the same helper the closure itself uses, so this cannot drift out of step
+    // with the sliding law.
+    float c = get_diva_drag_coeff({U_b,0.0f},beta_g,m,u_reg,water_drag,u_c_c,sliding_law).v;
+
+    r_ub[idx]      = U_b + c*U_b*F2_c - U_bar;
+    U_bar_out[idx] = U_bar;
+}
+
 extern "C" __global__
 void compute_diva_derivs(
     float* __restrict__ deta_deps,

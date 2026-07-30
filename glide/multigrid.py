@@ -618,15 +618,34 @@ class FASCDSolver:
                 and absolute_residual_norm > self._fas_config.absolute_tolerance
                 and iteration < self._fas_config.maximum_vcycles):
             self.vcycle(start_level,finest=True)
+
+            # Closure staleness, measured BEFORE compute_residual refreshes the coefficients.
+            # eta_bar/beta_eff are frozen during a V-cycle, so this is how far they drifted out
+            # of consistency with the velocity while the smoother worked.  Measured after the
+            # refresh it would be zero by construction and say nothing.
+            r_ub, u_bar = start_level_.forward_operators.compute_diva_closure_residual()
+
             ru,rv,rH = start_level_.forward_operators.compute_residual(dt,freeze_phi=True,return_norms=True)
 
             absolute_residual_norm = cp.sqrt(ru**2 + rv**2 + rH**2)
             relative_residual_norm = absolute_residual_norm / initial_residual_norm
             if self._fas_config.report_norms:
-                print(f"  V-cycle {iteration}: |r|/|r0| = {relative_residual_norm:.2e}, "
-                      f"|r_u| = {float(ru):.2e}, "
-                      f"|r_v| = {float(rv):.2e}, "
-                      f"|r_H| = {float(rH):.2e}")
+                line = (f"  V-cycle {iteration}: |r|/|r0| = {relative_residual_norm:.2e}, "
+                        f"|r_u| = {float(ru):.2e}, "
+                        f"|r_v| = {float(rv):.2e}, "
+                        f"|r_H| = {float(rH):.2e}")
+                # |r_u| above is already the TRUE DIVA residual: compute_residual refreshes
+                # the coefficients before evaluating, so it is not a frozen-coefficient
+                # surrogate.  What r_Ub adds is the other half of the picture -- how far the
+                # coefficients had DRIFTED during the V-cycle, i.e. whether the segregated
+                # refresh is keeping up with the velocity.  It is also a standing guard that
+                # the closure solve itself converges, which is what regressed silently before
+                # (notes/diva_numerics.md 5.2.0).  Reported separately and scaled by |Ubar|,
+                # never folded into |r|: r_Ub is a velocity residual and r_u a momentum one
+                # (notes/open_questions.md Q6).
+                if r_ub is not None:
+                    line += f", |r_Ub|/|Ubar| = {float(r_ub)/max(float(u_bar),1e-30):.2e}"
+                print(line)
             iteration += 1
 
         

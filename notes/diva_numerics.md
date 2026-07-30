@@ -518,22 +518,37 @@ bisection, and check 6 asserts idempotence.
 
 ### 5.2.1b Two places where we knowingly differ from Goldberg
 
-- **The bed-slope factor.** Goldberg carries $m = \sqrt{1 + b_x^2 + b_y^2}$ through his eqs (38)–(41);
-  GLIDE has no such factor, i.e. assumes small bed slopes. Worth quantifying before ISMIP-HOM,
-  whose topographic experiments deliberately impose slopes. Note the name collision: Goldberg's $m$
-  is geometric, ours is the Weertman exponent.
-- **A typo in the paper — CONFIRMED, and we follow the correct one.** Eq (40) gives the frozen-bed
-  limit as $\tau_x = (H/\omega)\bar u$, i.e. $\beta_{\mathrm{eff}} = H/\omega = 1/F_2$; the text
-  introducing (42) gives $H/(2\omega)$, a factor of 2 apart. Jake confirmed both appear in the
-  typeset PDF, so it is not an extraction artefact.
+- **The bed-slope factor — Arthern drops it too.** Goldberg carries
+  $m = \sqrt{1 + b_x^2 + b_y^2}$ through his eqs (38)–(41). GLIDE has no such factor, and neither
+  does Arthern: his eq (8) is a plain Robin condition $\boldsymbol\tau_b = \beta\mathbf u_b$ with no
+  geometric prefactor, his eq (12) for $\beta_{\mathrm{eff}}$ carries none, and he states the
+  small-slope assumption outright when approximating the surface normal stress (his eq 19). So on
+  this point we agree with the more recent implementation and Goldberg is the outlier.
 
-  (40) is the correct one, and it is derivable rather than a matter of preference: eq (34) reads
-  $u|_{z=b} = \bar u - \tau_x\omega/H$, so a frozen bed ($u|_{z=b}=0$) gives $\tau_x = H\bar u/\omega$
-  directly. (42) cannot be reconciled with (34).
+  That is reassuring but not licence: Arthern omits it for a continental Antarctic inversion where
+  bed slopes really are small, whereas ISMIP-HOM's topographic experiments impose large slopes
+  deliberately. Still worth quantifying before running them. (Name collision to watch: Goldberg's
+  $m$ is geometric, ours is the Weertman exponent.)
+- **A typo in Goldberg — SETTLED, independently, by Arthern.** Goldberg's eq (40) gives the
+  frozen-bed limit as $\tau_x = (H/\omega)\bar u$, i.e. $\beta_{\mathrm{eff}} = H/\omega = 1/F_2$,
+  while the text introducing his (42) gives $H/(2\omega)$ — a factor of 2 apart, and Jake confirmed
+  both appear in the typeset PDF, so it is not an extraction artefact.
 
-  We implement (40): $\beta_{\mathrm{eff}} = c/(1+cF_2) \to 1/F_2 = H/\omega$ as $c\to\infty$, pinned
-  by `diva_closure_test` check 1. So nothing to change — but worth knowing before comparing any
-  frozen-bed result against a published figure, in case the figure used (42).
+  (40) is correct, on two independent grounds. Internally: his eq (34) is
+  $u|_{z=b} = \bar u - \tau_x\omega/H$, so a frozen bed ($u|_{z=b}=0$) gives
+  $\tau_x = H\bar u/\omega$ immediately, and (42) cannot be reconciled with it. Externally:
+  Arthern's eq (12), citing Goldberg for the definition, is
+
+  $$\beta_{\mathrm{eff}} = \frac{\beta}{1 + \beta\,\mathcal{I}_2}, \qquad \mathcal{I}_2 = \int_b^s \frac{1}{\eta}\Big(\frac{s-z}{h}\Big)^{\!2} dz$$
+
+  whose $\beta\to\infty$ limit is $1/\mathcal{I}_2$, with **no factor of 2**. And
+  $\mathcal{I}_2$ is exactly our $F_2$: substituting $\zeta=(s-z)/H$ gives
+  $\mathcal{I}_2 = H\!\int_0^1 \zeta^2/\eta\,\mathrm{d}\zeta$, which is what the code accumulates.
+  So two independent implementations and one internal consistency check all give $H/\omega$; (42) is
+  the typo.
+
+  We implement (40): $\beta_{\mathrm{eff}} = c/(1+cF_2)\to 1/F_2$ as $c\to\infty$, pinned by
+  `diva_closure_test` check 1. Nothing to change.
 
 ### 5.2.3 Adaptive iteration, and the three things it took to get right
 
@@ -751,11 +766,19 @@ each other. Goldberg's eqs (38)–(39) are the local root find, and he is explic
 cell-local ("solved at a location along the base independently of other locations"), but in his
 actual scheme $\tau$ is likewise set after the momentum solve from the previous $\beta_{\mathrm{eff}}$.
 
-|  | implicit $\eta(\zeta)$ | closure for $U_b$, $\tau_b$ | outer |
-|---|---|---|---|
-| **Goldberg 2011** | lagged, one Picard step per momentum iteration | lagged | Picard on momentum |
-| **Arthern 2015** | solved exactly: cubic for $n=3$, then quadrature | lagged (given to the cubic) | Picard, residual tolerance |
-| **GLIDE (here)** | solved by Newton to tolerance | solved by Newton to tolerance, **jointly** with $\eta$ | multigrid + refresh; both residuals reported |
+|  | sliding law | implicit $\eta(\zeta)$ | closure for $U_b$, $\tau_b$ | outer |
+|---|---|---|---|---|
+| **Goldberg 2011** | general $f(u_b)$ | lagged, one Picard step per momentum iteration | root find (eqs 38–39) | Picard on momentum |
+| **Arthern 2015** | **linear** (Robin, eq 8) | solved exactly: cubic for $n=3$, then quadrature | closed form, eq 12 | Picard, residual tolerance |
+| **GLIDE (here)** | general $f(u_b)$ | solved by Newton to tolerance | root find, **jointly** with $\eta$ | multigrid + refresh; both residuals reported |
+
+**Which explains why neither paper details the joint problem: neither one faces it.** Goldberg has
+the nonlinear closure but lags the viscosity. Arthern solves the viscosity but his drag is linear
+(eq 8, $\boldsymbol\tau_b = \beta\mathbf u_b$), so his closure inverts in closed form and there is
+nothing to iterate. Our scheme is the union of the two hard parts — a nonlinear sliding law *and* a
+converged depth-varying viscosity, resolved against each other — because we want learned sliding
+laws and an exact gradient. That combination appears not to be in the literature, which is the real
+answer to "why is there so little detail on the implicit viscosity".
 
 So we are strictly more converged locally than either, and the joint resolution is the part neither
 paper does: our quadrature sits *inside* the closure Newton, so $\eta$, $F_2$ and $U_b$ are mutually

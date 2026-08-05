@@ -892,6 +892,27 @@ intermediate $L$, falling at large $L$ where the flow becomes sliding-dominated 
 rising toward 1). Both schemes solve the same 2-D operator, so the entire difference is in
 $\bar\eta$ and $\beta_{\mathrm{eff}}$.
 
+Diagnostic gotcha worth recording, since the first version of both this table and the SSA-limit
+test got it wrong: **`u_b` is a cell-centred SPEED while `u` is the x-component on a facet.**
+Dividing one by the other is not a sliding fraction and can exceed 1. It goes unnoticed in
+experiment C, where the flow is almost entirely in $x$ so the two nearly coincide -- but in the
+stiff-ice SSA-limit test it produced a *negative* deformation fraction, which is what exposed it.
+The denominator has to be the cell-centred $|\bar{\mathbf u}|$ from both averaged components.
+
+**The end-to-end SSA limit** is checked in `diva_solve_test`: stiffening the ice removes the
+vertical shear, since the shear strain rate scales like $B^{-n}$, so the DIVA solution must collapse
+onto the SSA one. It does, monotonically, and the deformation fraction tracks the gap closely --
+which is the internal consistency one wants, the gap being nothing other than the deformation:
+
+| $B$ scale | 1 | 4 | 16 |
+|---|---|---|---|
+| DIVA $-$ SSA | 4.59% | 0.92% | 0.21% |
+| deformation fraction | 3.54% | 0.77% | 0.19% |
+
+Together with `diva_closure_test` check 1 (the SSA limit at $\tau_b = 0$, coefficient level) and
+`diva_slab_test` (the SIA limit, analytic), both asymptotic limits are now pinned at both the
+coefficient and the solve level.
+
 **This is not yet a validation, and two things stand between it and one:**
 
 1. **No reference data.** ISMIP-HOM has no analytical solution; the reference is the spread of the

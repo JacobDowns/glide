@@ -12,7 +12,13 @@ the way the physics requires, rather than against a stored regression:
   * F2 > 0 wherever there is ice, and the solve is deterministic;
   * the answer does not depend on multigrid depth -- the coarse-grid correction has to
     be consistent with the DIVA operator, since each level diagnoses its own
-    eta_bar/F2/beta_eff from its own restricted state.
+    eta_bar/F2/beta_eff from its own restricted state;
+  * it converges onto SSA as the ice stiffens -- the END-TO-END SSA limit. The vertical
+    shear strain rate scales like B^-n, so stiffening the ice must drive the DIVA
+    solution onto the SSA one. The coefficient-level version of this limit is
+    diva_closure_test check 1 (eta_bar collapses onto the membrane viscosity at
+    tau_b = 0) and the SIA limit is diva_slab_test; this is the only one that exercises
+    the whole solve.
 
     uv run python tests/diva_solve_test.py
 """
@@ -33,7 +39,7 @@ RHO_I = cp.float32(917.0)
 GRAV = cp.float32(9.81)
 
 
-def solve(stress_balance, vcycles=15, levels=None):
+def solve(stress_balance, vcycles=15, levels=None, B_scale=1.0):
     """Cold-started, converged solve under the requested stress balance."""
     x = cp.arange(nx, dtype=cp.float32) * dx
     y = cp.arange(ny, dtype=cp.float32) * dx
@@ -43,7 +49,7 @@ def solve(stress_balance, vcycles=15, levels=None):
     thk = srf - bed
     beta = (1000 * cp.sin(2 * cp.pi * X / L) * cp.sin(2 * cp.pi * Y / L) + 1000) / (RHO_I * GRAV)
     B = cp.ones((ny, nx), dtype=cp.float32)
-    B.fill((1e-16 ** -(1. / 3)) / (RHO_I * GRAV))
+    B.fill(B_scale * (1e-16 ** -(1. / 3)) / (RHO_I * GRAV))
 
     mg = Multigrid(levels or n_levels, ny=ny, nx=nx, dx=dx)
     mg.geometry.bed.set(bed)
@@ -78,6 +84,13 @@ def solve(stress_balance, vcycles=15, levels=None):
     return dict(u=cp.asnumpy(grid.state.u.data), v=cp.asnumpy(grid.state.v.data),
                 u_b=cp.asnumpy(grid.state.u_b.data), F2=cp.asnumpy(grid.rheology.F2.data),
                 H=cp.asnumpy(grid.state.H.data), residual=final)
+
+
+def cell_speed(r):
+    """Cell-centred |ubar| from the staggered components, which is what u_b is comparable to."""
+    u_ctr = 0.5 * (r['u'][:, :-1] + r['u'][:, 1:])
+    v_ctr = 0.5 * (r['v'][:-1, :] + r['v'][1:, :])
+    return np.hypot(u_ctr, v_ctr)
 
 
 def main():
@@ -123,7 +136,28 @@ def main():
         assert got['residual'] < 1e-2, f"n_levels={depth} did not converge"
         assert rel < 2e-3, f"n_levels={depth} disagrees with the single-grid solution"
 
-    print("\nOK: DIVA forward solve converges and is physically consistent")
+    # ---- end-to-end SSA limit: stiffen the ice and DIVA must collapse onto SSA ----
+    print("\nSSA limit -- stiffening the ice removes the vertical shear:")
+    prev = None
+    for B_scale in (1.0, 4.0, 16.0):
+        ssa = solve(0.0, B_scale=B_scale)
+        div = solve(1.0, B_scale=B_scale)
+        # u_b is a cell-centred SPEED, so it has to be compared against the cell-centred speed,
+        # not against the x-component of the facet velocity.
+        sp_s, sp_d = cell_speed(ssa), cell_speed(div)
+        rel = abs(sp_d.mean() - sp_s.mean()) / sp_s.mean()
+        deform = 1.0 - div['u_b'].mean() / max(sp_d.mean(), 1e-30)
+        print(f"  B x {B_scale:<5g} DIVA-SSA = {rel:8.2%}   deformation fraction = {deform:7.2%}")
+        if prev is not None:
+            assert rel < prev, (
+                f"DIVA does not approach SSA as the ice stiffens: {rel:.2%} at B x {B_scale} "
+                f"is not below {prev:.2%} at the previous scale")
+        prev = rel
+    assert prev < 5e-3, (
+        f"DIVA has not collapsed onto SSA in the stiff limit: {prev:.2%}. The vertical shear "
+        f"scales like B^-n, so it must.")
+
+    print("\nOK: DIVA forward solve converges, is physically consistent, and recovers SSA")
 
 
 if __name__ == '__main__':

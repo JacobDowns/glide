@@ -89,9 +89,14 @@ def run(L, stress_balance, n_sigma=8.0):
     # the central tile, along y = L/4 (modulo the tiling)
     ys = int((TILES // 2 + 1. / 4) * BASE_RES)
     xs = slice(TILES // 2 * BASE_RES, (TILES // 2 + 1) * BASE_RES)
-    ubar = cp.asnumpy(model.mg[0].state.u.data)[ys, xs]
-    u_b = cp.asnumpy(model.mg[0].state.u_b.data)[ys, xs] if stress_balance > 0.5 else ubar
-    return ubar, u_b, resid, r_ub, len(cycles)
+    u = cp.asnumpy(model.mg[0].state.u.data)
+    v = cp.asnumpy(model.mg[0].state.v.data)
+    ubar = u[ys, xs]
+    # u_b is a cell-centred SPEED, so the sliding fraction needs the cell-centred speed in the
+    # denominator, not the x-component of the facet velocity.
+    speed = np.hypot(0.5 * (u[:, :-1] + u[:, 1:]), 0.5 * (v[:-1, :] + v[1:, :]))[ys, xs]
+    u_b = cp.asnumpy(model.mg[0].state.u_b.data)[ys, xs] if stress_balance > 0.5 else speed
+    return ubar, speed, u_b, resid, r_ub, len(cycles)
 
 
 def main():
@@ -103,10 +108,10 @@ def main():
     print("-" * len(hdr))
     rows = []
     for L in LENGTH_SCALES:
-        u_ssa, _, r_s, _, n_s = run(L, 0.0)
-        u_div, ub_div, r_d, rub, n_d = run(L, 1.0)
-        rel = (u_div.mean() - u_ssa.mean()) / u_ssa.mean()
-        slip = ub_div.mean() / u_div.mean()
+        u_ssa, sp_ssa, _, r_s, _, n_s = run(L, 0.0)
+        u_div, sp_div, ub_div, r_d, rub, n_d = run(L, 1.0)
+        rel = (sp_div.mean() - sp_ssa.mean()) / sp_ssa.mean()
+        slip = ub_div.mean() / sp_div.mean()
         print(f"{L / 1000:7g} | {u_ssa.mean():9.3f} {u_div.mean():10.3f} {rel:+6.1%} | "
               f"{u_ssa.max():8.3f} {u_div.max():9.3f} | {slip:9.3f} | {r_d:9.1e} {rub:8.1e}")
         rows.append((L, u_ssa, u_div, ub_div))

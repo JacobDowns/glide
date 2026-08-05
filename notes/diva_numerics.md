@@ -820,6 +820,98 @@ his recovered basal drag varies by factors exceeding $10^{10}$ and resists any $
 That is an argument from the observational side for the learned-closure direction, from an author
 with no stake in it.
 
+### 5.10 The analytic slab check, and what `eps_reg` and $N_\sigma$ cost
+
+Every other DIVA test checks the code against itself. The uniform slab is the first check against
+an **external truth**, and it is exact: uniform thickness, uniform slope, uniform drag, so membrane
+stresses vanish, all driving stress reaches the bed, and the shear profile integrates twice in
+closed form. Verified symbolically both ways (`tests/diva_slab_test.py`):
+
+$$\bar u - u_b = \frac{2AH\tau_b^{\,n}}{n+2} \qquad\Longrightarrow\qquad F_2 = \frac{2AH\tau_b^{\,n-1}}{n+2}, \quad A = B^{-n}$$
+
+and DIVA's own definition $F_2 = H\!\int_0^1 \zeta^2/\eta\,\mathrm d\zeta$, built from the
+depth-varying viscosity with no reference to the SIA result, must reproduce it.
+
+**It does, to 5.1e-5 — the float32 floor — once the regularization is removed.** So the
+formulation and the quadrature are right. Note $\bar\eta$ is *not* checkable this way: in pure
+shear $\eta \sim \zeta^{1-n}$ diverges at the stress-free surface, so its depth average is set by
+$\varepsilon_{\mathrm{reg}}$ rather than by the physics. $F_2$'s $\zeta^2$ weight removes that
+singularity, which is why $F_2$ is the well-posed quantity and the one the momentum balance
+consumes.
+
+**$N_\sigma$ convergence** — the item §7 had listed as outstanding. Midpoint quadrature, clean
+second order:
+
+| $N_\sigma$ | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|
+| rel. error in $F_2$ | 5.2e-2 | **1.3e-2** | 3.3e-3 | 8.1e-4 |
+
+exactly $4\times$ per doubling. The integrand is $\zeta^2/\eta \propto \zeta^{n+1}$, so for integer
+$n$ it is a *polynomial* — **Gauss–Legendre would integrate it exactly** with $\lceil (n+2)/2\rceil$
+points in the unregularized limit, against 32+ midpoint points for the same accuracy. Worth doing;
+not done.
+
+**What $\varepsilon_{\mathrm{reg}} = 10^{-6}$ costs.** This is the finding worth acting on. It is a
+squared strain rate, so it caps the viscosity wherever the shear term falls below it — and DIVA's
+vertical shear strain rate is far smaller than the membrane strain rates
+$\varepsilon_{\mathrm{reg}}$ was chosen for:
+
+| $\tau_b$ (code) | $\approx$ kPa | error in $F_2$ | column regularized |
+|---:|---:|---:|---:|
+| 13.6 | 123 | 1.2% | top 18% |
+| 6.3 | 57 | 1.5% | top 38% |
+| 4.8 | 43 | 7.7% | top 50% |
+| 0.4 | 3.6 | **5951%** | all of it |
+
+The last row is not a corner case: 3.6 kPa is slow interior ice, which is exactly the regime DIVA
+exists to represent. There the deformational velocity is essentially manufactured by the
+regularization. Nothing is wrong with the closure — part 1 of the test shows the formulation is
+exact — but $\varepsilon_{\mathrm{reg}}$ is an SSA-era parameter and DIVA inherits it in a term
+where it does far more damage. Both this and the $N_\sigma$ error suppress deformation, so they
+bias the same way.
+
+Options, none taken yet: lower $\varepsilon_{\mathrm{reg}}$ for DIVA runs; regularize the membrane
+and shear invariants separately; or add the shear term before regularizing (the code currently adds
+$\varepsilon_{\mathrm{reg}}$ once to the total, which is right for SSA and arguably wrong here).
+That is a modelling decision, not a bug fix.
+
+### 5.11 ISMIP-HOM experiment C: SSA against DIVA
+
+`examples/ismip-hom/ismip-hom.py` already sets up experiment C correctly -- 1000 m slab, 0.1
+degree slope, $\beta = 1000 + 1000\sin(2\pi x/L)\sin(2\pi y/L)$, $A = 10^{-16}$, $L$ from 5 to
+160 km, tiled $5\times5$ because GLIDE has Dirichlet rather than periodic edges.
+`ismip_hom_c_ssa_vs_diva.py` runs both stress balances on it:
+
+| $L$ (km) | 5 | 10 | 20 | 40 | 80 | 160 |
+|---|---|---|---|---|---|---|
+| DIVA $-$ SSA, mean $\bar u$ | +4.2% | +4.8% | +4.8% | +4.3% | +3.5% | +2.6% |
+| sliding fraction $u_b/\bar u$ | 0.965 | 0.962 | 0.964 | 0.969 | 0.976 | 0.982 |
+
+The difference is the vertical shear SSA cannot represent, and it behaves sensibly: largest at
+intermediate $L$, falling at large $L$ where the flow becomes sliding-dominated (sliding fraction
+rising toward 1). Both schemes solve the same 2-D operator, so the entire difference is in
+$\bar\eta$ and $\beta_{\mathrm{eff}}$.
+
+**This is not yet a validation, and two things stand between it and one:**
+
+1. **No reference data.** ISMIP-HOM has no analytical solution; the reference is the spread of the
+   participating full-Stokes models, published as figures in Pattyn et al. (2008) and reproduced
+   for DIVA in Goldberg (2011). Those numbers are not in this repository. Getting them means the
+   ISMIP-HOM archive or digitising the figures.
+
+2. **We report the wrong quantity.** The published diagnostic is SURFACE velocity along $y=L/4$.
+   GLIDE's state variable is depth-averaged. For SSA they coincide; for DIVA they do not, and
+   recovering the surface value needs the first shear moment
+
+   $$F_1 = H\!\int_0^1 \frac{\zeta}{\eta}\,\mathrm d\zeta, \qquad u_s = u_b + \tau_b F_1$$
+
+   which is Arthern's $\mathcal I_1$ (his eq 10) and is one more running sum in the quadrature loop
+   that already computes $F_2$. Cheap, and required before any literature comparison.
+
+Also worth noting for that comparison: experiment C has a **flat bed**, so the bed-slope factor of
+§5.2.1b is irrelevant here. It becomes relevant for experiments A and B, whose bumpy beds are the
+point.
+
 ## 6. Verification status
 
 | test | what it establishes |

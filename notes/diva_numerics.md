@@ -839,17 +839,37 @@ $\varepsilon_{\mathrm{reg}}$ rather than by the physics. $F_2$'s $\zeta^2$ weigh
 singularity, which is why $F_2$ is the well-posed quantity and the one the momentum balance
 consumes.
 
-**$N_\sigma$ convergence** — the item §7 had listed as outstanding. Midpoint quadrature, clean
-second order:
+**$N_\sigma$ convergence, and why the quadrature is now Gauss–Legendre.** Midpoint was clean second
+order — $4\times$ per doubling, rel. error in $F_2$ of 5.2e-2 / 1.3e-2 / 3.3e-3 / 8.1e-4 at
+$N_\sigma = 4/8/16/32$ — which meant the **default $N_\sigma=8$ carried a 1.3% systematic error of
+its own**, on top of the regularization error below and in the same direction.
 
-| $N_\sigma$ | 4 | 8 | 16 | 32 |
-|---|---|---|---|---|
-| rel. error in $F_2$ | 5.2e-2 | **1.3e-2** | 3.3e-3 | 8.1e-4 |
+But in the shear-dominated limit $\eta \sim \zeta^{1-n}$, so the integrands are
 
-exactly $4\times$ per doubling. The integrand is $\zeta^2/\eta \propto \zeta^{n+1}$, so for integer
-$n$ it is a *polynomial* — **Gauss–Legendre would integrate it exactly** with $\lceil (n+2)/2\rceil$
-points in the unregularized limit, against 32+ midpoint points for the same accuracy. Worth doing;
-not done.
+$$\frac{\zeta}{\eta} \propto \zeta^{n}, \qquad \frac{\zeta^2}{\eta} \propto \zeta^{n+1}$$
+
+**polynomials for integer $n$**, which Gauss–Legendre integrates *exactly*. Switched to GL, and the
+node thresholds come out precisely where the theory says:
+
+| $N_\sigma$ | 2 | 3 | 4 | 8 | 32 |
+|---|---|---|---|---|---|
+| $F_2$ error (degree $n{+}1=4$) | 2.8e-2 | **2.4e-7** | 1.0e-8 | 1.2e-7 | 1.5e-7 |
+| $F_1$ error (degree $n=3$) | **1.9e-7** | 2.8e-7 | 1.3e-7 | 4.2e-7 | 3.5e-7 |
+
+$F_2$ needs 3 nodes and $F_1$ needs 2, exactly $\lceil (\text{degree}+1)/2\rceil$. Everything from
+there up is round-off. Two consequences: the 1.3% quadrature bias at the default is simply gone
+(it is why the $\tau_b = 13.6$ row below improved from 1.2% to 0.1%), and $N_\sigma$ can be 3 or 4
+rather than 8 — which does not measurably change runtime, since the coefficient kernel is a small
+fraction of it, but matters directly for memory if a per-level velocity profile is ever stored.
+
+The rule is built on the host by `numpy.polynomial.legendre.leggauss`, mapped to $[0,1]$ with
+weights scaled to sum to 1, cached on $N_\sigma$, and passed to the kernels as two small arrays.
+No table in the CUDA, and any $N_\sigma$ works.
+
+Note GL gives whole-interval integrals only. A *partial* moment
+$G(\zeta) = H\!\int_\zeta^1 (\zeta'/\eta)\,\mathrm d\zeta'$, which is what a velocity profile at
+intermediate depths needs, does not fall out of a GL rule the way it would from a cumulative
+midpoint sum. That is a separate design problem, flagged in §5.12.
 
 **What $\varepsilon_{\mathrm{reg}} = 10^{-6}$ costs.** This is the finding worth acting on. It is a
 squared strain rate, so it caps the viscosity wherever the shear term falls below it — and DIVA's
@@ -858,7 +878,7 @@ $\varepsilon_{\mathrm{reg}}$ was chosen for:
 
 | $\tau_b$ (code) | $\approx$ kPa | error in $F_2$ | column regularized |
 |---:|---:|---:|---:|
-| 13.6 | 123 | 1.2% | top 18% |
+| 13.6 | 123 | 0.1% | top 18% |
 | 6.3 | 57 | 1.5% | top 38% |
 | 4.8 | 43 | 7.7% | top 50% |
 | 0.4 | 3.6 | **5951%** | all of it |
@@ -874,6 +894,59 @@ Options, none taken yet: lower $\varepsilon_{\mathrm{reg}}$ for DIVA runs; regul
 and shear invariants separately; or add the shear term before regularizing (the code currently adds
 $\varepsilon_{\mathrm{reg}}$ once to the total, which is right for SSA and arguably wrong here).
 That is a modelling decision, not a bug fix.
+
+### 5.10a The first shear moment $F_1$, and the surface velocity
+
+$F_2$ is what the momentum balance needs. $F_1$ is what **observations** measure:
+
+$$F_1 = H\!\int_0^1 \frac{\zeta}{\eta}\,\mathrm d\zeta, \qquad u_s = u_b + \tau_b F_1$$
+
+which is Arthern's $\mathcal I_1$ (his eq 10). Accumulated in the same quadrature loop as $F_2$ at
+negligible cost, checked against its analytic slab value $2AH\tau_b^{n-1}/(n+1)$ in
+`diva_slab_test`, and exposed as `rheology.F1`.
+
+Why it matters beyond diagnostics: **GLIDE's inversions use $\bar u$ as the model counterpart to
+observed surface velocity.** That is *exact* for SSA, where the two coincide. Under DIVA they do
+not, and the difference is precisely the deformation — up to ~5% on ISMIP-HOM C (§5.11) and much
+more in slow interior ice. So a DIVA inversion against surface observations is systematically
+biased unless the objective uses $u_s$, and using $u_s$ means $F_1$ must enter the **adjoint**:
+$\partial F_1/\partial\dot\varepsilon^2_{\mathrm{mem}}$, $\partial F_1/\partial\bar U$ and the
+parameter analogues, contracted through a $W_{F_1}$ field. That is the same cell-local pattern as
+$F_2$'s, so the machinery exists, but it is a real extension with its own verification burden —
+not done, and scoped separately.
+
+### 5.12 A velocity profile at arbitrary depth: what it would take
+
+Integrating the shear ansatz up from the bed gives one family rather than a set of separate
+integrals:
+
+$$u(\zeta) = u_b + \tau_b\,G(\zeta), \qquad G(\zeta) = H\!\int_\zeta^1 \frac{\zeta'}{\eta}\,\mathrm d\zeta'$$
+
+with $G(1) = 0$ (bed), $G(0) = F_1$ (surface) and $\int_0^1 G\,\mathrm d\zeta = F_2$ (depth
+average) — all three verified, the last symbolically for the slab and numerically for arbitrary
+$\eta$. So $F_1$ and $F_2$ are the endpoint and the mean of the *same* partial moment.
+
+The practical consequence is that the whole 3-D velocity is **one scalar field per level**. Because
+$\mathbf u_b \parallel \bar{\mathbf u}$ (isotropic drag; Goldberg's collinearity),
+
+$$\mathbf u(\zeta) = \hat s(\zeta)\,\bar{\mathbf u}, \qquad \hat s(\zeta) = \frac{U_b + \tau_b G(\zeta)}{\bar U}$$
+
+applied to the existing staggered depth-averaged components. Direction is preserved automatically,
+and there are two free self-checks: $\hat s(1)$ is the sliding fraction and $\int \hat s\,\mathrm
+d\zeta = 1$ by construction.
+
+Not implemented. Two things to get right when it is:
+
+- **Gauss–Legendre does not give partial integrals.** It is optimal for $F_1$ and $F_2$ and useless
+  for $G(\zeta_k)$, so the profile needs its own scheme — GL on each subinterval, or a cumulative
+  rule alongside the moment rule.
+- Under the old midpoint rule the natural cumulative sum landed on cell *edges*, not the sample
+  points, which would have put an $O(h)$ error in the profile while $F_2$ stayed $O(h^2)$. The slab
+  gives an analytic profile $u(\zeta) = u_b + 2AH\tau_b^n(1-\zeta^{n+1})/(n+1)$ to check against.
+
+Beyond that, the thermal coupling also wants $w$, from $\partial_z w = -(\partial_x u + \partial_y v)$
+integrated from the bed — which needs horizontal derivatives of the reconstructed profile and is
+materially more work than the rest.
 
 ### 5.11 ISMIP-HOM experiment C: SSA against DIVA
 

@@ -1,4 +1,5 @@
 import cupy as cp
+import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -58,12 +59,37 @@ class ForwardOperators:
         self._u_bar = None
         self._diva_caps = None
 
+        # Gauss-Legendre quadrature rule for the vertical integrals, cached on n_sigma
+        self._gl_n = None
+        self._gl_zeta = None
+        self._gl_w = None
+
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
 
         self.vanka_config = VankaConfig()
 
 
+
+    def _quadrature(self):
+        """Gauss-Legendre nodes and weights on [0,1] for DIVA's vertical integrals.
+
+        The integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) where the shear
+        dominates, so they behave like polynomials of degree n and n+1 -- which Gauss-Legendre
+        integrates EXACTLY with ceil((n+2)/2) nodes.  Midpoint quadrature is only second order
+        and needed 32+ nodes for what 4 Gauss nodes deliver; see notes/diva_numerics.md 5.10.
+
+        Built on the host by numpy, so any n_sigma works with no table in the kernel, and cached
+        because it changes only if n_sigma does.  Weights are scaled to sum to 1, so the eta
+        accumulation is a depth AVERAGE with no further division.
+        """
+        n = int(self.grid.rheology.n_sigma.value)
+        if self._gl_n != n:
+            x, w = np.polynomial.legendre.leggauss(n)
+            self._gl_zeta = cp.asarray(0.5*(x + 1.0), dtype=cp.float32)
+            self._gl_w = cp.asarray(0.5*w, dtype=cp.float32)
+            self._gl_n = n
+        return self._gl_zeta, self._gl_w
 
     @property
     def _kernel_config(self):
@@ -187,7 +213,7 @@ class ForwardOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
-                *((int(rheology.n_sigma.value),) if diva else ()),
+                *((int(rheology.n_sigma.value), *self._quadrature()) if diva else ()),
                 grid.ny, grid.nx, stride, halo)) 
 
     def compute_phi(self, relaxation=cp.float32(0.0)):
@@ -220,7 +246,8 @@ class ForwardOperators:
 
         kernel(grid_size, block_size,
                    (rheology.eta_bar.data, rheology.F2.data, state.u_b.data,
-                    sliding.beta_eff.data, self._diva_caps,
+                    sliding.beta_eff.data, rheology.F1.data, self._diva_caps,
+                    *self._quadrature(),
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data,
                     sliding.m.value, sliding.u_reg.value,
@@ -301,6 +328,7 @@ class ForwardOperators:
                     sliding.water_drag.value, sliding.sliding_law.value,
                     rheology.n.value, rheology.eps_reg.value, grid.dx,
                     int(rheology.n_sigma.value),
+                    *self._quadrature(),
                     grid.ny, grid.nx,
                     stride, halo))
 

@@ -555,6 +555,8 @@ __device__ void jvp_body(
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int n_sigma,                            // DIVA only
+    const float* __restrict__ zeta_q,       // DIVA only: quadrature nodes
+    const float* __restrict__ w_q,          // DIVA only: quadrature weights
     int ny, int nx, int stride, int halo)
 {
     const int bny = 16;
@@ -575,7 +577,7 @@ __device__ void jvp_body(
 	populate_diva_coeffs_dual(eta_local, beta_eff_local, bi, bj, i, j,
 		u, v, d_u, d_v, H, phi, B, beta, u_c, u_b,
 		m, u_reg, water_drag, sliding_law,
-		n, eps_reg, dx, n_sigma, ny, nx);
+		n, eps_reg, dx, n_sigma, zeta_q, w_q, ny, nx);
     } else {
 	populate_viscosity(eta_local, bi, bj, i, j, u, v, d_u, d_v, B, n, eps_reg, dx, ny, nx);
     }
@@ -912,7 +914,7 @@ void compute_jvp(
 	    bed,B,beta,u_c,gamma,nullptr,use_mask,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
-	    calving_rate,flotation_reg_calving,dx,dt,0,ny,nx,stride,halo);
+	    calving_rate,flotation_reg_calving,dx,dt,0,nullptr,nullptr,ny,nx,stride,halo);
 }
 
 // J*d for DIVA.  Carries the exact closure sensitivity: eta_bar and beta_eff are
@@ -946,12 +948,14 @@ void compute_jvp_diva(
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int n_sigma,                            // DIVA only
+    const float* __restrict__ zeta_q,       // DIVA only: quadrature nodes
+    const float* __restrict__ w_q,          // DIVA only: quadrature weights
     int ny, int nx, int stride, int halo){
     jvp_body<true>(jvp_u,jvp_v,jvp_H,u,v,H,d_u,d_v,d_H,phi,mask,f_u,f_v,f_H,
 	    bed,B,beta,u_c,gamma,u_b,use_mask,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
-	    calving_rate,flotation_reg_calving,dx,dt,n_sigma,ny,nx,stride,halo);
+	    calving_rate,flotation_reg_calving,dx,dt,n_sigma,zeta_q,w_q,ny,nx,stride,halo);
 }
 
 /*=========================================================

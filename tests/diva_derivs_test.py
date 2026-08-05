@@ -38,6 +38,7 @@ void deriv_probe(const float* eps, const float* Ubar, const float* beta,
                  float* deta_deps, float* deta_dU, float* dbe_deps, float* dbe_dU,
                  float* deta_dbeta, float* dbe_dbeta,
                  float* deta_duc, float* dbe_duc, float* deta_dm, float* dbe_dm,
+                 const float* zq, const float* wq,
                  float H_c, float B_c,
                  float u_reg, float wd, float law,
                  float glen_exp, float eps_reg, int n_sigma, float U_b_warm, int n)
@@ -47,35 +48,39 @@ void deriv_probe(const float* eps, const float* Ubar, const float* beta,
     float e = eps[i], U = Ubar[i], bg = beta[i], u_c_c = u_cs[i], m = ms[i];
 
     int cap = 0;
-    float eta_f, F2_f, Ub_f, be_f;
+    float eta_f, F1_f, F2_f, Ub_f, be_f;
     diva_coeffs_cell<float>(e, U, H_c,B_c,bg,u_c_c, m,u_reg,wd,law,
-                            glen_exp,eps_reg,n_sigma,U_b_warm, eta_f,F2_f,Ub_f,be_f, cap);
+                            glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, eta_f,F1_f,F2_f,Ub_f,be_f, cap);
     eta_v[i]=eta_f; be_v[i]=be_f;
 
-    DualFloat a,b,c,d;
+    DualFloat a,f1d,b,c,d;
     diva_coeffs_cell<DualFloat>({e,1.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
     deta_deps[i]=a.d; dbe_deps[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,1.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
     deta_dU[i]=a.d; dbe_dU[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,1.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
     deta_dbeta[i]=a.d; dbe_dbeta[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,1.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
     deta_duc[i]=a.d; dbe_duc[i]=d.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,1.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,U_b_warm, a,b,c,d, cap);
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
     deta_dm[i]=a.d; dbe_dm[i]=d.d;
 }
 '''
 
 RHO_I, GRAV = 917.0, 9.81
+# Gauss-Legendre rule, the same one operators.py builds
+_x, _w = np.polynomial.legendre.leggauss(8)
+ZQ = cp.asarray(0.5*(_x + 1.0), dtype=cp.float32)
+WQ = cp.asarray(0.5*_w, dtype=cp.float32)
 H_C = 1000.0
 B_C = (1e-16 ** -(1. / 3)) / (RHO_I * GRAV)
 U_C_C, U_REG, WATER_DRAG = 100.0, 1.0, 0.0
@@ -98,6 +103,7 @@ def probe(mod, eps_arr, U_arr, beta_arr, u_c_arr, m_arr, law):
         (cp.asarray(eps_arr, cp.float32), cp.asarray(U_arr, cp.float32),
          cp.asarray(beta_arr, cp.float32), cp.asarray(u_c_arr, cp.float32),
          cp.asarray(m_arr, cp.float32), *out,
+         ZQ, WQ,
          np.float32(H_C), np.float32(B_C),
          np.float32(U_REG), np.float32(WATER_DRAG), np.float32(law),
          np.float32(GLEN_EXP), np.float32(EPS_REG), np.int32(N_SIGMA),

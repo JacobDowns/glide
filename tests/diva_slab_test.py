@@ -20,6 +20,13 @@ DIVA writes that same quantity as tau_b*F2, so it must produce
 and this is an independent statement: DIVA defines F2 = H*int zeta^2/eta dzeta, from the
 depth-varying viscosity, with no reference to the SIA result. Verified symbolically both ways.
 
+The same integral with weight zeta rather than zeta^2 gives the SURFACE velocity,
+
+    u_s = u_b + tau_b*F1,   F1 = 2*A*H*tau_b^(n-1)/(n+1)
+
+(Arthern eq 10), which is what velocity observations measure and what an ISMIP-HOM comparison
+needs. Both are checked here.
+
 WHAT IS AND IS NOT CHECKABLE HERE.  Only F2 (hence the deformational velocity). eta_bar is NOT:
 in pure shear eta ~ zeta^(1-n) diverges at the stress-free surface, so its depth average is set
 by the regularization rather than by the physics. F2's zeta^2 weight removes that singularity,
@@ -64,11 +71,18 @@ def coeffs(U0, beta, n_sigma, eps_reg):
     grid = mg.levels[0]
     grid.forward_operators.compute_diva_coeffs()
     at = lambda f: float(cp.asnumpy(f.data)[ny // 2, nx // 2])
-    return at(grid.rheology.F2), at(grid.state.u_b)
+    return at(grid.rheology.F2), at(grid.state.u_b), at(grid.rheology.F1)
 
 
 def F2_analytic(tau_b):
+    """ubar = u_b + tau_b*F2, the depth average."""
     return 2.0 * H0 * tau_b ** (GLEN_N - 1.0) / (B0 ** GLEN_N * (GLEN_N + 2.0))
+
+
+def F1_analytic(tau_b):
+    """u_surface = u_b + tau_b*F1.  Same integral with weight zeta instead of zeta^2, so the
+    n+2 becomes n+1 -- verified symbolically alongside F2."""
+    return 2.0 * H0 * tau_b ** (GLEN_N - 1.0) / (B0 ** GLEN_N * (GLEN_N + 1.0))
 
 
 def regularized_fraction(tau_b, eps_reg):
@@ -87,7 +101,7 @@ def main():
     for U0, beta in ((100.0, 0.05), (100.0, 0.5), (20.0, 0.5)):
         errs = []
         for eps_reg in (1e-6, 1e-8, 1e-10, 1e-12):
-            F2, u_b = coeffs(U0, beta, 128, eps_reg)
+            F2, u_b, F1 = coeffs(U0, beta, 128, eps_reg)
             tau_b = beta * u_b
             errs.append(abs(F2 - F2_analytic(tau_b)) / F2_analytic(tau_b))
         print(f"  U0={U0:<6g} beta={beta:<6g} tau_b={tau_b:8.4g}   " +
@@ -100,21 +114,28 @@ def main():
     print(f"  -> converged to {worst_converged:.1e} at eps_reg = 1e-12, i.e. the float32 floor\n")
 
     # ---- 2. quadrature order, at a regularization small enough not to dominate ----
-    print("n_sigma convergence at eps_reg = 1e-12 (U0 = 100, beta = 0.5):")
-    prev = None
-    for n_sigma in (4, 8, 16, 32):
-        F2, u_b = coeffs(100.0, 0.5, n_sigma, 1e-12)
-        err = abs(F2 - F2_analytic(beta * u_b)) / F2_analytic(beta * u_b)
-        ratio = "" if prev is None else f"   ({prev / max(err, 1e-30):.1f}x)"
-        print(f"  n_sigma = {n_sigma:<4d} rel err = {err:.2e}{ratio}")
-        prev = err
+    print("n_sigma convergence at eps_reg = 1e-12 (U0 = 100, beta = 0.5).")
+    print("The integrand is zeta^(n+1), a polynomial for integer n, so Gauss-Legendre is EXACT")
+    print("from ceil((n+2)/2) = 3 nodes upward -- no convergence sequence to speak of:")
+    for n_sigma in (2, 3, 4, 8, 32):
+        F2, u_b, F1 = coeffs(100.0, 0.5, n_sigma, 1e-12)
+        e2 = abs(F2 - F2_analytic(0.5 * u_b)) / F2_analytic(0.5 * u_b)
+        e1 = abs(F1 - F1_analytic(0.5 * u_b)) / F1_analytic(0.5 * u_b)
+        print(f"  n_sigma = {n_sigma:<4d} F2 err = {e2:.2e}   F1 err = {e1:.2e}")
+    F2, u_b, F1 = coeffs(100.0, 0.5, 3, 1e-12)
+    e3 = abs(F2 - F2_analytic(0.5 * u_b)) / F2_analytic(0.5 * u_b)
+    assert e3 < FLOOR, (
+        f"Gauss-Legendre with 3 nodes should integrate a degree-{int(GLEN_N)+1} polynomial "
+        f"exactly, got {e3:.2e}")
+    e1 = abs(F1 - F1_analytic(0.5 * u_b)) / F1_analytic(0.5 * u_b)
+    assert e1 < FLOOR, f"F1 disagrees with the analytic surface moment: {e1:.2e}"
 
     # ---- 3. what the DEFAULT regularization costs, which is the point of this test ----
     print(f"\nWhat eps_reg = 1e-6 (the default) costs at realistic driving stresses.")
     print(f"tau_b is in code units; multiply by rho*g = {RHO_I * GRAV:.0f} Pa/m for stress:")
     print(f"  {'tau_b':>7} {'~kPa':>7} {'F2 err':>9} {'column regularized':>20}")
     for U0, beta in ((100.0, 0.5), (20.0, 0.5), (100.0, 0.05), (20.0, 0.02)):
-        F2, u_b = coeffs(U0, beta, 8, 1e-6)
+        F2, u_b, F1 = coeffs(U0, beta, 8, 1e-6)
         tau_b = beta * u_b
         err = abs(F2 - F2_analytic(tau_b)) / F2_analytic(tau_b)
         frac = regularized_fraction(tau_b, 1e-6)

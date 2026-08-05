@@ -110,9 +110,12 @@ __device__ void diva_coeffs_cell(
     T eps_mem_sq, T U_bar,                       // the two velocity-dependent inputs
     float H_c, float B_c, T beta_grounded, T u_c_c,
     T m, float u_reg, float water_drag, float sliding_law,
-    float glen_exp, float eps_reg, int n_sigma,
+    float glen_exp, float eps_reg,
+    int n_sigma,
+    const float* __restrict__ zeta_q,     // quadrature nodes on [0,1], Gauss-Legendre
+    const float* __restrict__ w_q,        // matching weights, summing to 1
     float U_b_warm,
-    T& eta_bar_out, T& F2_out, T& U_b_out, T& beta_eff_out,
+    T& eta_bar_out, T& F1_out, T& F2_out, T& U_b_out, T& beta_eff_out,
     int& cap_flags_out)          // bit 0: closure Newton hit its cap; bit 1: an eta solve did
 {
     // Given U_bar, produce the two coefficients the momentum operator needs.  One unknown --
@@ -127,6 +130,18 @@ __device__ void diva_coeffs_cell(
     //
     //     eta_bar  = int eta(zeta) dzeta
     //     beta_eff = c(U_b)/(1 + c(U_b)*F2)                     (eq 41)
+    //
+    // F1 = H*int (zeta/eta) dzeta is the first shear moment, accumulated in the same loop.
+    // It is not needed by the momentum balance -- F2 is -- but it gives the SURFACE velocity,
+    // u_s = u_b + tau_b*F1 (Arthern eq 10), which is what velocity observations measure.  For
+    // SSA that coincides with the depth average; under DIVA it does not.
+    //
+    // The quadrature rule is passed IN rather than built here.  It is Gauss-Legendre: the
+    // integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) in the shear-dominated
+    // limit, so they behave like zeta^n and zeta^(n+1) -- polynomials for integer n, which
+    // Gauss-Legendre integrates EXACTLY with ceil((n+2)/2) nodes.  Midpoint needed 32+ nodes
+    // for what 3 or 4 Gauss nodes deliver (notes/diva_numerics.md 5.10).  Nodes and weights
+    // come from numpy on the host, so any n_sigma works without a table here.
     //
     // Newton on F, with the FULL slope
     //
@@ -175,13 +190,12 @@ __device__ void diva_coeffs_cell(
 
     cap_flags_out = 0;
 
-    float w = 1.0f/(float)n_sigma;
-
     T U_b; diva_from_float(U_b, U_b_warm);
     T coeff = get_diva_c_of_U<T>(U_b, beta_grounded, m, u_reg, water_drag, u_c_c, sliding_law);
     T tau_b = coeff * U_b;
 
     T eta_avg = T();
+    T F1_c = T();
     T F2_c = T();
 
     // Breaks only immediately AFTER a quadrature, never after a step, so eta_bar, F2 and
@@ -195,12 +209,14 @@ __device__ void diva_coeffs_cell(
         tau_b = coeff * U_b;
 
         eta_avg = T();
+        F1_c = T();
         F2_c = T();
         float dF2_dtau = 0.0f;              // primal only; see the Newton step below
         float tau_p = diva_primal(tau_b);
 
         for (int k = 0; k < n_sigma; ++k) {
-            float zeta = ((float)k + 0.5f)*w;
+            float zeta = zeta_q[k];
+            float wq   = w_q[k];
 
             // ---- per-level viscosity ----
             //
@@ -256,8 +272,9 @@ __device__ void diva_coeffs_cell(
             }
             if (!eta_ok) cap_flags_out |= 2;
 
-            eta_avg = eta_avg + w*eta_k;
-            F2_c    = F2_c + w*zeta*zeta/eta_k;
+            eta_avg = eta_avg + wq*eta_k;
+            F1_c    = F1_c + wq*zeta/eta_k;
+            F2_c    = F2_c + wq*zeta*zeta/eta_k;
 
             // d(F2)/d(tau_b) for the closure Newton's slope, accumulated here because
             // everything it needs is already in registers.  From the implicit function theorem
@@ -274,8 +291,9 @@ __device__ void diva_coeffs_cell(
             float E_p   = diva_primal(A_mem) + s_p;
             float dnm   = 1.0f + 2.0f*glen_exp*(s_p/E_p);       // = 1 - G_eta
             float deta_dtau = glen_exp*tau_p*zeta*zeta/(2.0f*eta_p*E_p*dnm);
-            dF2_dtau += w*zeta*zeta*(-deta_dtau/(eta_p*eta_p));
+            dF2_dtau += wq*zeta*zeta*(-deta_dtau/(eta_p*eta_p));
         }
+        F1_c     = F1_c * H_c;
         F2_c     = F2_c * H_c;
         dF2_dtau = dF2_dtau * H_c;
 
@@ -305,6 +323,7 @@ __device__ void diva_coeffs_cell(
     if (!closure_ok) cap_flags_out |= 1;
 
     eta_bar_out  = eta_avg;
+    F1_out       = F1_c;
     F2_out       = F2_c;
     U_b_out      = U_b;
     beta_eff_out = coeff/(1.0f + coeff*F2_c);
@@ -329,7 +348,10 @@ __device__ void populate_diva_coeffs_dual(
     const float* __restrict__ u_c,
     const float* __restrict__ u_b,
     float m, float u_reg, float water_drag, float sliding_law,
-    float n, float eps_reg, float dx, int n_sigma,
+    float n, float eps_reg, float dx,
+    int n_sigma,
+    const float* __restrict__ zeta_q,
+    const float* __restrict__ w_q,
     int ny, int nx){
 
     // Fills the eta_bar and beta_eff tiles as DUALS: the exact d/d(velocity direction) of the
@@ -357,14 +379,14 @@ __device__ void populate_diva_coeffs_dual(
     float u_c_c = get_cell(u_c, i, j, ny, nx);
     float U_b_warm = fminf(fmaxf(get_cell(u_b, i, j, ny, nx), 0.0f), U_bar.v);
 
-    DualFloat eta_d, F2_d, U_b_d, beta_eff_d;
+    DualFloat eta_d, F1_d, F2_d, U_b_d, beta_eff_d;
     int cap_sink = 0;      // the diagnostic path (compute_diva_coeffs) owns cap reporting
     diva_coeffs_cell<DualFloat>(eps_mem_sq, U_bar,
             H_c, B_c, DualFloat{beta_grounded, 0.0f}, DualFloat{u_c_c, 0.0f},
             DualFloat{m, 0.0f}, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma,
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q,
             U_b_warm,
-            eta_d, F2_d, U_b_d, beta_eff_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, beta_eff_d, cap_sink);
 
     eta_local[bi][bj] = eta_d;
     beta_eff_local[bi][bj] = beta_eff_d;
@@ -376,7 +398,10 @@ void compute_diva_coeffs(
     float* __restrict__ F2,
     float* __restrict__ u_b,
     float* __restrict__ beta_eff,
+    float* __restrict__ F1,            // first shear moment; gives the SURFACE velocity
     float* __restrict__ cap_flags,     // per-cell: which local solve failed to reach tolerance
+    const float* __restrict__ zeta_q,
+    const float* __restrict__ w_q,
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
@@ -431,14 +456,14 @@ void compute_diva_coeffs(
     // deformation can only add to sliding, so 0 <= U_b <= U_bar.
     float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar);
 
-    float eta_avg, F2_c, U_b, beta_eff_c;
+    float eta_avg, F1_c, F2_c, U_b, beta_eff_c;
     int caps = 0;
     diva_coeffs_cell<float>(eps_mem_sq, U_bar,
             H_c, B_c, beta_grounded, u_c_c,
             m, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma,
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q,
             U_b_warm,
-            eta_avg, F2_c, U_b, beta_eff_c, caps);
+            eta_avg, F1_c, F2_c, U_b, beta_eff_c, caps);
 
     if (is_active) {
         eta_bar[idx] = eta_avg;
@@ -447,6 +472,7 @@ void compute_diva_coeffs(
         // Goldberg eq 41: the secant drag the 2D momentum solve sees, tau_b = beta_eff*U_bar.
         // Strictly non-negative, and finite at rest (no division by the speed).
         beta_eff[idx] = beta_eff_c;
+        F1[idx] = F1_c;
         // Reduced and reported by the caller alongside |r_Ub|; should always be zero.
         cap_flags[idx] = (float)caps;
     }
@@ -539,6 +565,8 @@ void compute_diva_derivs(
     float m, float u_reg, float water_drag, float sliding_law,
     float n, float eps_reg, float dx,
     int n_sigma,
+    const float* __restrict__ zeta_q,
+    const float* __restrict__ w_q,
     int ny, int nx,
     int stride, int halo
     )
@@ -581,15 +609,15 @@ void compute_diva_derivs(
     int idx = i * nx + j;
     float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar_v);
 
-    DualFloat eta_d, F2_d, U_b_d, be_d;
+    DualFloat eta_d, F1_d, F2_d, U_b_d, be_d;
     int cap_sink = 0;      // derivative path; compute_diva_coeffs owns cap reporting
 
     // Seed 1: d/d(eps_mem^2)
     diva_coeffs_cell<DualFloat>({eps_mem_v,1.0f}, {U_bar_v,0.0f},
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d, cap_sink);
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
+            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_deps = eta_d.d;
     float d_be_deps  = be_d.d;
 
@@ -597,8 +625,8 @@ void compute_diva_derivs(
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,1.0f},
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d, cap_sink);
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
+            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_dU = eta_d.d;
     float d_be_dU  = be_d.d;
 
@@ -610,8 +638,8 @@ void compute_diva_derivs(
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
             H_c, B_c, {beta_grounded,grounded}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d, cap_sink);
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
+            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_dbeta = eta_d.d;
     float d_be_dbeta  = be_d.d;
 
@@ -620,8 +648,8 @@ void compute_diva_derivs(
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,1.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d, cap_sink);
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
+            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_duc = eta_d.d;
     float d_be_duc  = be_d.d;
 
@@ -632,8 +660,8 @@ void compute_diva_derivs(
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,1.0f}, u_reg, water_drag, sliding_law,
-            glen_exp, eps_reg, n_sigma, U_b_warm,
-            eta_d, F2_d, U_b_d, be_d, cap_sink);
+            glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
+            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
     float d_eta_dm = eta_d.d;
     float d_be_dm  = be_d.d;
 

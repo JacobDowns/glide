@@ -75,6 +75,7 @@ class Rheology:
     deta_dU: Field | None = None      # d(eta_bar)/d(Ubar)
     dbe_deps: Field | None = None     # d(beta_eff)/d(eps_mem^2)
     dbe_dU: Field | None = None       # d(beta_eff)/d(Ubar)
+    F1: Field | None = None           # H*int (zeta/eta) dzeta -- gives the SURFACE velocity
     deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)   -- for the parameter gradients
     dbe_dbeta: Field | None = None    # d(beta_eff)/d(beta)
     deta_duc: Field | None = None     # d(eta_bar)/d(u_c)    -- zero under Weertman
@@ -439,6 +440,7 @@ class Grid:
                 deta_dU=_cell('deta_dU','Pa a^2 m^{-1}','DIVA d(eta_bar)/d(Ubar)'),
                 dbe_deps=_cell('dbe_deps','?','DIVA d(beta_eff)/d(eps_mem^2)'),
                 dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'),
+                F1=_cell('F1','a','DIVA first shear moment H*int(zeta/eta)dzeta'),
                 deta_dbeta=_cell('deta_dbeta','?','DIVA d(eta_bar)/d(beta)'),
                 dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'),
                 deta_duc=_cell('deta_duc','?','DIVA d(eta_bar)/d(u_c)'),

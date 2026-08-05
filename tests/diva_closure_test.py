@@ -97,16 +97,17 @@ def reference_closure(beta, glen_exp):
     passed the block iteration's 2-cycle. See notes/diva_numerics.md 5.2.0.
     """
     A = EPS_REG                      # membrane strain rates vanish in this configuration
-    w = 1.0 / N_SIGMA
+    # Same Gauss-Legendre rule the kernel uses, built the same way (operators.py _quadrature).
+    _x, _w = np.polynomial.legendre.leggauss(N_SIGMA)
+    nodes, weights = 0.5 * (_x + 1.0), 0.5 * _w
 
     def quadrature(tau_b):
         eta_avg = 0.0
         F2 = 0.0
-        for k in range(N_SIGMA):
-            zeta = (k + 0.5) * w
+        for zeta, wq in zip(nodes, weights):
             eta = exact_level_viscosity(A, (tau_b * zeta / 2.0) ** 2, glen_exp)
-            eta_avg += w * eta
-            F2 += w * zeta * zeta / eta
+            eta_avg += wq * eta
+            F2 += wq * zeta * zeta / eta
         return eta_avg, F2 * H0
 
     # linear law here, so f(U_b) = beta*U_b
@@ -190,9 +191,13 @@ def check_idempotent():
 def main():
     glen_exp = (1.0 - GLEN_N) / (2.0 * GLEN_N)
     eta_mem = 0.5 * B0 * EPS_REG ** glen_exp
-    # Midpoint rule for int_0^1 zeta^2 dzeta (1/3 up to quadrature error).
-    quad = sum((1.0 / N_SIGMA) * (((k + 0.5) / N_SIGMA) ** 2) for k in range(N_SIGMA))
-    print(f"analytic: eta_membrane = {eta_mem:.4f}, quadrature int zeta^2 = {quad:.6f}")
+    # int_0^1 zeta^2 dzeta = 1/3 EXACTLY.  The vertical quadrature is Gauss-Legendre, which
+    # integrates a quadratic exactly with 2 nodes and so certainly with N_SIGMA of them, and
+    # this check pins that: under the previous midpoint rule the expected value carried the
+    # quadrature error (0.332031 at N_SIGMA = 8) and had to be computed rather than known.
+    quad = 1.0 / 3.0
+    print(f"analytic: eta_membrane = {eta_mem:.4f}, int zeta^2 = {quad:.6f} (exact under "
+          f"Gauss-Legendre)")
 
     # --- 1. zero drag: the SSA limit -------------------------------------------------
     mg = build()
@@ -203,7 +208,8 @@ def main():
           f"F2 = {F2:.5f} (expect {F2_expect:.5f}), u_b = {u_b:.4f} (expect {U0})")
     assert abs(eta_bar - eta_mem) / eta_mem < 1e-3, \
         "with no shear eta_bar must reduce to the SSA membrane viscosity"
-    assert abs(F2 - F2_expect) / F2_expect < 1e-3, "F2 disagrees with the quadrature"
+    assert abs(F2 - F2_expect) / F2_expect < 1e-5, (
+        "F2 disagrees with the exact integral -- Gauss-Legendre should make this round-off")
     assert abs(u_b - U0) / U0 < 1e-5, "with no drag all motion is sliding (u_b = U_bar)"
     assert abs(beta_eff) < 1e-6, "no drag -> beta_eff = 0"
 

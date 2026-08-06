@@ -890,10 +890,49 @@ exact — but $\varepsilon_{\mathrm{reg}}$ is an SSA-era parameter and DIVA inhe
 where it does far more damage. Both this and the $N_\sigma$ error suppress deformation, so they
 bias the same way.
 
-Options, none taken yet: lower $\varepsilon_{\mathrm{reg}}$ for DIVA runs; regularize the membrane
-and shear invariants separately; or add the shear term before regularizing (the code currently adds
-$\varepsilon_{\mathrm{reg}}$ once to the total, which is right for SSA and arguably wrong here).
-That is a modelling decision, not a bug fix.
+**It is not a DIVA-only question, which changes what can be done about it.** Measured against the
+membrane invariant $\varepsilon_{\mathrm{reg}}$ nominally regularizes:
+
+| configuration | median $\dot\varepsilon^2_{\mathrm{mem}}$ | vs $\varepsilon_{\mathrm{reg}}$ | cells below $\varepsilon_{\mathrm{reg}}$ |
+|---|---:|---:|---:|
+| ISMIP-HOM C, $L=20$ km | 4.7e-7 | 0.47$\times$ | 93% |
+| ISMIP-HOM C, $L=160$ km | 1.1e-7 | 0.11$\times$ | 76% |
+| gentle slab (gradient tests) | 4.4e-8 | 0.044$\times$ | 78% |
+| slow interior, 0.02° slope | 1.9e-9 | 0.002$\times$ | **100%** |
+
+So $\varepsilon_{\mathrm{reg}}$ is not a safety net that occasionally engages — it is the dominant
+term in the viscosity over most of the domain, **for SSA as well**. (The $\dot\varepsilon^2_{\mathrm{mem}}$
+estimate uses a centred approximation for the corner $\dot\varepsilon_{xy}$ terms rather than the
+exact four-corner form, so these are indicative to a factor.) Two consequences: lowering it changes
+SSA materially, not just DIVA; and it may well be a deliberate viscosity floor for solver
+robustness rather than a numerical nicety, which is a question for Doug rather than something to
+change unilaterally.
+
+**A structural constraint on any fix.** In the shear-dominated limit $\eta \sim \zeta^{1-n}$, so
+
+$$F_1 = H\!\int \frac{\zeta}{\eta}, \quad F_2 = H\!\int\frac{\zeta^2}{\eta} \quad\text{converge}, \qquad \bar\eta = \int \eta \quad\text{DIVERGES}$$
+
+Lowering $\varepsilon_{\mathrm{reg}}$ therefore makes $F_1$ and $F_2$ *more* accurate — they stay
+bounded, and a large $\eta$ simply means no deformation — while inflating $\bar\eta$ without bound
+in the idealized pure-shear case. A single value cannot serve both moments in that limit. In
+practice $\dot\varepsilon^2_{\mathrm{mem}} > 0$ bounds $\bar\eta$, but per the table above it is
+$\varepsilon_{\mathrm{reg}}$ and not the membrane strain that is doing the bounding today.
+
+Options, none taken:
+
+1. **Lower $\varepsilon_{\mathrm{reg}}$ globally.** Simplest, and the slab test says $10^{-10}$
+   brings $F_2$ to $\sim$1e-5. But it changes SSA everywhere per the table, so it needs the
+   regression fingerprint re-baselined and Doug's agreement on what the parameter is *for*.
+2. **A separate, smaller regularization for the shear moments only** — keep the current value for
+   $\bar\eta$, where it is protecting the membrane operator, and use a small one for $F_1$/$F_2$,
+   where a large $\eta$ is harmless. This is the option the convergence argument above actually
+   points at, and it is DIVA-contained, so it does not touch SSA. Costs either a second $\eta$ per
+   level or an upper clamp on $\bar\eta$'s integrand.
+3. **Leave it and document the bias**, which is the current state: the slab test prints the cost at
+   four driving stresses so the number is never a surprise.
+
+A modelling decision, not a bug fix — and after the measurement above, one with a wider blast
+radius than it first appeared.
 
 ### 5.10a The first shear moment $F_1$, and the surface velocity
 

@@ -940,13 +940,44 @@ Sanity note from those numbers: $\mathrm du_s/\mathrm d\bar U$ comes out at 1.00
 1.026 (Coulomb) -- just above one, which it must be, since raising the depth-averaged speed raises
 the surface speed slightly more than proportionally.
 
-**Stage 2 (not done).** Two kernels: a cell-to-facet scatter turning a surface-velocity cotangent
-into $f_u, f_v$ via the analytic $\partial\bar U/\partial\text{facet}$ and
-$\partial\dot\varepsilon^2_{\mathrm{mem}}/\partial\text{facet}$ partials -- the same structure as
-`compute_diva_vjp_coeffs` -- and a cell-local one adding the explicit $\partial J/\partial p$ term
-to the parameter gradient. Verification is an end-to-end FD check of $\mathrm dJ/\mathrm d\beta$
-with a surface-velocity objective, against an SSA control where $u_s \equiv \bar u$ makes the new
-term vanish and the answer must reduce to the existing one.
+**Stage 2 (done).** Two pieces, and the scatter turned out to be free.
+
+*The right-hand side.* $\partial J/\partial x$ is a cell-to-facet scatter of the cotangent through
+$\partial\dot\varepsilon^2_{\mathrm{mem}}/\partial\text{facet}$ and
+$\partial\bar U/\partial\text{facet}$ — **exactly the scatter the coefficient transpose already
+performs**, with $A$ and $B$ redefined from $(W_\eta,W_{\beta_{\mathrm{eff}}})\times$(coefficient
+derivatives) to $\text{cot}\times(\mathrm du_s/\mathrm d\cdot)$. So the body was extracted into
+`diva_scatter_cell_to_facets` and both callers share it; `compute_diva_us_vjp` is then twenty lines.
+Exposed as `AdjointOperators.diva_surface_misfit_rhs`.
+
+*The explicit parameter term.* Cell-local, so no kernel at all —
+`diva_surface_param_gradient` returns $\sum_c \text{cot}_c\,(\mathrm du_s/\mathrm dp)_c$ in cupy,
+which the caller adds to whatever `compute_gradient_<p>` produced.
+
+**Verification: `tests/diva_surface_gradient_test.py`.** Jake's SSA control, in two forms, and it is
+the sharp part — finite differences at the 1e-3 floor (Q7) could not resolve a sign error or a
+double count.
+
+*Structural.* Under SSA both new pieces must be **inactive**, returning `None` rather than a small
+number. That distinguishes "switched off" from "small in the configuration I tried".
+
+*Stiff limit.* The load-bearing one. Stiffening the ice removes the shear, so $u_s\to|\bar u|$ and
+the explicit term $\to 0$, and both schemes then compute the gradient of the **identical functional**
+of $\beta$ — observations taken from the SSA run, so it is the same function and not merely the same
+formula — one exercising the new path and the other using none of it:
+
+| $B$ scale | 1 | 4 | 16 | 64 | 256 |
+|---|---|---|---|---|---|
+| $\|\Delta\text{grad}\|/\|\text{grad}\|$ | 1.7e-1 | 5.4e-2 | 1.7e-2 | 5.4e-3 | 2.0e-3 |
+
+Monotone with **no plateau**, which is what says the path is right: as the shear vanishes DIVA's
+scatter reduces term by term to the $\mathrm d|\bar u|/\mathrm d\text{facet}$ scatter the SSA branch
+builds independently, so a residual error would appear as a floor. It falls somewhat slower than the
+shear itself (~3.1 per step against ~4.1) — expected for a max-norm of a difference the adjoint solve
+has spread nonlocally, not evidence of anything.
+
+*And then finite differences.* $\mathrm dJ/\mathrm d\beta$ for the surface objective: DIVA **3.9e-4**
+against an SSA control of 1.4e-3, i.e. at the floor and better than the control.
 
 ### 5.12 A velocity profile at arbitrary depth: what it would take
 

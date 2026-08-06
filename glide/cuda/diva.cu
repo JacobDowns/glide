@@ -719,39 +719,30 @@ void compute_diva_derivs(
   symmetry is assumed anywhere: this is the honest transpose of the coefficient paths,
   which is what the frozen adjoint omitted.
 */
-extern "C" __global__
-void compute_diva_vjp_coeffs(
-    float* __restrict__ r_u,
-    float* __restrict__ r_v,
+/*
+  The cell->facet half of a coefficient transpose.  One thread owns a cell, is handed that
+  cell's cotangents on the two closure inputs,
+
+      A = d(objective)/d(eps_mem^2)_c ,   B = d(objective)/d(Ubar)_c
+
+  and scatters them onto the facets those inputs depend on, through the analytic partials of
+  eps_mem^2 and Ubar.  Reach is +/-1 in each direction.
+
+  Shared by two callers with different A and B: the adjoint residual, where they come from
+  W_eta/W_be times the coefficient derivatives, and a surface-velocity objective, where they
+  come from the misfit times d(u_s)/d(.).  The scatter itself does not care which.
+*/
+__device__ __forceinline__
+void diva_scatter_cell_to_facets(
+    float A, float B,
+    int i, int j,
     const float* __restrict__ u,
     const float* __restrict__ v,
-    const float* __restrict__ W_eta,
-    const float* __restrict__ W_be,
-    const float* __restrict__ deta_deps,
-    const float* __restrict__ deta_dU,
-    const float* __restrict__ dbe_deps,
-    const float* __restrict__ dbe_dU,
+    float* __restrict__ r_u,
+    float* __restrict__ r_v,
     float dx,
-    int ny, int nx,
-    int stride, int halo
-    )
+    int ny, int nx)
 {
-    int j = blockIdx.x * stride + (threadIdx.x - halo);
-    int i = blockIdx.y * stride + (threadIdx.y - halo);
-
-    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
-
-    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
-                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
-    if (!is_active) return;
-
-    int idx = i * nx + j;
-    float we = W_eta[idx];
-    float wb = W_be[idx];
-    float A = we*deta_deps[idx] + wb*dbe_deps[idx];
-    float B = we*deta_dU[idx]   + wb*dbe_dU[idx];
-    if (A == 0.0f && B == 0.0f) return;
-
     float dx_inv = 1.0f/dx;
     float h = 0.5f*dx_inv;
 
@@ -827,6 +818,90 @@ void compute_diva_vjp_coeffs(
     #undef DIVA_ADD_U
     #undef DIVA_ADD_V
 }
+
+extern "C" __global__
+void compute_diva_vjp_coeffs(
+    float* __restrict__ r_u,
+    float* __restrict__ r_v,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ W_eta,
+    const float* __restrict__ W_be,
+    const float* __restrict__ deta_deps,
+    const float* __restrict__ deta_dU,
+    const float* __restrict__ dbe_deps,
+    const float* __restrict__ dbe_dU,
+    float dx,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+    if (!is_active) return;
+
+    int idx = i * nx + j;
+    float we = W_eta[idx];
+    float wb = W_be[idx];
+    float A = we*deta_deps[idx] + wb*dbe_deps[idx];
+    float B = we*deta_dU[idx]   + wb*dbe_dU[idx];
+    if (A == 0.0f && B == 0.0f) return;
+
+    diva_scatter_cell_to_facets(A, B, i, j, u, v, r_u, r_v, dx, ny, nx);
+}
+
+/*=========================================================
+  ==== d(surface velocity)/d(state), transposed ===========
+  =========================================================*/
+/*
+  For an objective built on SURFACE velocity rather than the depth average.  Given the per-cell
+  cotangent cot_c = d(objective)/d(u_s)_c, produce d(objective)/d(u,v) on the facets:
+
+      d(obj)/d(u_j) = sum_c cot_c * [ dus_deps_c * d(eps_mem^2)_c/d(u_j)
+                                    + dus_dU_c   * d(Ubar)_c/d(u_j) ]
+
+  which is the same scatter as the adjoint residual's coefficient transpose with A and B
+  redefined.  The caller negates this to form the adjoint right-hand side, f = -d(obj)/d(x).
+
+  Under SSA there is no vertical shear, u_s == |ubar|, and this whole path is unnecessary --
+  which is what makes the SSA limit a usable control on it.
+*/
+extern "C" __global__
+void compute_diva_us_vjp(
+    float* __restrict__ out_u,
+    float* __restrict__ out_v,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ cot,       // d(objective)/d(u_s), per cell
+    const float* __restrict__ dus_deps,
+    const float* __restrict__ dus_dU,
+    float dx,
+    int ny, int nx,
+    int stride, int halo
+    )
+{
+    int j = blockIdx.x * stride + (threadIdx.x - halo);
+    int i = blockIdx.y * stride + (threadIdx.y - halo);
+
+    if (i < 0 || i >= ny || j < 0 || j >= nx) return;
+
+    bool is_active = (threadIdx.x >= halo && threadIdx.x < blockDim.x - halo) &&
+                     (threadIdx.y >= halo && threadIdx.y < blockDim.y - halo);
+    if (!is_active) return;
+
+    int idx = i * nx + j;
+    float c = cot[idx];
+    if (c == 0.0f) return;
+
+    diva_scatter_cell_to_facets(c*dus_deps[idx], c*dus_dU[idx],
+                                i, j, u, v, out_u, out_v, dx, ny, nx);
+}
+
 
 /*=========================================================
   === DIVA parameter gradients: cell-local W products ======

@@ -741,6 +741,67 @@ class AdjointOperators:
             self.grid.adjoint.lambda_v.data[:] -= self.vanka_config.omega * self.delta_lambda_v
             self.grid.adjoint.lambda_H.data[:] -= self.vanka_config.omega * self.delta_lambda_H
 
+    def diva_surface_misfit_rhs(self, cot, out_u=None, out_v=None):
+        """Adjoint right-hand side for an objective built on SURFACE velocity.
+
+        Given the per-cell cotangent ``cot = dJ/d(u_s)``, returns ``(f_u, f_v) = -dJ/d(u,v)``,
+        the right-hand side the adjoint solve expects.
+
+        Why this exists: GLIDE's inversions compare the model against observed SURFACE velocity
+        but use ``ubar`` as the counterpart.  That is exact for SSA, where the two coincide.
+        Under DIVA they differ by the vertical shear -- ~6% on ISMIP-HOM C and much more in slow
+        interior ice -- so an inversion that ignores it is systematically biased.  See
+        notes/diva_numerics.md 5.10b.
+
+        Under SSA this is a no-op and returns None: there is no shear, u_s is ubar, and the
+        caller should build the right-hand side from the depth-averaged misfit directly.
+        """
+        if float(self.grid.rheology.stress_balance.value) < 0.5:
+            return None, None
+        grid = self.grid
+        if out_u is None:
+            out_u, out_v = self.f_u, self.f_v
+        out_u.fill(0)
+        out_v.fill(0)
+
+        # dus_* must correspond to the current state, and they are written by the forward
+        # operators' derivative kernel.
+        grid.forward_operators.compute_diva_derivs()
+
+        kernel = self.kernels.get_function('compute_diva_us_vjp')
+        grid_size, block_size, stride, halo = self._kernel_config
+        kernel(grid_size, block_size,
+               (out_u, out_v,
+                grid.state.u.data, grid.state.v.data,
+                cot, grid.rheology.dus_deps.data, grid.rheology.dus_dU.data,
+                grid.dx, grid.ny, grid.nx, stride, halo))
+        # f = -dJ/dx
+        out_u *= -1.0
+        out_v *= -1.0
+        return out_u, out_v
+
+    def diva_surface_param_gradient(self, cot, param):
+        """The EXPLICIT dJ/d(param) term that a surface-velocity objective introduces.
+
+        The usual adjoint gradient is lambda^T dr/dp, which assumes the objective depends on the
+        parameters only through the state.  A surface-velocity objective does not: u_s depends on
+        beta, u_c and m directly, through the closure.  So
+
+            dJ/dp = dJ/dp|explicit + lambda^T dr/dp,   dJ/dp|explicit = sum_c cot_c * dus_dp_c
+
+        This returns that first term.  It is cell-local and needs no kernel.  Add it to whatever
+        compute_gradient_<param> produced.
+
+        Returns a field-shaped array for beta and u_c, and a scalar for the global m.
+        """
+        if float(self.grid.rheology.stress_balance.value) < 0.5:
+            return None                     # SSA: u_s is ubar, no explicit dependence
+        rheology = self.grid.rheology
+        field = {'beta': rheology.dus_dbeta, 'u_c': rheology.dus_duc,
+                 'm': rheology.dus_dm}[param]
+        term = cot * field.data
+        return float(cp.sum(term)) if param == 'm' else term
+
     def compute_gradient_beta(self):
         if float(self.grid.rheology.stress_balance.value) > 0.5:
             rheology = self.grid.rheology

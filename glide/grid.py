@@ -13,7 +13,8 @@ class State:
     H_prev: Field | None = None
     phi: Field | None = None
     mask: Field | None = None
-    u_b: Field | None = None          # DIVA basal sliding speed |u_b| (unused / zero in SSA)
+    u_b: Field | None = None
+    u_s: Field | None = None          # DIVA basal sliding speed |u_b| (unused / zero in SSA)
 
     def __repr__(self):
         return f'{self.u.compact_string}\n{self.v.compact_string}\n{self.H.compact_string}\n{self.H_prev.compact_string}\n{self.phi.compact_string}\n{self.mask.compact_string}\n{self.u_b.compact_string}'
@@ -76,6 +77,11 @@ class Rheology:
     dbe_deps: Field | None = None     # d(beta_eff)/d(eps_mem^2)
     dbe_dU: Field | None = None       # d(beta_eff)/d(Ubar)
     F1: Field | None = None           # H*int (zeta/eta) dzeta -- gives the SURFACE velocity
+    dus_deps: Field | None = None     # d(u_s)/d(...) -- for an objective on surface velocity
+    dus_dU: Field | None = None
+    dus_dbeta: Field | None = None
+    dus_duc: Field | None = None
+    dus_dm: Field | None = None
     deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)   -- for the parameter gradients
     dbe_dbeta: Field | None = None    # d(beta_eff)/d(beta)
     deta_duc: Field | None = None     # d(eta_bar)/d(u_c)    -- zero under Weertman
@@ -350,7 +356,18 @@ class Grid:
             units='m a^{-1}',
             attrs={'long_name':'DIVA basal sliding speed |u_b| (zero in SSA)'})
 
-        return State(u=u,v=v,H=H,H_prev=H_prev,phi=phi,mask=mask,u_b=u_b)
+        u_s = Field(
+            data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+            grid_entity=GridEntity.CELL,
+            dx=self.dx,
+            grid=self,
+            name='u_s',
+            units='m a^{-1}',
+            attrs={'long_name':'''DIVA surface speed |u_s| = u_b + tau_b*F1.
+                         Equals |ubar| under SSA, but not under DIVA -- the difference is
+                         the vertical shear, and it is what velocity observations see.'''})
+
+        return State(u=u,v=v,H=H,H_prev=H_prev,phi=phi,mask=mask,u_b=u_b,u_s=u_s)
 
     def _allocate_adjoint_state(self):
         lambda_u = Field(
@@ -441,6 +458,11 @@ class Grid:
                 dbe_deps=_cell('dbe_deps','?','DIVA d(beta_eff)/d(eps_mem^2)'),
                 dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'),
                 F1=_cell('F1','a','DIVA first shear moment H*int(zeta/eta)dzeta'),
+                dus_deps=_cell('dus_deps','?','DIVA d(u_s)/d(eps_mem^2)'),
+                dus_dU=_cell('dus_dU','?','DIVA d(u_s)/d(Ubar)'),
+                dus_dbeta=_cell('dus_dbeta','?','DIVA d(u_s)/d(beta)'),
+                dus_duc=_cell('dus_duc','?','DIVA d(u_s)/d(u_c)'),
+                dus_dm=_cell('dus_dm','?','DIVA d(u_s)/d(m)'),
                 deta_dbeta=_cell('deta_dbeta','?','DIVA d(eta_bar)/d(beta)'),
                 dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'),
                 deta_duc=_cell('deta_duc','?','DIVA d(eta_bar)/d(u_c)'),

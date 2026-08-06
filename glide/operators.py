@@ -246,7 +246,7 @@ class ForwardOperators:
 
         kernel(grid_size, block_size,
                    (rheology.eta_bar.data, rheology.F2.data, state.u_b.data,
-                    sliding.beta_eff.data, rheology.F1.data, self._diva_caps,
+                    sliding.beta_eff.data, rheology.F1.data, state.u_s.data, self._diva_caps,
                     *self._quadrature(),
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data,
@@ -322,6 +322,8 @@ class ForwardOperators:
                     rheology.deta_dbeta.data, rheology.dbe_dbeta.data,
                     rheology.deta_duc.data, rheology.dbe_duc.data,
                     rheology.deta_dm.data, rheology.dbe_dm.data,
+                    rheology.dus_deps.data, rheology.dus_dU.data,
+                    rheology.dus_dbeta.data, rheology.dus_duc.data, rheology.dus_dm.data,
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data, state.u_b.data,
                     sliding.m.value, sliding.u_reg.value,

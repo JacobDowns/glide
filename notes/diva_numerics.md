@@ -915,6 +915,39 @@ parameter analogues, contracted through a $W_{F_1}$ field. That is the same cell
 $F_2$'s, so the machinery exists, but it is a real extension with its own verification burden —
 not done, and scoped separately.
 
+### 5.10b Surface velocity in the adjoint -- stage 1 of 2
+
+The framework point first, because it is what makes this more than plumbing. With the objective a
+function of a *diagnostic* $u_s = g(x,p)$ rather than of the state directly, the adjoint identity
+gains a term that a depth-averaged objective simply does not have:
+
+$$\frac{\mathrm dJ}{\mathrm dp} = \underbrace{\frac{\partial J}{\partial p}}_{\text{NEW}} + \lambda^T\frac{\partial r}{\partial p}, \qquad \Big(\frac{\partial r}{\partial x}\Big)^{\!T}\lambda = -\frac{\partial J}{\partial x}$$
+
+with $\partial J/\partial x = (\partial J/\partial u_s)(\partial g/\partial x)$ changing the adjoint
+**right-hand side**, and $\partial J/\partial p = (\partial J/\partial u_s)(\partial g/\partial p)$
+being genuinely new: $u_s$ depends on $\beta$, $u_c$ and $m$ *directly* through the closure, which
+$\bar u$ never did.
+
+**Stage 1 (done).** `diva_coeffs_cell` now emits $u_s = U_b + \tau_b F_1$ as an output, so a dual
+seeding of any input yields $\mathrm d u_s/\mathrm d(\text{that input})$ with nothing hand-derived.
+`compute_diva_derivs` therefore gets all five sensitivities free from the seedings it already
+performs -- `dus_deps`, `dus_dU` for the right-hand side and `dus_dbeta`, `dus_duc`, `dus_dm` for
+the explicit parameter term. All five are FD-checked in `diva_derivs_test`, both sliding laws,
+agreement between 1.3e-6 and 3.3e-4, with the law-inert entries exactly zero. `state.u_s` is
+exposed and restricted through the hierarchy.
+
+Sanity note from those numbers: $\mathrm du_s/\mathrm d\bar U$ comes out at 1.003 (Weertman) and
+1.026 (Coulomb) -- just above one, which it must be, since raising the depth-averaged speed raises
+the surface speed slightly more than proportionally.
+
+**Stage 2 (not done).** Two kernels: a cell-to-facet scatter turning a surface-velocity cotangent
+into $f_u, f_v$ via the analytic $\partial\bar U/\partial\text{facet}$ and
+$\partial\dot\varepsilon^2_{\mathrm{mem}}/\partial\text{facet}$ partials -- the same structure as
+`compute_diva_vjp_coeffs` -- and a cell-local one adding the explicit $\partial J/\partial p$ term
+to the parameter gradient. Verification is an end-to-end FD check of $\mathrm dJ/\mathrm d\beta$
+with a surface-velocity objective, against an SSA control where $u_s \equiv \bar u$ makes the new
+term vanish and the answer must reduce to the existing one.
+
 ### 5.12 A velocity profile at arbitrary depth: what it would take
 
 Integrating the shear ansatz up from the bed gives one family rather than a set of separate
@@ -957,8 +990,15 @@ degree slope, $\beta = 1000 + 1000\sin(2\pi x/L)\sin(2\pi y/L)$, $A = 10^{-16}$,
 
 | $L$ (km) | 5 | 10 | 20 | 40 | 80 | 160 |
 |---|---|---|---|---|---|---|
-| DIVA $-$ SSA, mean $\bar u$ | +4.2% | +4.8% | +4.8% | +4.3% | +3.5% | +2.6% |
+| DIVA $-$ SSA, **surface** speed | +5.9% | +6.6% | +6.5% | +5.9% | +4.7% | +3.5% |
+| DIVA $-$ SSA, depth-averaged | +4.2% | +4.8% | +4.8% | +4.3% | +3.5% | +2.6% |
+| $u_s/\bar u$ | 1.016 | 1.017 | 1.016 | 1.015 | 1.012 | 1.009 |
 | sliding fraction $u_b/\bar u$ | 0.965 | 0.962 | 0.964 | 0.969 | 0.976 | 0.982 |
+
+The surface row is the published diagnostic and is now reported directly (§5.10a). Note it is
+consistently *larger* than the depth-averaged difference — by construction, since the surface sits
+at the top of the shear profile — which is precisely why an inversion that compares $\bar u$ against
+surface observations is biased.
 
 The difference is the vertical shear SSA cannot represent, and it behaves sensibly: largest at
 intermediate $L$, falling at large $L$ where the flow becomes sliding-dominated (sliding fraction

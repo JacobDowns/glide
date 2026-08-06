@@ -20,15 +20,11 @@ ISMIP-HOM, for two reasons worth being explicit about:
      the ISMIP-HOM archive or digitised from the figures. None of that is in this repository, and
      nothing here should be read as agreeing or disagreeing with full Stokes.
 
-  2. The published diagnostic for experiment C is SURFACE velocity along y = L/4. GLIDE's state
-     variable is the DEPTH-AVERAGED velocity. For SSA those coincide; for DIVA they do not, and
-     recovering the surface value needs the first shear moment
-
-         F1 = H * int_0^1 (zeta/eta) dzeta      (Arthern's I_1; u_s = u_b + tau_b*F1)
-
-     which the coefficient kernel does not currently accumulate. It is one more running sum in
-     the same quadrature loop. Until it exists, this script compares depth-averaged velocities,
-     which is a valid SSA-vs-DIVA contrast but not the ISMIP-HOM diagnostic.
+  2. The published diagnostic for experiment C is SURFACE velocity, which this now reports:
+     u_s = u_b + tau_b*F1 with F1 = H*int (zeta/eta) dzeta (Arthern's I_1), accumulated by the
+     coefficient kernel and exposed as state.u_s. Under SSA the surface and depth-averaged
+     speeds coincide, so the SSA column is the same quantity either way; under DIVA they differ
+     by the vertical shear, which is the whole point. Both are printed below.
 
 For an analytic check of the machinery DIVA adds, see tests/diva_slab_test.py -- the uniform slab
 does have a closed-form solution, and F2 matches it to float32 round-off.
@@ -91,53 +87,59 @@ def run(L, stress_balance, n_sigma=8.0):
     xs = slice(TILES // 2 * BASE_RES, (TILES // 2 + 1) * BASE_RES)
     u = cp.asnumpy(model.mg[0].state.u.data)
     v = cp.asnumpy(model.mg[0].state.v.data)
-    ubar = u[ys, xs]
-    # u_b is a cell-centred SPEED, so the sliding fraction needs the cell-centred speed in the
-    # denominator, not the x-component of the facet velocity.
+    # u_b and u_s are cell-centred SPEEDS, so they must be compared against the cell-centred
+    # speed, not against the x-component of the facet velocity.
     speed = np.hypot(0.5 * (u[:, :-1] + u[:, 1:]), 0.5 * (v[:-1, :] + v[1:, :]))[ys, xs]
-    u_b = cp.asnumpy(model.mg[0].state.u_b.data)[ys, xs] if stress_balance > 0.5 else speed
-    return ubar, speed, u_b, resid, r_ub, len(cycles)
+    if stress_balance > 0.5:
+        u_b = cp.asnumpy(model.mg[0].state.u_b.data)[ys, xs]
+        u_s = cp.asnumpy(model.mg[0].state.u_s.data)[ys, xs]
+    else:
+        u_b = u_s = speed          # SSA: no vertical shear, so all three coincide
+    return speed, u_s, u_b, resid, r_ub, len(cycles)
 
 
 def main():
-    print("ISMIP-HOM experiment C: depth-averaged velocity along y = L/4, central tile")
-    print("(NOT the published surface-velocity diagnostic -- see the module docstring)\n")
-    hdr = (f"{'L (km)':>7} | {'SSA mean':>9} {'DIVA mean':>10} {'diff':>7} | "
-           f"{'SSA max':>8} {'DIVA max':>9} | {'u_b/ubar':>9} | {'|r|/|r0|':>9} {'|r_Ub|':>8}")
+    print("ISMIP-HOM experiment C along y = L/4, central tile.  SURFACE speed is the published")
+    print("diagnostic; the depth-averaged column is shown alongside since that is what the")
+    print("momentum balance solves and the two differ only under DIVA.\n")
+    hdr = (f"{'L (km)':>7} | {'SSA surf':>9} {'DIVA surf':>10} {'diff':>7} | "
+           f"{'DIVA ubar':>10} {'us/ubar':>8} | {'u_b/ubar':>9} | {'|r_Ub|':>8}")
     print(hdr)
     print("-" * len(hdr))
     rows = []
     for L in LENGTH_SCALES:
-        u_ssa, sp_ssa, _, r_s, _, n_s = run(L, 0.0)
-        u_div, sp_div, ub_div, r_d, rub, n_d = run(L, 1.0)
-        rel = (sp_div.mean() - sp_ssa.mean()) / sp_ssa.mean()
-        slip = ub_div.mean() / sp_div.mean()
-        print(f"{L / 1000:7g} | {u_ssa.mean():9.3f} {u_div.mean():10.3f} {rel:+6.1%} | "
-              f"{u_ssa.max():8.3f} {u_div.max():9.3f} | {slip:9.3f} | {r_d:9.1e} {rub:8.1e}")
-        rows.append((L, u_ssa, u_div, ub_div))
+        sp_ssa, us_ssa, _, r_s, _, n_s = run(L, 0.0)
+        sp_div, us_div, ub_div, r_d, rub, n_d = run(L, 1.0)
+        rel = (us_div.mean() - us_ssa.mean()) / us_ssa.mean()
+        print(f"{L / 1000:7g} | {us_ssa.mean():9.3f} {us_div.mean():10.3f} {rel:+6.1%} | "
+              f"{sp_div.mean():10.3f} {us_div.mean() / sp_div.mean():8.3f} | "
+              f"{ub_div.mean() / sp_div.mean():9.3f} | {rub:8.1e}")
+        rows.append((L, us_ssa, us_div, sp_div, ub_div))
 
     print("""
-Reading it: the DIVA/SSA difference is the vertical shear SSA cannot represent, so it is the
-deformational part of the flow. u_b/ubar is the sliding fraction -- near 1 means the column moves
-as a plug and DIVA has little to add, well below 1 means internal deformation matters. Both
-schemes solve the same 2-D operator, so any difference is entirely in eta_bar and beta_eff.
+Reading it: the DIVA/SSA difference is the vertical shear SSA cannot represent. us/ubar > 1 is
+the surface moving faster than the column mean, and u_b/ubar is the sliding fraction -- near 1
+means plug flow with little for DIVA to add, well below 1 means internal deformation matters.
+Both schemes solve the same 2-D operator, so every difference is in eta_bar and beta_eff.
 
-Two systematic biases in the DIVA numbers, both quantified in tests/diva_slab_test.py and both
-suppressing deformation, so the difference below is if anything an underestimate:
-  * eps_reg = 1e-6 regularizes the viscosity over the upper part of the column (18% at
-    tau_b ~ 120 kPa, more at lower driving stress), costing a few percent in F2;
-  * n_sigma = 8 midpoint quadrature is second-order and costs a further ~1.3%.""")
+One systematic bias remains in the DIVA numbers and it suppresses deformation, so the surface
+difference is if anything an underestimate: eps_reg = 1e-6 regularizes the viscosity over the
+upper part of the column (18% at tau_b ~ 120 kPa, and more at lower driving stress), costing
+~0.1-8% in F2 depending on the driving stress -- quantified in tests/diva_slab_test.py. The
+quadrature bias that used to sit alongside it is gone: the vertical integrals are now
+Gauss-Legendre and exact for integer n.""")
 
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         fig, axs = plt.subplots(nrows=2, ncols=3, figsize=(13, 7), sharex=True)
-        for ax, (L, u_ssa, u_div, ub_div) in zip(axs.ravel(), rows):
+        for ax, (L, us_ssa, us_div, sp_div, ub_div) in zip(axs.ravel(), rows):
             s = np.linspace(0, 1, BASE_RES)
-            ax.plot(s, u_ssa, label="SSA", lw=1.6)
-            ax.plot(s, u_div, label="DIVA", lw=1.6)
-            ax.plot(s, ub_div, label="DIVA $u_b$", lw=1.0, ls="--")
+            ax.plot(s, us_ssa, label="SSA (surface = mean)", lw=1.6)
+            ax.plot(s, us_div, label="DIVA surface", lw=1.6)
+            ax.plot(s, sp_div, label="DIVA depth-avg", lw=1.2, ls=":")
+            ax.plot(s, ub_div, label="DIVA basal", lw=1.0, ls="--")
             ax.set_title(f"L = {L / 1000:g} km")
             ax.set_xlim(0, 1)
             ax.grid(alpha=.3)
@@ -145,8 +147,8 @@ suppressing deformation, so the difference below is if anything an underestimate
         for ax in axs[-1]:
             ax.set_xlabel("$x/L$")
         for ax in axs[:, 0]:
-            ax.set_ylabel(r"$\bar u$  (m a$^{-1}$)")
-        fig.suptitle("ISMIP-HOM C: depth-averaged velocity along $y=L/4$ (not surface velocity)")
+            ax.set_ylabel(r"speed  (m a$^{-1}$)")
+        fig.suptitle("ISMIP-HOM C: surface, depth-averaged and basal speed along $y=L/4$")
         fig.tight_layout()
         out = "ismip_hom_c_ssa_vs_diva.png"
         fig.savefig(out, dpi=130)

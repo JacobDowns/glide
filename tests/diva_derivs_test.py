@@ -1,12 +1,15 @@
 """The four total derivatives of the DIVA cell-local closure.
 
-compute_diva_derivs obtains, by three dual seedings of diva_coeffs_cell,
+compute_diva_derivs obtains, by five dual seedings of diva_coeffs_cell,
 
-    d(eta_bar)/d(eps_mem^2),  d(eta_bar)/d(Ubar),  d(eta_bar)/d(beta),
-    d(beta_eff)/d(eps_mem^2), d(beta_eff)/d(Ubar), d(beta_eff)/d(beta)
+    d(eta_bar)/d(.),  d(beta_eff)/d(.),  d(u_s)/d(.)     for . in
+        eps_mem^2, Ubar          -> the state transpose
+        beta, u_c, m             -> the parameter gradients
 
-which is everything the adjoint needs from the closure -- the first four for the state
-transpose, the last two for the parameter gradient: with these the transpose can be
+which is everything the adjoint needs from the closure. The u_s row is for an objective built on
+SURFACE velocity observations rather than the depth average: it supplies both the adjoint
+right-hand side (the eps/Ubar entries) and the objective's explicit parameter dependence (the
+beta/u_c/m entries), which a depth-averaged objective does not have at all: with these the transpose can be
 applied without re-running the vertical quadrature, and without assuming the operator is
 symmetric.
 
@@ -34,10 +37,11 @@ PROBE = r'''
 extern "C" __global__
 void deriv_probe(const float* eps, const float* Ubar, const float* beta,
                  const float* u_cs, const float* ms,
-                 float* eta_v, float* be_v,
+                 float* eta_v, float* be_v, float* us_v,
                  float* deta_deps, float* deta_dU, float* dbe_deps, float* dbe_dU,
                  float* deta_dbeta, float* dbe_dbeta,
                  float* deta_duc, float* dbe_duc, float* deta_dm, float* dbe_dm,
+                 float* dus_deps, float* dus_dU, float* dus_dbeta, float* dus_duc, float* dus_dm,
                  const float* zq, const float* wq,
                  float H_c, float B_c,
                  float u_reg, float wd, float law,
@@ -48,31 +52,31 @@ void deriv_probe(const float* eps, const float* Ubar, const float* beta,
     float e = eps[i], U = Ubar[i], bg = beta[i], u_c_c = u_cs[i], m = ms[i];
 
     int cap = 0;
-    float eta_f, F1_f, F2_f, Ub_f, be_f;
+    float eta_f, F1_f, F2_f, Ub_f, be_f, us_f;
     diva_coeffs_cell<float>(e, U, H_c,B_c,bg,u_c_c, m,u_reg,wd,law,
-                            glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, eta_f,F1_f,F2_f,Ub_f,be_f, cap);
-    eta_v[i]=eta_f; be_v[i]=be_f;
+                            glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, eta_f,F1_f,F2_f,Ub_f,be_f,us_f, cap);
+    eta_v[i]=eta_f; be_v[i]=be_f; us_v[i]=us_f;
 
-    DualFloat a,f1d,b,c,d;
+    DualFloat a,f1d,b,c,d,usd;
     diva_coeffs_cell<DualFloat>({e,1.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
-    deta_deps[i]=a.d; dbe_deps[i]=d.d;
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d,usd, cap);
+    deta_deps[i]=a.d; dbe_deps[i]=d.d; dus_deps[i]=usd.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,1.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
-    deta_dU[i]=a.d; dbe_dU[i]=d.d;
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d,usd, cap);
+    deta_dU[i]=a.d; dbe_dU[i]=d.d; dus_dU[i]=usd.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,1.0f},{u_c_c,0.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
-    deta_dbeta[i]=a.d; dbe_dbeta[i]=d.d;
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d,usd, cap);
+    deta_dbeta[i]=a.d; dbe_dbeta[i]=d.d; dus_dbeta[i]=usd.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,1.0f}, {m,0.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
-    deta_duc[i]=a.d; dbe_duc[i]=d.d;
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d,usd, cap);
+    deta_duc[i]=a.d; dbe_duc[i]=d.d; dus_duc[i]=usd.d;
 
     diva_coeffs_cell<DualFloat>({e,0.0f},{U,0.0f}, H_c,B_c,{bg,0.0f},{u_c_c,0.0f}, {m,1.0f},u_reg,wd,law,
-                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d, cap);
-    deta_dm[i]=a.d; dbe_dm[i]=d.d;
+                                glen_exp,eps_reg,n_sigma,zq,wq,U_b_warm, a,f1d,b,c,d,usd, cap);
+    deta_dm[i]=a.d; dbe_dm[i]=d.d; dus_dm[i]=usd.d;
 }
 '''
 
@@ -98,7 +102,7 @@ def build_module():
 
 def probe(mod, eps_arr, U_arr, beta_arr, u_c_arr, m_arr, law):
     n = len(eps_arr)
-    out = [cp.zeros(n, cp.float32) for _ in range(12)]
+    out = [cp.zeros(n, cp.float32) for _ in range(18)]
     mod.get_function("deriv_probe")((n // 64 + 1,), (64,),
         (cp.asarray(eps_arr, cp.float32), cp.asarray(U_arr, cp.float32),
          cp.asarray(beta_arr, cp.float32), cp.asarray(u_c_arr, cp.float32),
@@ -132,14 +136,17 @@ def best_agreement(mod, m, law, beta_g, which):
         else:
             h = U0 * frac; U_arr[1] -= h; U_arr[2] += h
 
-        (eta, be, de_de, de_dU, db_de, db_dU,
-         de_db, db_db, de_duc, db_duc, de_dm, db_dm) = probe(
+        (eta, be, us, de_de, de_dU, db_de, db_dU,
+         de_db, db_db, de_duc, db_duc, de_dm, db_dm,
+         du_de, du_dU, du_db, du_duc, du_dm) = probe(
                 mod, eps_arr, U_arr, beta_arr, u_c_arr, m_arr, law)
-        value = eta if which.startswith("deta") else be
+        value = us if which.startswith("dus") else (eta if which.startswith("deta") else be)
         dual = {"deta_deps": de_de, "deta_dU": de_dU, "deta_dbeta": de_db,
                 "deta_duc": de_duc, "deta_dm": de_dm,
                 "dbe_deps": db_de, "dbe_dU": db_dU, "dbe_dbeta": db_db,
-                "dbe_duc": db_duc, "dbe_dm": db_dm}[which][0]
+                "dbe_duc": db_duc, "dbe_dm": db_dm,
+                "dus_deps": du_de, "dus_dU": du_dU, "dus_dbeta": du_db,
+                "dus_duc": du_duc, "dus_dm": du_dm}[which][0]
         fd = (value[2] - value[1]) / (2 * h)
         rel = abs(dual - fd) / max(abs(fd), 1e-30)
         if rel < best[0]:
@@ -154,10 +161,13 @@ def main():
         print(f"{tag}:")
         # u_c only enters the Coulomb branch and m only the Weertman branch, so each
         # law exercises just one of the two.  The other is checked to be exactly zero.
-        active = ("deta_duc", "dbe_duc") if law > 0.5 else ("deta_dm", "dbe_dm")
-        inert  = ("deta_dm", "dbe_dm") if law > 0.5 else ("deta_duc", "dbe_duc")
+        active = (("deta_duc", "dbe_duc", "dus_duc") if law > 0.5
+                  else ("deta_dm", "dbe_dm", "dus_dm"))
+        inert  = (("deta_dm", "dbe_dm", "dus_dm") if law > 0.5
+                  else ("deta_duc", "dbe_duc", "dus_duc"))
         for which in ("deta_deps", "deta_dU", "dbe_deps", "dbe_dU",
-                      "deta_dbeta", "dbe_dbeta") + active:
+                      "deta_dbeta", "dbe_dbeta",
+                      "dus_deps", "dus_dU", "dus_dbeta") + active:
             rel, dual, fd, frac = best_agreement(mod, m, law, beta_g, which)
             print(f"  {which:<10} dual = {dual:+.6e}  FD = {fd:+.6e}  "
                   f"rel = {rel:.2e}  (best at step {frac:g})")

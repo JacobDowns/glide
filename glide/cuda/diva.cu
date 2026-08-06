@@ -115,7 +115,7 @@ __device__ void diva_coeffs_cell(
     const float* __restrict__ zeta_q,     // quadrature nodes on [0,1], Gauss-Legendre
     const float* __restrict__ w_q,        // matching weights, summing to 1
     float U_b_warm,
-    T& eta_bar_out, T& F1_out, T& F2_out, T& U_b_out, T& beta_eff_out,
+    T& eta_bar_out, T& F1_out, T& F2_out, T& U_b_out, T& beta_eff_out, T& u_s_out,
     int& cap_flags_out)          // bit 0: closure Newton hit its cap; bit 1: an eta solve did
 {
     // Given U_bar, produce the two coefficients the momentum operator needs.  One unknown --
@@ -327,6 +327,11 @@ __device__ void diva_coeffs_cell(
     F2_out       = F2_c;
     U_b_out      = U_b;
     beta_eff_out = coeff/(1.0f + coeff*F2_c);
+    // Surface SPEED, u_s = u_b + tau_b*F1.  Emitted from here rather than assembled by the
+    // caller so that a dual seeding of any input yields d(u_s)/d(that input) directly -- which
+    // is what an objective built on surface-velocity observations needs, both for the adjoint
+    // right-hand side (seeds 1-2) and for the parameter gradient's explicit term (seeds 3-5).
+    u_s_out      = U_b + coeff*U_b*F1_c;
 }
 
 
@@ -379,14 +384,14 @@ __device__ void populate_diva_coeffs_dual(
     float u_c_c = get_cell(u_c, i, j, ny, nx);
     float U_b_warm = fminf(fmaxf(get_cell(u_b, i, j, ny, nx), 0.0f), U_bar.v);
 
-    DualFloat eta_d, F1_d, F2_d, U_b_d, beta_eff_d;
+    DualFloat eta_d, F1_d, F2_d, U_b_d, beta_eff_d, u_s_d;
     int cap_sink = 0;      // the diagnostic path (compute_diva_coeffs) owns cap reporting
     diva_coeffs_cell<DualFloat>(eps_mem_sq, U_bar,
             H_c, B_c, DualFloat{beta_grounded, 0.0f}, DualFloat{u_c_c, 0.0f},
             DualFloat{m, 0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q,
             U_b_warm,
-            eta_d, F1_d, F2_d, U_b_d, beta_eff_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, beta_eff_d, u_s_d, cap_sink);
 
     eta_local[bi][bj] = eta_d;
     beta_eff_local[bi][bj] = beta_eff_d;
@@ -399,6 +404,7 @@ void compute_diva_coeffs(
     float* __restrict__ u_b,
     float* __restrict__ beta_eff,
     float* __restrict__ F1,            // first shear moment; gives the SURFACE velocity
+    float* __restrict__ u_s,           // surface speed, u_b + tau_b*F1
     float* __restrict__ cap_flags,     // per-cell: which local solve failed to reach tolerance
     const float* __restrict__ zeta_q,
     const float* __restrict__ w_q,
@@ -456,14 +462,14 @@ void compute_diva_coeffs(
     // deformation can only add to sliding, so 0 <= U_b <= U_bar.
     float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar);
 
-    float eta_avg, F1_c, F2_c, U_b, beta_eff_c;
+    float eta_avg, F1_c, F2_c, U_b, beta_eff_c, u_s_c;
     int caps = 0;
     diva_coeffs_cell<float>(eps_mem_sq, U_bar,
             H_c, B_c, beta_grounded, u_c_c,
             m, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q,
             U_b_warm,
-            eta_avg, F1_c, F2_c, U_b, beta_eff_c, caps);
+            eta_avg, F1_c, F2_c, U_b, beta_eff_c, u_s_c, caps);
 
     if (is_active) {
         eta_bar[idx] = eta_avg;
@@ -473,6 +479,7 @@ void compute_diva_coeffs(
         // Strictly non-negative, and finite at rest (no division by the speed).
         beta_eff[idx] = beta_eff_c;
         F1[idx] = F1_c;
+        u_s[idx] = u_s_c;
         // Reduced and reported by the caller alongside |r_Ub|; should always be zero.
         cap_flags[idx] = (float)caps;
     }
@@ -554,6 +561,11 @@ void compute_diva_derivs(
     float* __restrict__ dbe_duc,
     float* __restrict__ deta_dm,
     float* __restrict__ dbe_dm,
+    float* __restrict__ dus_deps,      // the surface-speed sensitivities, for an objective
+    float* __restrict__ dus_dU,        // built on surface-velocity observations
+    float* __restrict__ dus_dbeta,
+    float* __restrict__ dus_duc,
+    float* __restrict__ dus_dm,
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
@@ -609,7 +621,7 @@ void compute_diva_derivs(
     int idx = i * nx + j;
     float U_b_warm = fminf(fmaxf(u_b[idx], 0.0f), U_bar_v);
 
-    DualFloat eta_d, F1_d, F2_d, U_b_d, be_d;
+    DualFloat eta_d, F1_d, F2_d, U_b_d, be_d, us_d;
     int cap_sink = 0;      // derivative path; compute_diva_coeffs owns cap reporting
 
     // Seed 1: d/d(eps_mem^2)
@@ -617,18 +629,20 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
-            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, be_d, us_d, cap_sink);
     float d_eta_deps = eta_d.d;
     float d_be_deps  = be_d.d;
+    float d_us_deps  = us_d.d;
 
     // Seed 2: d/d(Ubar)
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,1.0f},
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
-            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, be_d, us_d, cap_sink);
     float d_eta_dU = eta_d.d;
     float d_be_dU  = be_d.d;
+    float d_us_dU  = us_d.d;
 
     // Seed 3: d/d(beta).  The perturbation is `grounded` rather than 1 because the
     // closure is given beta*grounded, so this yields the derivative with respect to the
@@ -639,9 +653,10 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,grounded}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
-            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, be_d, us_d, cap_sink);
     float d_eta_dbeta = eta_d.d;
     float d_be_dbeta  = be_d.d;
+    float d_us_dbeta  = us_d.d;
 
     // Seed 4: d/d(u_c), the regularized-Coulomb threshold speed.  Identically zero under
     // Weertman, where the u_c branch is not taken -- the same way SSA's d_u_c is.
@@ -649,9 +664,10 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,1.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
-            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, be_d, us_d, cap_sink);
     float d_eta_duc = eta_d.d;
     float d_be_duc  = be_d.d;
+    float d_us_duc  = us_d.d;
 
     // Seed 5: d/d(m), the Weertman exponent.  m is a single global scalar, so these are
     // the per-cell contributions that compute_gradient_param_sum_diva reduces.  Getting
@@ -661,9 +677,10 @@ void compute_diva_derivs(
             H_c, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,1.0f}, u_reg, water_drag, sliding_law,
             glen_exp, eps_reg, n_sigma, zeta_q, w_q, U_b_warm,
-            eta_d, F1_d, F2_d, U_b_d, be_d, cap_sink);
+            eta_d, F1_d, F2_d, U_b_d, be_d, us_d, cap_sink);
     float d_eta_dm = eta_d.d;
     float d_be_dm  = be_d.d;
+    float d_us_dm  = us_d.d;
 
     if (is_active) {
         deta_deps[idx] = d_eta_deps;
@@ -676,6 +693,11 @@ void compute_diva_derivs(
         dbe_duc[idx]    = d_be_duc;
         deta_dm[idx]    = d_eta_dm;
         dbe_dm[idx]     = d_be_dm;
+        dus_deps[idx]   = d_us_deps;
+        dus_dU[idx]     = d_us_dU;
+        dus_dbeta[idx]  = d_us_dbeta;
+        dus_duc[idx]    = d_us_duc;
+        dus_dm[idx]     = d_us_dm;
     }
 }
 

@@ -557,6 +557,7 @@ __device__ void jvp_body(
     int n_sigma,                            // DIVA only
     const float* __restrict__ zeta_q,       // DIVA only: quadrature nodes
     const float* __restrict__ w_q,          // DIVA only: quadrature weights
+    float eps_reg_shear,                    // DIVA only: shear-moment regularization
     int ny, int nx, int stride, int halo)
 {
     const int bny = 16;
@@ -575,9 +576,9 @@ __device__ void jvp_body(
 
     if (DIVA) {
 	populate_diva_coeffs_dual(eta_local, beta_eff_local, bi, bj, i, j,
-		u, v, d_u, d_v, H, phi, B, beta, u_c, u_b,
+		u, v, d_u, d_v, H, d_H, phi, B, beta, u_c, u_b,
 		m, u_reg, water_drag, sliding_law,
-		n, eps_reg, dx, n_sigma, zeta_q, w_q, ny, nx);
+		n, eps_reg, eps_reg_shear, dx, n_sigma, zeta_q, w_q, ny, nx);
     } else {
 	populate_viscosity(eta_local, bi, bj, i, j, u, v, d_u, d_v, B, n, eps_reg, dx, ny, nx);
     }
@@ -914,7 +915,7 @@ void compute_jvp(
 	    bed,B,beta,u_c,gamma,nullptr,use_mask,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
-	    calving_rate,flotation_reg_calving,dx,dt,0,nullptr,nullptr,ny,nx,stride,halo);
+	    calving_rate,flotation_reg_calving,dx,dt,0,nullptr,nullptr,0.0f,ny,nx,stride,halo);
 }
 
 // J*d for DIVA.  Carries the exact closure sensitivity: eta_bar and beta_eff are
@@ -950,12 +951,14 @@ void compute_jvp_diva(
     int n_sigma,                            // DIVA only
     const float* __restrict__ zeta_q,       // DIVA only: quadrature nodes
     const float* __restrict__ w_q,          // DIVA only: quadrature weights
+    float eps_reg_shear,                    // DIVA only: shear-moment regularization
     int ny, int nx, int stride, int halo){
     jvp_body<true>(jvp_u,jvp_v,jvp_H,u,v,H,d_u,d_v,d_H,phi,mask,f_u,f_v,f_H,
 	    bed,B,beta,u_c,gamma,u_b,use_mask,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
-	    calving_rate,flotation_reg_calving,dx,dt,n_sigma,zeta_q,w_q,ny,nx,stride,halo);
+	    calving_rate,flotation_reg_calving,dx,dt,n_sigma,zeta_q,w_q,eps_reg_shear,
+	    ny,nx,stride,halo);
 }
 
 /*=========================================================
@@ -980,8 +983,9 @@ void compute_jvp_diva(
 // back onto the facets.  Splitting the transpose at the cell is what keeps both halves
 // within a +/-1 reach: row->facet is +/-2 composite, but row->cell and cell->facet are
 // each +/-1, so neither needs a wider halo.  Together the two passes give the EXACT
-// transpose, with no symmetry assumed -- dot-product identity 5.6e-7 against an SSA
-// control of 1.2e-7.  See notes/diva_numerics.md sections 5.8 and 7.
+// transpose, with no symmetry assumed -- dot-product identity 6.3e-8 against an SSA
+// control of 2.3e-7, and 9.8e-2 for the frozen alternative, which is what the deferral
+// buys.  See notes/diva_numerics.md section 5.2.
 //
 // The same W fields are reused for the parameter gradients (beta, u_c, m), since they
 // already are lambda^T d(r)/d(coefficient) summed over every row touching the cell.
@@ -1044,9 +1048,11 @@ __device__ void vjp_body(
     __shared__ DualFloat eta_local[bny][bnx];
 
     if (DIVA) {
-	// Frozen coefficients: the value is the lagged eta_bar and the perturbation slot
-	// is zero, so no d(eta_bar)/du contribution enters the adjoint.  Exact for the
-	// operator Goldberg proves self-adjoint; the omitted term is the next increment.
+	// Value only, zero perturbation: no d(eta_bar)/du is formed HERE.  That is not the
+	// term being dropped -- it is the term being deferred, to W_eta below and then to
+	// compute_diva_vjp_coeffs.  Note this also means the DIVA path takes none of the
+	// lambda-seeded viscosity shortcut the SSA branch below relies on, so it assumes no
+	// symmetry at all (notes/diva_numerics.md 5.7).
 	eta_local[bi][bj] = {get_cell(eta_bar, i, j, ny, nx), 0.0f};
     } else {
 	populate_viscosity(eta_local, bi, bj, i, j, u, v, lambda_u, lambda_v, B, n, eps_reg, dx, ny, nx);

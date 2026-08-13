@@ -526,8 +526,8 @@ DualFloat get_tau_by_dual(TauByStencilDual s) {
 
   The result is linear in the velocity, so these stencils are far simpler than their
   SSA counterparts: all of the velocity dependence of the real sliding law has moved
-  into the closure that produces U_b.  The extra derivative the augmented block needs,
-  d(beta_eff)/d(U_b), is get_diva_dbeta_eff_du_b below.
+  into the closure that produces U_b.  The smoother treats beta_eff as a frozen
+  coefficient and never sees U_b at all -- see notes/diva_numerics.md 5.2.
 */
 
 __device__ __forceinline__
@@ -558,19 +558,6 @@ DualFloat get_diva_drag_coeff(
     }
 
     return c + water_drag;
-}
-
-__device__ __forceinline__
-float get_diva_dbeta_eff_du_b(
-    float U_b, float F2,
-    float beta_grounded, float m, float u_reg, float water_drag,
-    float u_c, float sliding_law){
-
-    // d(beta_eff)/d(U_b) for beta_eff = c/(1 + c*F2): the quotient rule collapses to
-    // c'/(1 + c*F2)^2, with c' supplied by the dual evaluation.
-    DualFloat c = get_diva_drag_coeff({U_b,1.0f},beta_grounded,m,u_reg,water_drag,u_c,sliding_law);
-    float denom = 1.0f + c.v*F2;
-    return c.d/(denom*denom);
 }
 
 __device__ __forceinline__

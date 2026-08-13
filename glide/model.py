@@ -59,32 +59,70 @@ class IceDynamics:
         for f in self._post_forward_hooks:
             f(t+dt)
 
-    def backward(self,t,dt,dJdu=None,dJdv=None,dJdH=None,
+    def backward(self,t,dt,dJdu=None,dJdv=None,dJdH=None,dJdu_s=None,
             compute_beta_grad=True,compute_bed_grad=True,
             compute_H_prev_grad=True,compute_smb_grad=True,
             compute_m_grad=False,compute_u_c_grad=False):
+        """Solve the adjoint and reduce it onto the parameter gradients.
+
+        ``dJdu``/``dJdv``/``dJdH`` are cotangents on the solved state, as before.
+
+        ``dJdu_s`` is the cotangent on the DIVA SURFACE speed, per cell.  It enters
+        differently from the others and requires DIVA:
+
+          * u_s is not a state variable, so its cotangent cannot simply be dropped into
+            the right-hand side.  It is scattered to the velocity facets through the
+            closure's stored dus_deps/dus_dU (diva_surface_misfit_rhs), then ADDED to
+            whatever dJdu/dJdv contributed.
+          * u_s depends on the sliding parameters DIRECTLY through the closure, not only
+            through the state, so lambda^T dr/dp is no longer the whole gradient.  The
+            explicit term sum_c cot_c * d(u_s)_c/dp is added after the reduction.
+
+        See notes/diva_adjoint_map.md 7.3 and tests/diva_surface_gradient_test.py.
+        """
+        ao = self.mg.levels[self.top_level].adjoint_operators
+
+        # Surface term first: diva_surface_misfit_rhs FILLS f_u/f_v with -dJ/d(u,v), so the
+        # depth-averaged cotangents are accumulated on top of it rather than the reverse.
+        if dJdu_s is not None:
+            # Fills f_u, f_v AND f_H: u_s depends on thickness through the shear moments,
+            # so a surface objective has a thickness right-hand side of its own.
+            if ao.diva_surface_misfit_rhs(dJdu_s)[0] is None:
+                raise ValueError(
+                    "dJdu_s requires DIVA: under SSA the surface and depth-averaged "
+                    "velocities coincide, so pass the misfit through dJdu/dJdv instead "
+                    "(set mg.rheology.stress_balance to 1.0 for DIVA).")
+        else:
+            ao.f_u.fill(0.0)
+            ao.f_v.fill(0.0)
+            ao.f_H.fill(0.0)
+
         if dJdu is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_u[:,:] = -dJdu
-        else:
-            self.mg.levels[self.top_level].adjoint_operators.f_u.fill(0.0)            
+            ao.f_u -= dJdu
         if dJdv is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_v[:,:] = -dJdv
-        else:
-            self.mg.levels[self.top_level].adjoint_operators.f_v.fill(0.0)
+            ao.f_v -= dJdv
         if dJdH is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_H[:,:] = -dJdH
-        else:    
-            self.mg.levels[self.top_level].adjoint_operators.f_H.fill(0.0)
+            ao.f_H -= dJdH
 
         converged = self.adjoint_solver.solve(dt,start_level=self.top_level)
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_beta()
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_bed()
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_H_prev(dt)
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_smb()
+        ao.compute_gradient_beta()
+        ao.compute_gradient_bed()
+        ao.compute_gradient_H_prev(dt)
+        ao.compute_gradient_smb()
         if compute_m_grad:
-            self.mg.levels[self.top_level].adjoint_operators.compute_gradient_m()
+            ao.compute_gradient_m()
         if compute_u_c_grad:
-            self.mg.levels[self.top_level].adjoint_operators.compute_gradient_u_c()
+            ao.compute_gradient_u_c()
+
+        # The explicit parameter dependence of u_s, which only a surface objective has.
+        if dJdu_s is not None:
+            sliding = self.mg.levels[self.top_level].sliding
+            # Field.grad is read-only (it hands back the array), so accumulate in place.
+            sliding.beta.grad[:] += ao.diva_surface_param_gradient(dJdu_s,'beta')
+            if compute_u_c_grad:
+                sliding.u_c.grad[:] += ao.diva_surface_param_gradient(dJdu_s,'u_c')
+            if compute_m_grad:
+                sliding.m.grad = sliding.m.grad + ao.diva_surface_param_gradient(dJdu_s,'m')
 
         return converged
         

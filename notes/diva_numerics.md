@@ -1,1175 +1,1367 @@
-# DIVA in GLIDE: mathematics and numerical method
+# The DIVA stress balance in GLIDE
 
-**Branch:** `diva` (off `sliding-laws`) · **Status:** forward model, exact adjoint, all three sliding-parameter gradients, and both nested closure solves implemented and verified; ISMIP-HOM validation outstanding · **Companion:** `notes/diva.md` (the design proposal and staged plan)
+The depth-integrated viscosity approximation (DIVA) is a two-dimensional
+momentum balance for depth-averaged horizontal velocity, coupled to a
+one-dimensional vertical closure in every horizontal cell. It retains the
+membrane stresses of the shallow-shelf approximation (SSA), but restores the
+vertical shear that controls deformation in slow grounded ice. In this way one
+formulation covers both the shear-dominated and membrane-dominated flow regimes
+without introducing a globally coupled three-dimensional velocity unknown.
 
-**See also:** `notes/diva.md` (design and staged plan) and `notes/open_questions.md` (issues found in existing upstream code while doing this work -- not addressed here).
+This note develops that statement in the same order as the physics: first the
+depth-integrated balance, then the vertical closure, then the basal closure that
+makes the system two-dimensional. Only after those relationships are defined do
+we describe their discretization and their place in GLIDE's nonlinear solver
+and adjoint. The presentation is informed by the
+[Yelmo DIVA overview](https://fesmc.github.io/yelmo/physics/momentum/diva.html),
+while the notation and implementation details here are specific to GLIDE.
 
-**Primary reference:** Goldberg, D. N. (2011), *A variationally derived, depth-integrated approximation to a higher-order glaciological flow model*, J. Glaciol. **57**(201), 157–170. PDF in the workspace `docs/`. Equation numbers of the form (G-nn) refer to it.
+The notation follows Arthern et al. (2015), particularly for the shear integrals
+$\mathcal I_1$ and $\mathcal I_2$. Goldberg (2011) is the primary derivation
+of the variational, depth-integrated approximation.
 
-This note is written to be read next to the code. It states what DIVA is mathematically, then describes exactly how it is discretised and solved in GLIDE, with emphasis on **what is shared with the existing SSA path and what is genuinely new**.
+- Goldberg (2011), *A variationally derived, depth-integrated approximation to a
+  higher-order glaciological flow model*. Local
+  [PDF](../../docs/a-variationally-derived-depth-integrated-approximation-to-a-higher-order-glaciological-flow-model.pdf),
+  [DOI](https://doi.org/10.3189/002214311795306763).
+- Arthern et al. (2015), *Flow speed within the Antarctic ice sheet and its
+  controls inferred from satellite observations*. Local
+  [PDF](<../../docs/JGR Earth Surface - 2015 - Arthern - Flow speed within the Antarctic ice sheet and its controls inferred from satellite.pdf>),
+  [DOI](https://doi.org/10.1002/2014JF003239).
 
-------------------------------------------------------------------------
+References such as G31 and A7 denote equations in Goldberg and Arthern. See
+[diva.md](diva.md) for the original design and [diva_history.md](diva_history.md)
+for the development record. For a detailed, code-oriented trace of the DIVA
+linearization and VJP, see [diva_adjoint.md](diva_adjoint.md).
 
-## 1. Where DIVA sits
+## 1. What DIVA approximates
 
-The full-Stokes momentum balance is too expensive for continental-scale, long-timescale or inverse work. The standard ladder of approximations is:
+SSA assumes that horizontal velocity is independent of depth. That assumption
+is appropriate for ice shelves and fast streams, where membrane stresses
+dominate, but it omits the vertical shear responsible for most deformation in
+the slow grounded interior. A first-order or Blatter--Pattyn model retains both
+effects by solving for horizontal velocity throughout the ice thickness, at the
+cost of a three-dimensional nonlinear system.
 
-| model | horizontal velocity | resistance | cost |
-|------------------|------------------|------------------|------------------|
-| **SIA** | none solved (diagnostic) | vertical shear only | trivial |
-| **SSA** (GLIDE today) | depth-independent, 2-D PDE | membrane + basal drag | one 2-D solve |
-| **DIVA** (this branch) | depth-averaged 2-D PDE + reconstructed profile | membrane + vertical shear + basal drag | one 2-D solve + cell-local work |
-| **Blatter–Pattyn (first order)** | full 3-D field | all but vertical normal stresses | 3-D solve |
-| **full Stokes** | full 3-D field | everything | 3-D saddle point |
+DIVA occupies the useful middle ground. It makes the horizontal strain rates
+independent of depth, as in SSA, but retains the vertical shear rates in Glen's
+flow law. The viscosity can therefore vary through the column even though the
+globally coupled unknown is only the depth-averaged horizontal velocity
 
-The first-order (Blatter–Pattyn) equations are
+$$
+\bar{\mathbf u}=\frac{1}{H}\int_b^s\mathbf u(z)\,dz
+               =(\bar u,\bar v).
+$$
 
-$$\partial_x\big[\nu(4u_x + 2v_y)\big] + \partial_y\big[\nu(v_x+u_y)\big] + \partial_z(\nu u_z) = \rho g s_x$$
+The result can be viewed as an SSA-shaped membrane balance supplied with a
+local higher-order closure. Relative to SSA, the momentum solve sees two
+modified coefficients:
 
-and its $y$ counterpart (G-1,2), with the effective viscosity (G-3)
+1. the membrane viscosity is the depth average $\bar\eta$ of the
+   depth-varying viscosity $\eta(z)$; and
+2. the basal sliding coefficient is replaced by an effective drag
+   $\beta_{\mathrm{eff}}$ relating basal traction to $\bar{\mathbf u}$ rather
+   than to the basal velocity $\mathbf u_b$.
 
-$$\nu = \frac{B}{2}\Big[u_x^2 + v_y^2 + u_xv_y + \tfrac14(u_y+v_x)^2 + \tfrac14 u_z^2 + \tfrac14 v_z^2\Big]^{\frac{1-n}{2n}}$$
+Those coefficients are not prescribed material fields. They depend on the
+current velocity and are recomputed by a local column calculation as the
+nonlinear momentum solve proceeds.
 
-Solving this needs a 3-D PDE system because the **horizontal** stress terms ($u_x,u_y,v_x,v_y$) vary with depth.
+> DIVA keeps the global unknown and stencil two-dimensional. Vertical shear
+> enters through column-local constitutive calculations, not through a global
+> three-dimensional solve.
 
-**The DIVA approximation** is to replace $u,v$ by their depth averages $\bar u,\bar v$ *in the horizontal stress terms only*, while retaining the vertical shear terms $u_z,v_z$ in both the viscosity and the basal boundary condition. The approximation is made **to the action functional, not to the equations** (G-12), and the equations follow as its Euler–Lagrange equations. Two consequences matter here:
+## 2. Continuum equations
 
-1.  the approximated equations and boundary conditions are guaranteed mutually consistent;
-2.  the resulting operator is **self-adjoint**, in Goldberg's words *"ignoring dependence of viscosity on strain rate"* — which is exactly the level at which GLIDE's smoother already freezes viscosity (§5.5). The sliding law enters the functional as a basal dissipation potential $\int_{\Gamma_b}F(u_b)\,d\Gamma$, whose derivative is the traction, so a **nonlinear** sliding law is just a different $F$ and does not break the variational structure.
+### 2.1 Geometry and conventions
 
-------------------------------------------------------------------------
+The vertical coordinate $z$ increases upward. The bed is $b$, the surface is
+$s$, thickness is $H=s-b$, and scaled depth is
 
-## 2. The equations DIVA solves
+$$
+\zeta=\frac{s-z}{H},
+\qquad \zeta=0\text{ at the surface},
+\qquad \zeta=1\text{ at the bed}.
+$$
 
-### 2.1 Momentum
+The depth-averaged, basal, and surface velocities are
+$\bar{\mathbf u}$, $\mathbf u_b$, and $\mathbf u_s$, with speeds
+$\bar U$, $U_b$, and $U_s$. The column closure is scalar because the
+current rheology and sliding laws are isotropic.
 
-Identical in form to SSA — this is the reason DIVA fits GLIDE so cheaply (G-43):
+Strain rates use the tensor convention
 
-$$\partial_x\big[H\bar\eta(4\bar u_x + 2\bar v_y)\big]
-+ \partial_y\big[H\bar\eta(\bar v_x + \bar u_y)\big]
-- \tau_{bx} = \rho g H s_x$$
-
-Only two coefficients change meaning: the viscosity $\bar\eta$ is now a **depth average of a depth-varying** $\eta$, and the basal drag $\tau_b$ is an **effective** drag. Everything else — the stencil, the sparsity pattern, the boundary conditions — is SSA's.
-
-### 2.2 Depth-varying viscosity
-
-With the horizontal terms depth-averaged, the effective strain-rate invariant gains the vertical shear contributions (G-16):
-
-$$\eta(z) = \frac{B}{2}\Big[\underbrace{\bar u_x^2 + \bar v_y^2 + \bar u_x\bar v_y + \tfrac14(\bar u_y+\bar v_x)^2}_{\dot\varepsilon^2_{\mathrm{mem}}} + \dot\varepsilon_{xz}^2 + \dot\varepsilon_{yz}^2 + \varepsilon_{\mathrm{reg}}\Big]^{\frac{1-n}{2n}}$$
-
-The braced group is the membrane invariant $\dot\varepsilon^2_{\mathrm{mem}}$ — all that SSA has. The two shear terms are what DIVA adds.
-
-### 2.3 The shear ansatz
-
-Integrating the vertical-shear part of the momentum balance once gives a shear stress that is **linear in depth** — the full basal drag at the bed, zero at the stress-free surface (G-31):
-
-$$\tau_{xz}(z) = \tau_{bx}\,\frac{s-z}{H},
-\qquad\text{so}\qquad
-\dot\varepsilon_{xz}(z) = \tfrac12 u_z = \frac{\tau_{bx}}{2\eta(z)}\,\zeta ,
-\qquad \zeta \equiv \frac{s-z}{H}\in[0,1].$$
-
-Note the thickness **cancels** in $\dot\varepsilon_{xz}$; $H$ survives only as a prefactor in $F_2$ below. This is why the scheme degrades gracefully as $H\to0$.
-
-### 2.4 The shear integral $F_2$
-
-Integrating a second time and depth-averaging relates the depth-averaged and basal velocities (G-32–35):
-
-$$\bar{\mathbf u} = \mathbf u_b + \tau_b F_2$$
-
-$$F_2 \equiv \int_b^s \frac{1}{\eta}\Big(\frac{s-z}{H}\Big)^2 dz
-= H\int_0^1 \frac{\zeta^2}{\eta}\,d\zeta$$
-
-In words: **depth-averaged velocity = sliding + internal deformation**, with the deformation proportional to the basal drag through $F_2$. Goldberg writes this with $\omega$ (G-35), the double integral of $(s-z')/(H\eta)$. The two are related by $\omega = H F_2$, and that identity pins our convention with no stray factors. This relation is **independent of the sliding law**.
-
-### 2.5 The sliding closure
-
-The sliding law supplies a second, independent relation at the bed, $|\tau_b| = f(U_b) = c(U_b)\,U_b$, where $U_b=|\mathbf u_b|$ and $c$ is the drag *coefficient*:
-
-| law                 | $c(U)$                                          |
-|---------------------|-------------------------------------------------|
-| Weertman            | $\beta\,(U^2+u_{\mathrm{reg}})^{(m-1)/2} + w_d$ |
-| regularized Coulomb | $\beta/(\sqrt{U^2+u_{\mathrm{reg}}}+u_c) + w_d$ |
-
-Because drag and viscosity are isotropic, $\tau_b \parallel \mathbf u_b \parallel
-\bar{\mathbf u}$ (Goldberg: *"*$\vec\tau$ will always be in the same direction as $(\bar u,\bar v)$"), so the vector relation collapses to a **scalar equation for the basal speed**:
-
-$$R(U_b) = U_b + f(U_b)\,F_2 - \bar U = 0$$
-
-- **Linear** $f$: closed form, $U_b = \bar U/(1+\beta F_2)$.
-- **Nonlinear** $f$: a per-cell root find — Goldberg's (G-38,39), *"solved at a location along the base independently of other locations."*
-
-It is well posed: physical laws are monotone ($f'\ge0$) and $F_2>0$, so $R'(U_b) = 1 + f'(U_b)F_2 \ge 1 > 0$. The root is **unique** and Newton converges in a few iterations from any start.
-
-### 2.6 The effective drag
-
-$$\tau_b = \beta_{\mathrm{eff}}\,\bar U,
+$$
+\dot\varepsilon_{xy}=\tfrac12(\partial_y\bar u+\partial_x\bar v),
 \qquad
-\beta_{\mathrm{eff}} = \frac{c(U_b)}{1 + c(U_b)F_2}
-\qquad \text{(G-41)}$$
-
-Three properties worth noting:
-
-- it reduces to $\beta/(1+\beta F_2)$ for a linear law;
-- it is **strictly non-negative**, so the drag remains a dissipative (coercive) term in the elliptic operator — the property the momentum solve depends on;
-- in the **frozen-bed limit** $U_b\to0$ it tends to $1/F_2 = H/\omega$ (G-40), a *finite* deformational resistance, where SSA would give $\beta_{\mathrm{eff}}=0$ and lose all interior traction. This is the main physical gain of DIVA over SSA.
-
-**Implementation note.** We work with the coefficient $c(U)$ rather than the drag $f(U)=c U$ precisely so that $\beta_{\mathrm{eff}}$ needs no division by $\bar U$, which would be $0/0$ in every stagnant or ice-free cell.
-
-### 2.7 Secant versus tangent
-
-The residual uses the **secant** drag above. The Jacobian needs the **tangent**:
-
-$$\frac{\partial\tau_b}{\partial\bar U} = \frac{f'(U_b)}{1+f'(U_b)F_2}
-\qquad\text{vs.}\qquad
-\beta_{\mathrm{eff}} = \frac{c(U_b)}{1+c(U_b)F_2}.$$
-
-They coincide for a linear law ($c$ constant $\Rightarrow f'=c$) and differ for any nonlinear one. Getting this right is the single most error-prone part of the scheme; §5.6 explains how the implementation obtains the tangent without deriving it by hand.
-
-------------------------------------------------------------------------
-
-## 3. SSA versus DIVA at a glance
-
-|   | SSA (`stress_balance = 0`) | DIVA (`stress_balance = 1`) |
-|------------------------|------------------------|------------------------|
-| primary unknowns | $u,v,H$ | **unchanged** |
-| operator stencil / sparsity | 5-point membrane + drag | **unchanged** |
-| viscosity | $\eta(\bar u)$, explicit formula, computed **inline** | $\bar\eta$: depth average of an **implicit** $\eta(z)$, computed by a **separate kernel** and read as a field |
-| vertical structure | none (plug flow) | $N_\sigma$ sigma levels, integrated away per cell |
-| basal drag | sliding law evaluated on $\bar u$ | effective drag $\beta_{\mathrm{eff}}$ from the closure, evaluated on $\bar u$ |
-| basal speed | $=\bar u$ by assumption | separate quantity $U_b\le\bar U$ from the closure |
-| extra state | — | `u_b`, `eta_bar`, `F2`, `beta_eff` (all cell-centred 2-D) |
-| block size | 5 ($u_l,u_r,v_t,v_b,H$) | 6 (adds $U_b$), condensed back to 5 |
-| cost | baseline | **≈ 11 %** more (measured, §6) |
-
-The essential point: **DIVA changes coefficients, not structure.** The elliptic operator, the multigrid hierarchy, and the transfer operators are untouched.
-
-------------------------------------------------------------------------
-
-## 4. What is genuinely new, numerically
-
-Two nonlinearities must be distinguished, because only one is new.
-
-**(a) Viscosity depends on velocity — not new.** SSA already has Glen's-law shear thinning, and GLIDE already handles it with a well-established tripartite pattern: viscosity is *frozen* in the smoother block (Picard), *true* in the residual, and *exactly differentiated* in the JVP/adjoint via the `DualFloat` dual-number path. DIVA inherits this unchanged.
-
-**(b) Viscosity is implicit in itself — new.** The shear ansatz gives $\dot\varepsilon_{xz} = \tau_b\zeta/(2\eta)$, so $\eta$ appears inside the expression for its own argument:
-
-$$\eta_k = \tfrac12 B\Big[\dot\varepsilon^2_{\mathrm{mem}} + \big(\tfrac{\tau_b \zeta_k}{2\eta_k}\big)^2 + \varepsilon_{\mathrm{reg}}\Big]^{\frac{1-n}{2n}} .$$
-
-There is no closed form for $n=3$, so this needs a local fixed-point iteration. SSA has no analogue. (There *is* precedent for iterating locally inside a kernel: the Vanka smoother already runs an inner Newton per block.)
-
-**Structural consequence.** SSA computes $\eta$ *inline* inside every residual/Vanka/JVP kernel and never stores it. DIVA cannot — a vertical quadrature does not fit inside a per-stencil call — so $\bar\eta$ becomes a **stored, lagged field** refreshed before each evaluation. This is precisely Goldberg's "iteration on viscosity" (G-41–44), itself the classical SSA solution method of MacAyeal & Thomas (1986).
-
-------------------------------------------------------------------------
-
-## 5. The numerical method as implemented
-
-### 5.1 Vertical discretisation
-
-$N_\sigma$ sigma levels (default 8, `rheology.n_sigma`) with midpoint-rule quadrature in $\zeta\in[0,1]$:
-
-$$\zeta_k = \frac{k+\tfrac12}{N_\sigma},\qquad w_k = \frac1{N_\sigma},\qquad
-\bar\eta \approx \sum_k w_k\,\eta_k,\qquad
-F_2 \approx H\sum_k \frac{w_k\,\zeta_k^2}{\eta_k}.$$
-
-$\zeta=0$ is the surface, $\zeta=1$ the bed. **No 3-D array is stored**: the loop over $k$ lives inside one kernel and only its 2-D integrals are written out. `B` is currently uniform in $z$ (isothermal); note the vertical shear effect is captured *regardless*, because $\dot\varepsilon_{xz}\propto\zeta$ makes $\eta$ depth-varying even for constant `B`. Thermomechanical $B(z)$ is a later stage.
-
-### 5.2 The coefficient kernel
-
-`compute_diva_coeffs` (`cuda/diva.cu`) is the one genuinely novel kernel. Per cell:
-
-```         
-U_b <- stored u_b, clamped to [0, U_bar]            (warm start; the root is unique)
-repeat until converged, cap 20:                     NEWTON on F(U_b) = 0
-    tau_b = c(U_b)*U_b
-    for k in 0..N_sigma-1:                          the vertical quadrature
-        eta_k <- min(shear-free, shear-dominated) asymptote     (both overestimate)
-        repeat until converged, cap 10:             NEWTON on eta = G(eta)
-            s = k_shear/eta_k^2;  E = eps_mem^2 + eps_reg + s
-            G = 0.5*B*E^((1-n)/2n);  G' = -2p*(s/E)*(G/eta_k)
-            eta_k -= (eta_k - G)/(1 - G')
-        accumulate eta_bar, F2, and dF2/dtau_b
-    (breaks only right after a quadrature, so the outputs match the final U_b)
-    F  = U_b + c(U_b)*U_b*F2 - U_bar
-    F' = 1 + f'*F2 + f*f'*dF2/dtau_b                the FULL slope -- see 5.2.0
-    U_b = max(U_b - F/F', 0)
-write eta_bar, F2, u_b, beta_eff = c/(1 + c*F2)
-```
-
-Note the quadrature sits INSIDE the Newton loop, because $F_2$ depends on $U_b$. There is no
-outer "coupling" iteration; an earlier version had one and it 2-cycled (§5.2.0).
-
-Design choices worth reviewing:
-
-- **Adaptive iteration counts with caps, not fixed counts.** See §5.2.3 -- fixed counts sized by a scaling argument are what let both closure defects hide, and a count validated at $n=3$ was silently wrong at $n=4$.
-- **Only interior (non-halo) threads write.** `u_b` is read in place as the warm start, so each cell must have exactly one writer or the result would depend on block scheduling. This is what makes the kernel deterministic.
-- **Grounding is folded into `beta_eff` here** (via $\beta\cdot\phi$). The momentum kernels must therefore *not* apply the grounded factor again — unlike the SSA basal stencils, which do it internally. This asymmetry is deliberate and is the thing most likely to be mis-edited later; `tests/diva_residual_test.py` pins it.
-
-### 5.2.0 The kernel as a root-finding problem
-
-The clearest way to read `diva_coeffs_cell`. The SSA-shaped operator (Goldberg eqs 43–44) needs two
-coefficients per cell, $\bar\eta$ and $\beta_{\mathrm{eff}}$, and the momentum solve can only offer
-$\bar U$. The kernel inverts that. **There is one genuinely free scalar** — the partition of $\bar U$
-into sliding and internal deformation — and one equation fixing it:
-
-$$F(U_b) \;=\; U_b \;+\; f(U_b)\,F_2\big(f(U_b)\big) \;-\; \bar U \;=\; 0$$
-
-Constitutive, $\tau_b = f(U_b) = c(U_b)U_b$:
-
-$$c(U) = \begin{cases}\beta\varphi\,\big(U^2+u_{\mathrm{reg}}\big)^{\frac{m-1}{2}} + w_d & \text{Weertman}\\[6pt]\dfrac{\beta\varphi}{\sqrt{U^2+u_{\mathrm{reg}}}+u_c} + w_d & \text{regularized Coulomb}\end{cases}$$
-
-Shear integral, dependent on $U_b$ only through $\tau_b$:
-
-$$F_2(\tau_b) \;=\; H\!\int_0^1 \frac{\zeta^2}{\eta(\zeta;\tau_b)}\,\mathrm{d}\zeta \;\approx\; H\sum_{k=1}^{N_\sigma} w\,\frac{\zeta_k^2}{\eta(\zeta_k;\tau_b)},\qquad \zeta_k=\frac{k-\tfrac12}{N_\sigma},\;\; w=\frac1{N_\sigma}$$
-
-and a nested root problem per level, which is why $F_2$ is not a closed form (§5.2.1):
-
-$$G\big(\eta;\zeta,\tau_b\big) \;=\; \eta - \tfrac12 B\Big[\dot\varepsilon^2_{\mathrm{mem}} + \varepsilon_{\mathrm{reg}} + \Big(\frac{\tau_b\zeta}{2\eta}\Big)^{\!2}\Big]^{p} = 0, \qquad p=\frac{1-n}{2n}$$
-
-Both outputs are then formulas:
-
-$$\bar\eta = \sum_k w\,\eta(\zeta_k;\tau_b), \qquad \beta_{\mathrm{eff}} = \frac{c(U_b)}{1+c(U_b)F_2} \quad\text{(G-41)}$$
-
-**The derivative is the whole story.**
-
-$$F'(U_b) \;=\; \underbrace{1 + f'(U_b)F_2}_{\displaystyle R'(U_b)} \;+\; \underbrace{f(U_b)f'(U_b)\frac{\mathrm{d}F_2}{\mathrm{d}\tau_b}}_{\text{omitted by the code}}$$
-
-Every term is non-negative ($f,f'\ge0$, $F_2>0$, and $\mathrm{d}F_2/\mathrm{d}\tau_b>0$ because more
-drag means more shear means thinner ice), so $F'\ge 1$: **$F$ is strictly increasing, the root is
-unique, and full Newton is unconditionally well conditioned.** The problem is benign.
-
-**This is what the code now does.** It did not always: an earlier version ran block Gauss–Seidel,
-with the closure Newton using $R'$ (holding $F_2$ frozen) and a `coupling_iters` loop refreshing
-$F_2$ around it. That scheme's gain is exactly
-
-$$\Phi'(\tau_b) \;=\; 1 - \frac{F'}{R'} \qquad\Longrightarrow\qquad |\Phi'|>1 \iff F' > 2R'$$
-
-(verified against bisection-found roots to $10^{-11}$; see §5.2.1a for the table). So the mechanism
-is simply that the iteration **under-estimates the slope of a monotone increasing function**, and
-Newton with an under-estimated slope overshoots — by more than $2\times$, it oscillates. Our
-configurations sat at $F'/R' = 1.013$, the omitted term being 1.4% of the total, which is why
-nothing had ever visibly misbehaved -- stable by accident rather than by construction.
-
-**Resolved** by using $F'$: true Newton, gain zero, quadratic, and `coupling_iters` gone rather
-than wrapped in anything. $\mathrm{d}F_2/\mathrm{d}\tau_b$ is accumulated in the $\sigma$ loop from
-the implicit function theorem on the converged level root, taken from primals as any Newton
-denominator may be (verified against a finite difference of the exact quadrature: 2e-9).
-
-Verified against the true root found by **bisection** — never by fixed-point iteration, which is
-the thing that was under suspicion — from a single COLD call, in the regimes that used to 2-cycle:
-
-| $\beta$ | $\bar\eta$ err | $F_2$ err | $U_b$ err | $\|F\|/\bar U$ |
-|--------:|---------------:|----------:|----------:|---------------:|
-| 0.02 | 1.1e-07 | 2.2e-07 | 1.7e-08 | 2.1e-08 |
-| 0.1  | 3.4e-08 | 5.0e-07 | 3.9e-08 | 9.3e-08 |
-| 0.5  | 2.8e-08 | 1.1e-07 | 8.3e-09 | 2.3e-08 |
-| 2.0  | 4.2e-07 | 3.9e-07 | 2.1e-07 | 5.9e-07 |
-
-and repeated calls now agree exactly, where the block iteration sat in a stable 2-cycle. Cost:
-DIVA went from ~11% more expensive than SSA to 12.5%, and to **13.8%** once the iteration counts
-became adaptive (§5.2.3).
-
-One trap worth recording. `newton_iters` was first left at 4, and the result *looked* converged --
-repeated calls were idempotent -- while sitting at a non-root, $U_b$ 53% high at $\beta=2$. That
-is what a too-short Newton looks like from outside: the warm start is the previous answer, so
-successive calls reproduce it. Idempotence alone is necessary, not sufficient; `diva_closure_test`
-check 5 compares against the true root from COLD for exactly this reason.
-
-### 5.2.0a The closure residual, and a correction about "two residuals"
-
-Implemented alongside the Newton fix, and it corrects something stated too strongly earlier in
-this note's history.
-
-**The claim was: DIVA has two residuals and the solver monitors one, so it can report
-convergence with the closure unsatisfied. That is wrong.** `compute_residual` calls
-`compute_diva_coeffs` before evaluating (`operators.py`), so the reported $|r_u|,|r_v|,|r_H|$
-are the residuals of the FULL DIVA system with coefficients consistent with the current
-velocity — not of a frozen-coefficient surrogate. The refresh-before-residual ordering already
-couples the two halves.
-
-What the closure residual
-
-$$r_{U_b} = U_b + f(U_b)F_2 - |\bar U|$$
-
-does add is worth having, but it is two other things:
-
-1. **Coefficient drift.** $\bar\eta$ and $\beta_{\mathrm{eff}}$ ARE frozen inside a V-cycle,
-   so measuring $r_{U_b}$ *before* the refresh says how far they drifted out of consistency
-   while the smoother worked, i.e. whether the segregated refresh keeps up. Measured *after* the
-   refresh it is zero by construction and says nothing — a trap worth noting, since that is
-   where it naturally lands if you add it to the reporting line without thinking.
-2. **A standing guard that the closure solve converges at all.** This is what regressed silently
-   before: the block iteration 2-cycled, so `u_b` and $F_2$ were simply wrong, and no test or
-   diagnostic noticed.
-
-Measured on the 128² 5-level slab after the Newton fix: $|r_{U_b}|/|\bar U|$ = 3.4e-6 after the
-first V-cycle and ~2e-8 thereafter. So the coefficients track the velocity to round-off and the
-segregated refresh is comfortably keeping up in this configuration — which is the evidence the
-earlier §5.2.1a caveat asked for, at least here.
-
-Reported separately and scaled by $|\bar U|$, never folded into the combined norm: $r_{U_b}$ is a
-velocity residual and $r_u$ a momentum one, and mixing incommensurable units in one norm is
-precisely the defect in `notes/open_questions.md` Q6.
-
-### 5.2.1 The per-level viscosity solve, and why Picard was not enough
-
-The innermost loop above solves a genuine scalar fixed point. At depth $\zeta$, Glen's law and
-the DIVA shear ansatz are two relations in $(\eta, \dot\varepsilon_{xz})$:
-
-$$\eta = \tfrac12 B\big[\underbrace{\dot\varepsilon^2_{\mathrm{mem}} + \varepsilon_{\mathrm{reg}}}_{A} + \dot\varepsilon_{xz}^2\big]^{p},
-\qquad p \equiv \frac{1-n}{2n} < 0,
-\qquad \dot\varepsilon_{xz} = \frac{\tau_b\zeta}{2\eta}$$
-
-Eliminating the shear rate leaves $\eta$ on both sides:
-
-$$\eta = \tfrac12 B\Big[A + \frac{k}{\eta^2}\Big]^{p} \equiv G(\eta),
-\qquad k \equiv \Big(\frac{\tau_b\zeta}{2}\Big)^2$$
-
-**The contraction rate.** Differentiating and evaluating at the root ($G(\eta)=\eta$),
-
-$$G'(\eta) = -2p\,\frac{s}{E}\,\frac{G(\eta)}{\eta}
-\;\;\xrightarrow[\text{at the root}]{}\;\;
-2|p|\frac{s}{E},
-\qquad s \equiv \frac{k}{\eta^2},\; E \equiv A + s$$
-
-Since $s \le E$ by construction, the Picard iteration $\eta \leftarrow G(\eta)$ is a contraction with
-
-$$|G'| \le 2|p| = \frac{n-1}{n} = \tfrac23 \ \text{for Glen } n=3$$
-
-**independent of $B$, $H$, $\tau_b$ and $\zeta$.** And because $s>0$ with $p<0$, the shear-free
-starting value $\eta_0 = \tfrac12 BA^{p}$ *overestimates*, so the iteration descends monotonically.
-That looks like a licence to fix the trip count at 3 — and it is not, because the bound is only
-attained as $s/E \to 1$, which is precisely the shear-dominated regime DIVA exists to capture.
-Three sweeps of a rate-$2/3$ contraction starting hundreds of times away from the root is not
-convergence.
-
-**Measured.** With the defaults ($\varepsilon_{\mathrm{reg}} = 10^{-6}$, $n_\sigma = 8$,
-$\dot\varepsilon^2_{\mathrm{mem}} \approx 6\times10^{-9}$ for the slab tests, $H = 1000$ m), 3 sweeps
-against a converged reference. $\tau_b$ is in code units, i.e. divided by $\rho g$, so 100 kPa
-$\approx 11$:
-
-| $\tau_b$ | $s/E$ | error in $\bar\eta$ | **error in $F_2$** |
-|---------:|------:|--------------------:|-------------------:|
-| 1.0 | 0.16 | 0.0% | 0.0% |
-| 4.4 *(our test configurations)* | 0.98 | 4.6% | **15.9%** |
-| 11.0 *(~100 kPa)* | 1.00 | 19.4% | **53.0%** |
-| 30.0 | 1.00 | 33.7% | **74.5%** |
-
-$F_2$ suffers most because it weights deep levels by $\zeta^2$ and the near-bed levels are the
-least converged (35% error in $\eta$ at $\zeta=1$, $\tau_b=4.4$; **17** sweeps are needed there for
-$10^{-3}$). $F_2$ too low means deformation underestimated, which drives DIVA back toward the SSA
-answer — the exact effect it exists to correct.
-
-**Why no test caught it.** `diva_closure_test` check 1, the strong one, sets $\tau_b = 0$, where
-$s=0$ and Picard is exact in one step. Checks 2 and 3 validate the *Newton* against the
-**computed** $F_2$, so they pass whatever $F_2$ happens to be. Nothing else compares DIVA to an
-external reference — which is what ISMIP-HOM is for, and this is the kind of thing it would have
-surfaced.
-
-Note this was never a defect in the *adjoint*: the dual numbers differentiate the implemented map
-exactly, so the dot-product identity and the parameter gradients remain correct statements about
-the code as written. What was wrong was the fidelity of the implemented forward map to the DIVA
-equations.
-
-**The fix: Newton, not Picard.** For $n=3$ the fixed point is in fact a *depressed cubic* with an
-exact root. Substituting $p=-\tfrac13$ and clearing denominators:
-
-$$\eta = \tfrac12 B\Big(A+\frac{k}{\eta^2}\Big)^{-1/3}
-\;\Longrightarrow\;
-B^3 = 8A\eta^3 + 8k\eta
-\;\Longrightarrow\;
-8A\,\eta^3 + 8k\,\eta - B^3 = 0$$
-
-No $\eta^2$ term, and $A,k,B^3>0$, so by Descartes exactly one positive real root — available in
-closed form via Cardano. **We do not use it.** Cardano's two cube-root terms are
-$\sqrt[3]{h\pm\sqrt{D}}$ with $D \approx (a_1/3)^3$ when the shear dominates, so they nearly cancel
-in exactly the regime of interest. Verified in float32 against a float64 reference:
-
-| $\tau_b$ | Cardano (float32) | Newton, 3 iters (float32) |
-|---------:|------------------:|--------------------------:|
-| 11.0 | 2.7e-6 | 2.0e-7 |
-| 30.0 | 9.0e-5 | 0.0 |
-| 100.0 | **1.9e-3** | 3.5e-7 |
-
-So the implementation applies **Newton to $\Phi(\eta) = \eta - G(\eta)$**:
-
-$$\eta \leftarrow \eta - \frac{\eta - G(\eta)}{1 - G'(\eta)},
-\qquad G'(\eta) = 2|p|\,\frac{s}{E}\,\frac{G(\eta)}{\eta}$$
-
-Three properties make this the right choice over both Picard and Cardano:
-
-- **Well conditioned by construction.** $G' \in (0, 2|p|) \subset (0,1)$, so $1-G' \in (1/3, 1)$ and
-  the Newton denominator is never near zero. No safeguarding needed.
-- **General in $n$.** The expression for $G'$ holds for any $p$, so unlike the closed form there is
-  no `n == 3` branch.
-- **No new dual overloads.** It uses only $\times, +, \div$ and `__powf`, all of which `DualFloat`
-  already has, so the derivative rides along exactly as before.
-
-The starting guess matters, and takes the smaller of the two asymptotic limits — both of which
-overestimate, since dropping either positive term in the cubic inflates $\eta$:
-
-$$\eta_A = \tfrac12 BA^{p} \quad (\text{shear-free}),
-\qquad \eta_k = \big(\tfrac12 Bk^{p}\big)^{n} \quad (\text{shear-dominated})$$
-
-With $\min(\eta_A,\eta_k)$, **3 Newton iterations reach float32 round-off across the whole range**
-($\le 2.6\times10^{-7}$ up to $\tau_b=100$) — the same trip count the Picard loop used. Starting from
-$\eta_A$ alone would need 6.
-
-### 5.2.1a RESOLVED: the outer coupling loop was unstable at high basal drag
-
-**Historical.** The loop this describes no longer exists — §5.2.0 replaced it with true Newton on
-$F(U_b)=0$, whose gain is zero. Kept because the analysis is the reason for that change, because it
-records how the diagnosis was and was not done, and because the same failure mode can reappear in
-any segregated scheme.
-
-Fixing the per-level solve exposed a problem in the loop *around* it. Measured, not conjectured.
-
-**The system.** Per cell the closure has $N+1$ unknowns — the viscosity at each $\sigma$ level and
-the basal speed — with $N+1$ equations:
-
-$$(E_k)\quad \eta_k = \tfrac12 B\Big[\dot\varepsilon^2_{\mathrm{mem}} + \varepsilon_{\mathrm{reg}} + \Big(\frac{\tau_b\zeta_k}{2\eta_k}\Big)^{\!2}\Big]^{p}, \qquad k = 1\dots N$$
-
-$$(C)\quad U_b + f(U_b)\,F_2 = \bar U$$
-
-with $\tau_b = f(U_b)$, $F_2 = H\sum_k w\,\zeta_k^2/\eta_k$ and $\bar\eta = \sum_k w\,\eta_k$ all
-*derived*. The coupling structure is what makes the algorithm possible: the $\eta_k$ interact only
-through the scalar $\tau_b$, and $U_b$ sees the $\eta_k$ only through the scalar $F_2$. So the
-whole system reduces to **one scalar fixed point**, $\tau_b = \Phi(\tau_b)$, where $\Phi$ is
-"solve every $E_k$, form $F_2$, solve $C$, return $f(U_b)$". The outer loop is plain Picard on it.
-
-**Why it can oscillate.** Every link has a fixed sign, from the physics:
-
-$$\tau_b \uparrow \Rightarrow \dot\varepsilon_{xz}\uparrow \Rightarrow \eta\downarrow \Rightarrow F_2\uparrow,
-\qquad F_2\uparrow \Rightarrow U_b\downarrow \ (\bar U \text{ fixed}),
-\qquad U_b\downarrow \Rightarrow \tau_b'\downarrow$$
-
-so $\Phi'(\tau_b) < 0$ **always** — the loop is negative feedback. It converges (alternating about
-the root) when $|\Phi'|<1$ and settles into a **2-cycle** when $|\Phi'|>1$. Physically it is a
-competition between sliding and deformation for a fixed budget $\bar U$: guess high drag and the
-model reports lots of deformation, so little sliding is needed, so drag is low; guess low drag and
-the reverse. It only damps if the gain is under one.
-
-**Measured.** The root must be found by **bisection** on $\tau_b - \Phi(\tau_b)$, which is
-guaranteed since $\Phi$ decreasing makes it strictly increasing. (An earlier attempt used
-fixed-point iteration to locate the root and differentiated around whatever the 400th sweep
-returned. That was invalid — the iteration is the thing under suspicion, and it was oscillating,
-so it was never at a fixed point. The numbers below replace it.)
-
-| configuration | $\beta$ | true $\tau_b^*$ | $\Phi'$ | |
-|---|---:|---:|---:|---|
-| closure test ($B=1$, soft) | 0.02 | 0.160 | −0.256 | converges |
-| closure test ($B=1$, soft) | 0.1 | 0.263 | **−1.382** | oscillates |
-| closure test ($B=1$, soft) | 2.0 | 0.290 | **−1.890** | oscillates |
-| **realistic $B$, our slab tests** | 0.11 | 2.12 | **−0.013** | converges hard |
-| realistic $B$, high drag | 1.0 | 7.54 | **−1.210** | oscillates |
-| realistic $B$, thick, slow, high drag | 5.0 | 3.30 | −0.866 | converges |
-| realistic $B$, soft membrane | 1.0 | 7.85 | **−1.645** | oscillates |
-
-It is **not** an artefact of the soft-ice test configuration: the *local* map is unstable at
-realistic stiffness whenever the basal drag is high. That $\tau_b^*=7.54$ is ~68 kPa with a 7.5/20
-sliding–deformation split, an ordinary Greenland condition.
-
-Directly observed in the kernel: in the soft configuration at $\beta=0.1$, repeated
-`compute_diva_coeffs` calls (warm-starting `u_b` from the previous, as the solver does) leave
-`u_b` alternating between $\approx 0.71$ and $\approx 5.75$, and $F_2$ by a factor of ~18, with no
-sign of damping by call 12.
-
-**IMPORTANT CAVEAT: this analysis holds $\bar U$ FIXED.** In the solver it is not — $\bar U$ responds
-to $\beta_{\mathrm{eff}}$ through the momentum solve, an additional feedback path excluded here. So
-$|\Phi'|>1$ establishes that *the local, $\bar U$-frozen map* 2-cycles; it does **not** establish that
-the coupled solver oscillates. Settling that needs a stability analysis of the full system, which
-has not been done.
-
-**And GLIDE's local loop is a deviation from Goldberg, not a reproduction of it.** His scheme
-(paper, following eq 42) is a *single* fixed-point iteration over the velocity field: from
-$\bar u^{(i)}$ diagnose $\nu^{(i)}, \omega^{(i)}, \beta^{(i)}_{\mathrm{eff}}$, solve the linear 2-D
-system (43–44) for $\bar u^{(i+1)}$, and then — in his words — "$\tau_x^{(i+1)}$ is set to
-$\beta^{(i)}_{\mathrm{eff}}\bar u^{(i+1)}$, and $u_z^{(i+1)}$ is found from Equation (31) using
-$\nu^{(i)}_{\mathrm{(hy)}}$". So $\tau$ and $u_z$ are **lagged across the outer loop** and the local
-diagnosis is a single pass. There is no local sub-iteration to oscillate. `coupling_iters` was ours,
-and is now gone (§5.2.0) -- so on this point we have converged back onto Goldberg's structure, with
-the local closure solved properly rather than swept.
-
-This also inverts part of the earlier recommendation: *more* coupling sweeps make the between-call
-behaviour worse, not better, since three sweeps carry gain $(\Phi')^3 = -2.6$ where one carries
-$-1.38$. What survives is the Newton argument — a robustly solved local closure hands the outer
-iteration a well-defined function of $\bar U$ whatever the gain, which beats any Picard sweep count
-and is what Goldberg's single lagged pass is implicitly relying on being well behaved.
-
-**Why nothing had broken.** Our configurations sat at $\Phi' = -0.013$, three orders of magnitude
-inside the local stability boundary, so every DIVA solve in the suite converged. The margin was real
-but it was luck rather than design — which is why this was fixed before ISMIP-HOM rather than after,
-those experiments being deliberately deformation-dominated. Jake's call, and the right one: no
-configuration can be called validated while the closure is stable only by accident.
-
-**The fix, as taken.** Superseded by the cleaner form in §5.2.0 — Newton on $F(U_b)=0$ directly,
-which removes the outer loop instead of wrapping it — but the argument that got there was: since
-$\Phi'<0$ always, $g(\tau_b) = \tau_b - \Phi(\tau_b)$ has
-$g' = 1 + |\Phi'| \ge 1$: **unconditionally well conditioned**. Newton on $g$ converges in every
-row of that table, quadratically — the same move as §5.2.1, one level out. Fixed under-relaxation
-would also stabilise it but is the wrong trade: $\omega = 0.5$ rescues $\Phi'=-1.9$ while
-*degrading* our present regime from 0.013 to 0.49. And $\Phi'$ can be had the way the closure
-Newton already gets $f'$ — a primal-only dual evaluation, valid because the converged sensitivity
-does not depend on the step size used to reach it — so it needs no nested duals.
-
-Implemented in the cleaner form of §5.2.0. Note that `diva_closure_test` check 5 had to change
-with it: it previously replicated the kernel's own coupling structure, which made it a
-self-consistency check that would have PASSED this 2-cycle. It now targets the true root by
-bisection, and check 6 asserts idempotence.
-
-### 5.2.1b Two places where we knowingly differ from Goldberg
-
-- **The bed-slope factor — Arthern drops it too.** Goldberg carries
-  $m = \sqrt{1 + b_x^2 + b_y^2}$ through his eqs (38)–(41). GLIDE has no such factor, and neither
-  does Arthern: his eq (8) is a plain Robin condition $\boldsymbol\tau_b = \beta\mathbf u_b$ with no
-  geometric prefactor, his eq (12) for $\beta_{\mathrm{eff}}$ carries none, and he states the
-  small-slope assumption outright when approximating the surface normal stress (his eq 19). So on
-  this point we agree with the more recent implementation and Goldberg is the outlier.
-
-  That is reassuring but not licence: Arthern omits it for a continental Antarctic inversion where
-  bed slopes really are small, whereas ISMIP-HOM's topographic experiments impose large slopes
-  deliberately. Still worth quantifying before running them. (Name collision to watch: Goldberg's
-  $m$ is geometric, ours is the Weertman exponent.)
-- **A typo in Goldberg — SETTLED, independently, by Arthern.** Goldberg's eq (40) gives the
-  frozen-bed limit as $\tau_x = (H/\omega)\bar u$, i.e. $\beta_{\mathrm{eff}} = H/\omega = 1/F_2$,
-  while the text introducing his (42) gives $H/(2\omega)$ — a factor of 2 apart, and Jake confirmed
-  both appear in the typeset PDF, so it is not an extraction artefact.
-
-  (40) is correct, on two independent grounds. Internally: his eq (34) is
-  $u|_{z=b} = \bar u - \tau_x\omega/H$, so a frozen bed ($u|_{z=b}=0$) gives
-  $\tau_x = H\bar u/\omega$ immediately, and (42) cannot be reconciled with it. Externally:
-  Arthern's eq (12), citing Goldberg for the definition, is
-
-  $$\beta_{\mathrm{eff}} = \frac{\beta}{1 + \beta\,\mathcal{I}_2}, \qquad \mathcal{I}_2 = \int_b^s \frac{1}{\eta}\Big(\frac{s-z}{h}\Big)^{\!2} dz$$
-
-  whose $\beta\to\infty$ limit is $1/\mathcal{I}_2$, with **no factor of 2**. And
-  $\mathcal{I}_2$ is exactly our $F_2$: substituting $\zeta=(s-z)/H$ gives
-  $\mathcal{I}_2 = H\!\int_0^1 \zeta^2/\eta\,\mathrm{d}\zeta$, which is what the code accumulates.
-  So two independent implementations and one internal consistency check all give $H/\omega$; (42) is
-  the typo.
-
-  We implement (40): $\beta_{\mathrm{eff}} = c/(1+cF_2)\to 1/F_2$ as $c\to\infty$, pinned by
-  `diva_closure_test` check 1. Nothing to change.
-
-### 5.2.3 Adaptive iteration, and the three things it took to get right
-
-Both nested solves now run to a tolerance with a cap, rather than a fixed count. The motivation is
-Jake's, and it is the standing directive applied to iteration counts: a fixed count is an
-assumption that holds in the regimes you tested, a tolerance is a guarantee. Both defects above
-were silent, and an adaptive loop would have exposed each of them immediately.
-
-Three things had to be right, and only the first was obvious.
-
-**1. Non-convergence must be observable.** An adaptive loop that silently caps is *worse* than a
-fixed count, because it looks converged. So `diva_coeffs_cell` returns a per-cell `cap_flags`
-bitmask, `compute_diva_coeffs` writes it, and the solver reports any nonzero count next to
-$|r_{U_b}|$. `diva_closure_test` asserts it is zero across its whole matrix. This earned its keep
-within minutes of being added: it immediately flagged that at $n=4$ the per-level solve was
-hitting its cap in every cell.
-
-**2. Terminate on stagnation, not only on a tolerance.** These kernels use `__powf` under
-`--use_fast_math`, so $G(\eta)$ carries a few ulp of error and the Newton correction does not go
-to zero -- it enters a limit cycle. Measured at $n=4$, the relative step alternates
-2.1e-7 / 4.3e-7 indefinitely. A pure tolerance therefore has to be tuned *above* a floor that is
-itself parameter-dependent, which is the same kind of tested-regime number the whole exercise is
-meant to eliminate. Accepting "the correction stopped decreasing" is floor-agnostic. It is armed
-only once the correction is already below 1e-4 relative, so an early non-monotone step from a poor
-start cannot trip it.
-
-**3. The criterion is on the value, but the ADJOINT needs the derivative converged too.** This was
-the flagged risk that turned out to be real. Breaking the instant the primal criterion fires
-leaves the seeded `.d` one step stale, and the DIVA JVP degraded against finite differences from
-2.3e-4 to **2.3e-3** while the SSA control sat unchanged at 2.33e-4 -- the localisation that says
-it is DIVA's derivative, not the harness.
-
-The fix is one extra iteration after the criterion fires, and it is exact rather than a safety
-margin. The Newton map $N$ has $N'(\text{root}) = 0$, so once the value sits at the root a further
-step leaves it there while replacing the derivative with $\mathrm{d}(\text{root})/\mathrm{d}(\text{seed})$
-exactly. With it, JVP vs FD is back to 2.352e-4 and the dot-product identity to 3.75e-7.
-
-**Cost, and a prediction that was wrong.** I predicted adaptivity would take DIVA from 12.5% over
-SSA back to ~11%, reasoning that the closure loop would drop from 8 iterations to 1--2 when
-warm-started (which it does -- $|r_{U_b}| \approx 2$e-8 between refreshes means the warm start is
-essentially at the root). It went to **13.8%** instead. The reason is instructive: the $\eta$ loop
-now does *more* work than its fixed 3, because 3 was under-converged. The saving on one loop was
-more than offset by the other loop finally doing the work it should always have done. The old
-number was partly cheap because it was wrong.
-
-Measured worst cases, now known rather than assumed: the deepest $\sigma$ level at $n=4$ needs 7--8
-$\eta$ iterations (the old fixed 3 left it at **2.8e-3** relative error), and the cold-start closure
-Newton needs more than 12 at $n=4$, $\beta=2$. Typical counts are far lower -- most levels exit at
-2--5, and a warm-started closure exits at 1--2.
-
-### 5.2.2 Methodology note: how this was found
-
-Worth recording, because the finding was a by-product rather than the object of a search, and the
-sequence generalises.
-
-1. **A claim was made in prose** — a comment asserting that 3 sweeps suffice, resting on the
-   contraction bound $2|p| = 2/3$.
-2. **The claim was checked numerically before being repeated.** A 20-line NumPy replication of the
-   iteration confirmed the algebra (predicted vs observed contraction ratios matched, monotone
-   descent held, the bound was attained) — and in doing so swept parameters more widely than any
-   test did.
-3. **An outlier in that sweep was chased rather than dismissed.** One random draw showed 233% error
-   after 3 sweeps. The tempting reading is "unphysical parameters".
-4. **The regime was re-tested with the code's real defaults**, not random ones: `eps_reg` read from
-   `grid.py`, $\tau_b$ converted to code units from a physical basal stress. The error survived, and
-   sat squarely in the range our own tests run at.
-5. **The effect was propagated to the quantities that matter.** Per-level $\eta$ error is not the
-   headline; $\bar\eta$ and $F_2$ are what the momentum balance sees, and $F_2$ turned out to be
-   hit ~3x harder by the $\zeta^2$ weighting.
-6. **The candidate fix was itself checked in float32 before being adopted**, which is what rejected
-   Cardano — it is exact in float64 and loses three digits in float32 in the regime of interest.
-
-A seventh step belongs on the list, and it is the one this session got wrong twice: **when the
-scaffolding built to measure something is itself an iterative scheme, verify that it converged
-before trusting what it reports.** The loop-gain measurement in 5.2.1a was invalid for exactly
-that reason -- 400 Picard sweeps were assumed to be a fixed point and were an oscillation. The
-same error, in a different costume, produced the retracted Q6.
-
-The transferable part: steps 2 and 6. An analytic bound is a statement about the limit, not about
-the truncation actually shipped, and a closed form is a statement about exact arithmetic, not about
-float32. Both needed a measurement to become claims about this code. See also
-`notes/open_questions.md` Q6, where reasoning from a plausible mechanism instead of measuring first
-produced a retracted entry.
-
-### 5.3 Dual numbers for the sliding law
-
-`get_diva_drag_coeff` (`cuda/stress.cu`) returns $c(U)$ as a `DualFloat`, so $c'(U)$ — and hence $f'=(cU)'$ by the product rule — falls out of the *same* evaluation. The same helper therefore serves the closure Newton, the block Jacobian, and (later) the adjoint, **for every sliding law, with no per-law hand derivation**. This required extending `DualFloat` with $\div$(dual,dual) and $\sqrt{\cdot}$(dual) — the only additions to the existing dual-number machinery.
-
-### 5.4 Momentum residual
-
-`residual_body<bool DIVA>` (`cuda/residuals.cu`) is shared by both schemes; `compute_residual` and `compute_residual_diva` are thin wrappers. `DIVA` is a compile-time flag, so each instantiation keeps only its own branch. The two differ in exactly two places:
-
-1.  the $\eta$ tile is read from `eta_bar` instead of `populate_viscosity`;
-2.  the basal term uses `get_tau_bx_diva_jac` / `get_tau_by_diva_jac` ($\tau_b=-\beta_{\mathrm{eff}}\bar u$, linear in velocity) instead of the sliding-law stencil.
-
-### 5.5 The smoother
-
-`vanka_smooth_body<bool DIVA>` and `build_5x5_vanka<bool DIVA, ...>` (`cuda/vanka.cu`) are shared the same way. The block owns $(u_l, u_r, v_t, v_b, H_c)$ — indices 0–4, row-major $J[5r+c]$ — and runs a damped local Newton with a $5\times5$ LU (Doolittle, no pivoting). Viscosity is frozen within the block; this is the level at which the DIVA operator is self-adjoint (§1).
-
-### 5.6 The augmented $U_b$ unknown and its condensation
-
-DIVA carries the basal speed as a **sixth local unknown** with the closure as its residual row, giving
-
-$$\begin{bmatrix} A & \mathbf b \\ \mathbf c^{\mathsf T} & d \end{bmatrix}
-\begin{bmatrix} \delta\mathbf x \\ \delta U_b\end{bmatrix}
-=\begin{bmatrix} \mathbf r \\ r_{U_b}\end{bmatrix},
+\dot\varepsilon_{xz}=\tfrac12\partial_z u,
 \qquad
+\dot\varepsilon_{yz}=\tfrac12\partial_z v.
+$$
+
+The Glen viscosity is
+
+$$
+\eta=\tfrac12B(\dot\varepsilon_e^2)^p,
+\qquad B=A^{-1/n},
+\qquad p=\frac{1-n}{2n}.
+$$
+
+In closure equations, $\tau_b\ge0$ is the magnitude of basal resistance. We
+write $\vec{\tau}_b$ for the drag vector aligned with velocity, so the traction
+on the ice is $-\vec{\tau}_b$ and the momentum equations contain a negative
+drag term.
+
+### 2.2 Depth-integrated momentum
+
+DIVA replaces $u,v$ by their depth averages in horizontal strain rates while
+retaining $\partial_z u,\partial_z v$ in viscosity and the basal condition.
+Goldberg applies this approximation to the action functional. The resulting
+equations and boundary conditions are consistent, and the frozen-viscosity
+operator is self-adjoint. The full nonlinear Jacobian need not be assumed
+symmetric.
+
+The $x$-momentum equation is
+
+$$
 \begin{aligned}
-b_a &= \frac{\partial r_a}{\partial\beta_{\mathrm{eff}}}\cdot\frac{c'}{(1+cF_2)^2}\\
-c_a &= -\frac{\partial \bar U}{\partial x_a}\\
-d &= 1 + f'(U_b)F_2 \;\ge\; 1
-\end{aligned}$$
+&\partial_x[2\bar\eta H(2\partial_x\bar u+\partial_y\bar v)]
++\partial_y[\bar\eta H(\partial_y\bar u+\partial_x\bar v)]
+-\tau_{b,x}\\
+&\hspace{5cm}=\rho gH\partial_xs,
+\end{aligned}
+$$
 
-Because $d$ is a **scalar and never singular**, $U_b$ is eliminated *analytically*:
+together with the basal-drag relation
 
-$$\left(A - \frac{\mathbf b\,\mathbf c^{\mathsf T}}{d}\right)\delta\mathbf x
-= \mathbf r - \frac{\mathbf b\, r_{U_b}}{d},
+$$
+\vec{\tau}_b=\beta_{\mathrm{eff}}\bar{\mathbf u}.
+$$
+
+Here
+
+$$
+\bar\eta=\frac{1}{H}\int_b^s\eta(z)\,dz.
+$$
+
+This is the same differential operator used for SSA, but $\bar\eta$ and
+$\beta_{\mathrm{eff}}$ now contain the effects of vertical shear. The
+right-hand side is the depth-integrated driving stress. The corresponding
+$y$-momentum equation is obtained by interchanging $x$ and $y$ (G43--G44; A1).
+
+GLIDE omits Goldberg's geometric bed-slope multiplier, consistent with
+Arthern's small-slope Robin condition. This does not affect flat-bed ISMIP-HOM
+experiment C but should be quantified for experiments A and B.
+
+### 2.3 Effective viscosity and vertical shear
+
+The strain-rate invariant is
+
+$$
+\dot\varepsilon_e^2
+=\underbrace{\dot\varepsilon_{xx}^2+\dot\varepsilon_{yy}^2
+ +\dot\varepsilon_{xx}\dot\varepsilon_{yy}+\dot\varepsilon_{xy}^2}
+ _{\dot\varepsilon_{\mathrm{mem}}^2}
++\dot\varepsilon_{xz}^2+\dot\varepsilon_{yz}^2+\varepsilon_0^2.
+$$
+
+The membrane part comes from $\bar{\mathbf u}$ and is depth-independent.
+`membrane_eps_sq<T>` in `viscosity.cu` is the shared unregularized
+definition. The vertical shear terms are what distinguish DIVA
+from SSA: they alter the deformation rate and hence the viscosity in
+shear-dominated columns.
+
+Integrating the shear stress from the stress-free surface gives (G31; A4--A5)
+
+$$
+\tau_{xz}=\tau_{b,x}\zeta,
+\qquad \tau_{yz}=\tau_{b,y}\zeta,
+$$
+
+and therefore
+
+$$
+\partial_zu=\frac{\tau_{b,x}\zeta}{\eta},
 \qquad
-\delta U_b = \frac{r_{U_b} - \mathbf c\cdot\delta\mathbf x}{d}.$$
+\partial_zv=\frac{\tau_{b,y}\zeta}{\eta}.
+$$
+
+Substitution into Glen's law gives the implicit level equation
+
+$$
+\boxed{
+\eta=\tfrac12B\left[A_{\mathrm{reg}}
+ +\frac{\tau_b^2\zeta^2}{4\eta^2}\right]^p},
+\qquad
+A_{\mathrm{reg}}=\dot\varepsilon_{\mathrm{mem}}^2+\varepsilon_0^2.
+$$
+
+Viscosity occurs on both sides because vertical strain rate is stress divided
+by viscosity. Thus, given the membrane strain rate and basal traction, each
+height in the column requires a scalar constitutive solve. Arthern obtains a
+cubic for $n=3$; GLIDE uses Newton's method for general $n$.
+
+### 2.4 From vertical shear to the velocity profile
+
+Following Arthern (A7), define the shear integrals
+
+$$
+\mathcal I_\alpha
+=\int_b^s\frac{1}{\eta(z)}
+ \left(\frac{s-z}{H}\right)^\alpha dz.
+$$
+
+Integrating $\partial_z\mathbf u=\vec{\tau}_b\zeta/\eta$ upward from the bed
+gives the velocity at any height:
+
+$$
+\mathbf u(z)=\mathbf u_b
++\vec{\tau}_b\int_b^z\frac{1}{\eta(z')}
+ \left(\frac{s-z'}{H}\right)dz'.
+$$
+
+Two special cases are all that the depth-integrated system needs. At the
+surface, and after averaging through the column, respectively,
+
+$$
+\boxed{\mathbf u_s=\mathbf u_b+\vec{\tau}_b\mathcal I_1},
+\qquad
+\boxed{\bar{\mathbf u}=\mathbf u_b+\vec{\tau}_b\mathcal I_2}.
+$$
+
+The $\mathcal I_1$ relation connects the model state to surface observations.
+The $\mathcal I_2$ relation connects the basal and depth-averaged velocities
+and is therefore the one needed to close the momentum balance. Both follow from
+the vertical-shear closure and are independent of the choice of sliding law.
+
+### 2.5 Basal stress closure and effective drag
+
+The momentum equation is solved for $\bar{\mathbf u}$, but a basal friction law
+relates traction to the velocity at the bed, $\mathbf u_b$. The purpose of the
+basal closure is therefore to answer a local question: **given the
+depth-averaged speed $\bar U$, what basal speed $U_b$ and basal traction
+$\tau_b$ are consistent with the vertical shear in this column?**
+
+Let
+
+$$
+U_b=\lVert\mathbf u_b\rVert,
+\qquad
+\tau_b=\lVert\vec{\tau}_b\rVert.
+$$
+
+Recall that $\vec{\tau}_b$ denotes the positive drag vector, aligned with the
+basal velocity; the physical traction acting on the ice is
+$-\vec{\tau}_b$. An isotropic sliding law can then be written in equivalent
+vector and scalar forms:
+
+$$
+\vec{\tau}_b=c(U_b)\mathbf u_b,
+\qquad
+\tau_b=f(U_b)=c(U_b)U_b.
+$$
+
+The scalar equation follows by taking the magnitude of the vector equation.
+For $U_b>0$, both vectors point along
+$\widehat{\mathbf t}=\mathbf u_b/U_b$, so
+$\mathbf u_b=U_b\widehat{\mathbf t}$ and
+$\vec{\tau}_b=\tau_b\widehat{\mathbf t}$. At $U_b=0$, the direction is
+undefined but both vectors vanish and the scalar relation remains well
+defined.
+
+GLIDE supports
+
+$$
+\begin{array}{ll}
+\text{Weertman:}&c(U)=\beta\varphi
+(U^2+u_{\mathrm{reg}})^{(m_s-1)/2}+w_d,\\[3pt]
+\text{regularized Coulomb:}&c(U)=\dfrac{\beta\varphi}
+{\sqrt{U^2+u_{\mathrm{reg}}}+u_c}+w_d.
+\end{array}
+$$
+
+Grounding is included here through $\beta\varphi$ and must not be applied
+again in the momentum stencil.
+
+Because both the rheology and the sliding law are isotropic,
+$\mathbf u_b$, $\vec{\tau}_b$, and $\bar{\mathbf u}$ are parallel. Taking
+magnitudes in the depth-average relation from Section 2.4 gives
 
-This is **algebraically identical to solving the** $6\times6$ but leaves the hardcoded $5\times5$ layout and `lu_5x5_solve` untouched. It is what upgrades the secant drag that `build_5x5_vanka` assembled into the **tangent** of §2.7 — and note it is obtained *without ever deriving the tangent by hand*: the condensation performs the elimination numerically from two quantities the duals already give us.
+$$
+\bar U=U_b+\tau_b\mathcal I_2(\tau_b).
+$$
 
-Two documented approximations:
+Substituting the sliding law $\tau_b=f(U_b)$ leaves one unknown, $U_b$:
 
-- $\mathbf c$ omits $\partial F_2/\partial H$, consistent with the lagged viscosity;
-- $U_b$ is not written back from the block — `compute_diva_coeffs` re-solves the closure exactly before the next sweep, which is at least as good as one Newton step.
+$$
+\boxed{R(U_b)=U_b+f(U_b)\mathcal I_2(f(U_b))-\bar U=0}.
+$$
+
+This is the basal-speed closure solved in each cell. The dependence
+$\mathcal I_2(\tau_b)$ is essential: changing $U_b$ changes traction, which
+changes vertical shear and viscosity, which in turn changes $\mathcal I_2$.
+Even a linear sliding law therefore produces a nonlinear closure.
+
+The root lies in $[0,\bar U]$, and for a monotone law
+
+$$
+R'=1+f'\mathcal I_2+ff'\frac{d\mathcal I_2}{d\tau_b}\ge1.
+$$
 
-Sanity check: for a **linear** law $c'=0$, so $\mathbf b \equiv 0$ and the condensation is provably inert — secant and tangent coincide, as they must.
-
-`lu_6x6_solve` exists in `cuda/vanka.cu` not for the hot path but as the **verification oracle**: `tests/diva_condensation_test.py` checks the condensed $5\times5$ against the explicit $6\times6$ on random systems.
-
-### 5.7 Multigrid
-
-Nothing in the FAS cycle changes. Each level diagnoses its own $\bar\eta, F_2,
-\beta_{\mathrm{eff}}$ from its own restricted state, including for the coarse-grid operator evaluations $F_c(I u_h)$, so the coarse-grid correction is consistent. `u_b` is restricted with the rest of the state (giving the coarse closure a good warm start) and needs no prolongation, since it is diagnosed rather than corrected. The DIVA auxiliaries are all cell-local, so no new transfer operator is required.
-
-------------------------------------------------------------------------
-
-### 5.8 Operator symmetry: what the adjoint relies on
-
-This is a real design constraint rather than a curiosity, so it is recorded here explicitly. It was previously implicit in the code and untested.
-
-**Where symmetry is and is not relied on.** GLIDE's adjoint is a hybrid:
-
-| site | mechanism | needs symmetry |
-|------------------------|------------------------|------------------------|
-| adjoint block solve (`vanka_smooth_adjoint`) | builds forward `J`, then **explicitly transposes** it (`J_T[r*5+c] = J[c*5+r]`) | no |
-| adjoint multigrid transfers | reuses the forward operators | no -- multigrid only accelerates; the fixed point is set by the residual equation |
-| basal / driving / flux / calving in `compute_vjp` | explicit scatter, `atomicAdd(adj_X, lambda_row * j.d_X)`, deposited at the **column** index | no |
-| **viscous (membrane) term in `compute_vjp`** | λ-seeded forward JVP -- `populate_viscosity(..., lambda_u, lambda_v, ...)`, then `eta_c.d` fed through `apply_jvp`, deposited at the **row** index | **yes** |
-
-So exactly one term computes `J λ` and uses it where `Jᵀ λ` is wanted. The tell is where the result lands: the basal block scatters to column indices, the membrane block deposits at its own row.
-
-**Why the shortcut is there.** `∂η/∂u` is the worst transpose in the code to write by hand: the shared `eta_local` tile couples a 3×3 cell neighbourhood, each `η` depends on \~8 velocity facets, and the shear terms contract four cells' viscosity derivatives at once -- roughly 32 velocity degrees of freedom feeding a single row. Exploiting symmetry lets the adjoint reuse the **forward data flow verbatim**, with λ substituted for the perturbation. The honest transpose is perfectly feasible matrix-free (form `w_c = (Gᵀλ)_c` per cell, then scatter `w_c · ∂η_c/∂u_j`), but it needs a second, differently-shaped phase: an extra shared tile, an extra `__syncthreads()`, and a scatter whose reach may exceed the current `halo = 1` tiling. The cost is code structure, not flops.
-
-**Measured** (central FD on the assembled residual, so the measured Jacobian contains the full `∂η̄/∂u` and `∂β_eff/∂u` paths; relative asymmetry of `⟨Jx,y⟩` vs `⟨x,Jy⟩`):
-
-| block                                    | SSA    | DIVA   |
-|------------------------------------------|--------|--------|
-| momentum diagonal                        | 5.0e-6 | 7.3e-5 |
-| off-diagonal `u`--`H` (positive control) | 9.8e-2 | 9.8e-2 |
-
-The control confirms the test detects real asymmetry, so the diagonal figures are meaningful. DIVA's momentum block is symmetric to three orders below a genuinely asymmetric one. DIVA is \~15x less symmetric than SSA, which is plausibly a small real asymmetry from the fixed-iteration closure not being exactly the gradient of anything; expect that as a floor in FD gradient checks.
-
-**What preserves symmetry.** The whole higher-order ladder (SSA, DIVA, MOLHO, Blatter--Pattyn) is variationally derived, so the momentum block is symmetric by construction. Also **every isotropic sliding law, neural networks included**: for `tau_b = -c(s) u` with `s = |u|`,
-
-$$\frac{\partial \tau_{b,i}}{\partial u_j} = -\Big[c(s)\,\delta_{ij} + \frac{c'(s)}{s}u_i u_j\Big]$$
-
-and both terms are symmetric in `(i,j)` for *any* scalar `c`. The eigenvalues are `c + c's = f'(s)` along the flow and `c` across it, so **definiteness** (not symmetry) is what requires a monotone law -- the rate-weakening constraint documented in `differentiable_sliding_laws.md`. Two separate properties: symmetry licenses the adjoint shortcut, monotonicity licenses the solver.
-
-Thermomechanical coupling does **not** threaten it: `B(T)` enters as a coefficient, so within the momentum block `eta` is still an isotropic function of the strain invariant. The new `∂r_u/∂T` and `∂r_T/∂u` blocks are off-diagonal and get explicit transposes, as the `H` blocks already do.
-
-**What would break it:** anisotropic drag (an NN emitting a 2x2 tensor, or drag not antiparallel to `u`); thickness transport (already nonsymmetric, already explicit); thermal or hydrological couplings (off-diagonal, handle explicitly).
-
-**Consequence for the DIVA adjoint.** `η̄` depends on velocity through two paths, and they are treated differently on purpose:
-
-| path into `η̄` | stencil | mechanism | symmetry assumed |
-|------------------|------------------|------------------|------------------|
-| `ε̇²_mem(u)` | wide (3x3 cells) | λ-seeded JVP shortcut | yes -- but the *same* assumption SSA already makes, structurally guaranteed |
-| closure, via `Ū_c` | **local, 4 facets** | explicit transpose scatter | **no** |
-
-The closure path enters only through `Ū_c = |ū_c|`, which `compute_diva_coeffs` builds from the cell's own four facets, so its transpose is a small local scatter. The DIVA adjoint therefore introduces **no new symmetry assumption** beyond SSA's.
-
-### 5.9 How the scheme compares to Goldberg (2011) and Arthern et al. (2015)
-
-Both published DIVA implementations use the **same outer scheme**: Picard on the momentum
-equations with $\bar\eta$ and $\beta_{\mathrm{eff}}$ lagged, re-diagnosed between solves. Arthern
-converges it on the momentum residual "expressed as a fraction of the norm of $f$", which is what
-our reported $|r|/|r_0|$ is. Nothing we do differs there.
-
-Everything that differs is in the two **implicit local problems**, and this is where the papers are
-thin — Jake's observation, and largely right, though Arthern is much more explicit than Goldberg.
-
-**The implicit viscosity.** $\eta$ appears on both sides, because the vertical shear strain rate
-$\dot\varepsilon_{xz} = \tau_b\zeta/(2\eta)$ depends on it. Arthern states the problem outright:
-
-> "The reason that equation (3) is an implicit definition for viscosity $\eta$ is that the strain
-> rates for vertical shear themselves depend on viscosity."
-
-and gives the resolution in one sentence:
-
-> "...given estimates of $s, h, B, \tau_{bx}, \tau_{by}, \partial_x\bar u, \dots$ the viscosity
-> $\eta$ can be found by **solving a cubic equation** obtained by substituting equations (5) and (4)
-> into equation (3) and rearranging. Integration over depth is then carried out by numerical
-> quadrature."
-
-That cubic is exactly the one derived independently in §5.2.1, $8A\eta^3 + 8k\eta - B^3 = 0$ — a
-useful confirmation of the algebra, arrived at from the other direction. **Goldberg does not solve
-it at all**: he lags it, computing $u_z^{(i+1)}$ from his eq (31) using $\nu^{(i)}$, so the
-viscosity advances one Picard step per momentum iteration and is never locally converged.
-
-**The sliding closure.** Note what Arthern's sentence takes as *given*: $\tau_{bx},\tau_{by}$. So the
-cubic is solved with $\tau_b$ **lagged** — the viscosity and the closure are not resolved against
-each other. Goldberg's eqs (38)–(39) are the local root find, and he is explicit that it is
-cell-local ("solved at a location along the base independently of other locations"), but in his
-actual scheme $\tau$ is likewise set after the momentum solve from the previous $\beta_{\mathrm{eff}}$.
-
-|  | sliding law | implicit $\eta(\zeta)$ | closure for $U_b$, $\tau_b$ | outer |
-|---|---|---|---|---|
-| **Goldberg 2011** | general $f(u_b)$ | lagged, one Picard step per momentum iteration | root find (eqs 38–39) | Picard on momentum |
-| **Arthern 2015** | **linear** (Robin, eq 8) | solved exactly: cubic for $n=3$, then quadrature | closed form, eq 12 | Picard, residual tolerance |
-| **GLIDE (here)** | general $f(u_b)$ | solved by Newton to tolerance | root find, **jointly** with $\eta$ | multigrid + refresh; both residuals reported |
-
-**Which explains why neither paper details the joint problem: neither one faces it.** Goldberg has
-the nonlinear closure but lags the viscosity. Arthern solves the viscosity but his drag is linear
-(eq 8, $\boldsymbol\tau_b = \beta\mathbf u_b$), so his closure inverts in closed form and there is
-nothing to iterate. Our scheme is the union of the two hard parts — a nonlinear sliding law *and* a
-converged depth-varying viscosity, resolved against each other — because we want learned sliding
-laws and an exact gradient. That combination appears not to be in the literature, which is the real
-answer to "why is there so little detail on the implicit viscosity".
-
-So we are strictly more converged locally than either, and the joint resolution is the part neither
-paper does: our quadrature sits *inside* the closure Newton, so $\eta$, $F_2$ and $U_b$ are mutually
-consistent before the coefficients are handed to the momentum solve. §5.2.0 is why that turned out
-to matter — lagging $F_2$ against the closure is precisely the block Gauss–Seidel that 2-cycles at
-high basal drag.
-
-Two smaller divergences, both deliberate:
-
-- **We use Newton on the cubic rather than Cardano**, despite having the closed form. Arthern
-  presumably works in double precision, where Cardano is exact (verified: 2e-12). In float32 its two
-  cube roots nearly cancel when the shear dominates and it loses three digits — 1.9e-3 at
-  $\tau_b = 100$ against Newton's 3.5e-7 (§5.2.1). Newton is also $n$-general where the cubic is not.
-- **We solve to a tolerance with stagnation detection, not a fixed sweep count** (§5.2.3). Neither
-  paper says how many local iterations it takes, which is the detail that would have saved us the
-  most time.
-
-**The adjoint is where the divergence is largest.** Arthern does not compute a discrete adjoint at
-all. He uses the Kohn–Vogelius functional with a Neumann/Dirichlet pair (Arthern & Gudmundsson
-2010): solve the forward problem twice under different upper-surface boundary conditions and the
-gradient falls out of the difference. That buys a gradient without an adjoint, at the cost of being
-frankly approximate — his own words on the viscosity in the Dirichlet solve:
-
-> "We do not recompute viscosity $\eta(z)$ but simply reuse the viscosity field that was computed
-> for the Neumann solution. This choice is somewhat heuristic but practically convenient."
-
-and on the stiffness update: *"Strictly, this applies only for a linear rheology. Nevertheless, at
-each iteration, we updated the ice stiffness coefficient $B$ heuristically as follows..."*
-
-That is entirely reasonable for a fixed-point inversion scheme, and it is the opposite of what we
-need. Our exact coefficient adjoint — dot-product identity 3.75e-7, no symmetry assumed, every
-closure path differentiated — exists because the gradient has to be consumed by a general optimizer,
-and because a learned sliding law needs a derivative that is exact by construction rather than by
-regime.
-
-**Worth noting for the sliding-law work.** Arthern's headline conclusion is that
-*"no simple sliding law adequately represents basal shear stress as a function of sliding speed"* --
-his recovered basal drag varies by factors exceeding $10^{10}$ and resists any $\tau_b(u_b)$ fit.
-That is an argument from the observational side for the learned-closure direction, from an author
-with no stake in it.
-
-### 5.10 The analytic slab check, and what `eps_reg` and $N_\sigma$ cost
-
-Every other DIVA test checks the code against itself. The uniform slab is the first check against
-an **external truth**, and it is exact: uniform thickness, uniform slope, uniform drag, so membrane
-stresses vanish, all driving stress reaches the bed, and the shear profile integrates twice in
-closed form. Verified symbolically both ways (`tests/diva_slab_test.py`):
-
-$$\bar u - u_b = \frac{2AH\tau_b^{\,n}}{n+2} \qquad\Longrightarrow\qquad F_2 = \frac{2AH\tau_b^{\,n-1}}{n+2}, \quad A = B^{-n}$$
-
-and DIVA's own definition $F_2 = H\!\int_0^1 \zeta^2/\eta\,\mathrm d\zeta$, built from the
-depth-varying viscosity with no reference to the SIA result, must reproduce it.
-
-**It does, to 5.1e-5 — the float32 floor — once the regularization is removed.** So the
-formulation and the quadrature are right. Note $\bar\eta$ is *not* checkable this way: in pure
-shear $\eta \sim \zeta^{1-n}$ diverges at the stress-free surface, so its depth average is set by
-$\varepsilon_{\mathrm{reg}}$ rather than by the physics. $F_2$'s $\zeta^2$ weight removes that
-singularity, which is why $F_2$ is the well-posed quantity and the one the momentum balance
-consumes.
-
-**$N_\sigma$ convergence, and why the quadrature is now Gauss–Legendre.** Midpoint was clean second
-order — $4\times$ per doubling, rel. error in $F_2$ of 5.2e-2 / 1.3e-2 / 3.3e-3 / 8.1e-4 at
-$N_\sigma = 4/8/16/32$ — which meant the **default $N_\sigma=8$ carried a 1.3% systematic error of
-its own**, on top of the regularization error below and in the same direction.
-
-But in the shear-dominated limit $\eta \sim \zeta^{1-n}$, so the integrands are
-
-$$\frac{\zeta}{\eta} \propto \zeta^{n}, \qquad \frac{\zeta^2}{\eta} \propto \zeta^{n+1}$$
-
-**polynomials for integer $n$**, which Gauss–Legendre integrates *exactly*. Switched to GL, and the
-node thresholds come out precisely where the theory says:
-
-| $N_\sigma$ | 2 | 3 | 4 | 8 | 32 |
-|---|---|---|---|---|---|
-| $F_2$ error (degree $n{+}1=4$) | 2.8e-2 | **2.4e-7** | 1.0e-8 | 1.2e-7 | 1.5e-7 |
-| $F_1$ error (degree $n=3$) | **1.9e-7** | 2.8e-7 | 1.3e-7 | 4.2e-7 | 3.5e-7 |
-
-$F_2$ needs 3 nodes and $F_1$ needs 2, exactly $\lceil (\text{degree}+1)/2\rceil$. Everything from
-there up is round-off. Two consequences: the 1.3% quadrature bias at the default is simply gone
-(it is why the $\tau_b = 13.6$ row below improved from 1.2% to 0.1%), and $N_\sigma$ can be 3 or 4
-rather than 8 — which does not measurably change runtime, since the coefficient kernel is a small
-fraction of it, but matters directly for memory if a per-level velocity profile is ever stored.
-
-The rule is built on the host by `numpy.polynomial.legendre.leggauss`, mapped to $[0,1]$ with
-weights scaled to sum to 1, cached on $N_\sigma$, and passed to the kernels as two small arrays.
-No table in the CUDA, and any $N_\sigma$ works.
-
-Note GL gives whole-interval integrals only. A *partial* moment
-$G(\zeta) = H\!\int_\zeta^1 (\zeta'/\eta)\,\mathrm d\zeta'$, which is what a velocity profile at
-intermediate depths needs, does not fall out of a GL rule the way it would from a cumulative
-midpoint sum. That is a separate design problem, flagged in §5.12.
-
-**What $\varepsilon_{\mathrm{reg}} = 10^{-6}$ costs.** This is the finding worth acting on. It is a
-squared strain rate, so it caps the viscosity wherever the shear term falls below it — and DIVA's
-vertical shear strain rate is far smaller than the membrane strain rates
-$\varepsilon_{\mathrm{reg}}$ was chosen for:
-
-| $\tau_b$ (code) | $\approx$ kPa | error in $F_2$ | column regularized |
-|---:|---:|---:|---:|
-| 13.6 | 123 | 0.1% | top 18% |
-| 6.3 | 57 | 1.5% | top 38% |
-| 4.8 | 43 | 7.7% | top 50% |
-| 0.4 | 3.6 | **5951%** | all of it |
-
-The last row is not a corner case: 3.6 kPa is slow interior ice, which is exactly the regime DIVA
-exists to represent. There the deformational velocity is essentially manufactured by the
-regularization. Nothing is wrong with the closure — part 1 of the test shows the formulation is
-exact — but $\varepsilon_{\mathrm{reg}}$ is an SSA-era parameter and DIVA inherits it in a term
-where it does far more damage. Both this and the $N_\sigma$ error suppress deformation, so they
-bias the same way.
-
-**It is not a DIVA-only question, which changes what can be done about it.** Measured against the
-membrane invariant $\varepsilon_{\mathrm{reg}}$ nominally regularizes:
-
-| configuration | median $\dot\varepsilon^2_{\mathrm{mem}}$ | vs $\varepsilon_{\mathrm{reg}}$ | cells below $\varepsilon_{\mathrm{reg}}$ |
-|---|---:|---:|---:|
-| ISMIP-HOM C, $L=20$ km | 4.7e-7 | 0.47$\times$ | 93% |
-| ISMIP-HOM C, $L=160$ km | 1.1e-7 | 0.11$\times$ | 76% |
-| gentle slab (gradient tests) | 4.4e-8 | 0.044$\times$ | 78% |
-| slow interior, 0.02° slope | 1.9e-9 | 0.002$\times$ | **100%** |
-
-So $\varepsilon_{\mathrm{reg}}$ is not a safety net that occasionally engages — it is the dominant
-term in the viscosity over most of the domain, **for SSA as well**. (The $\dot\varepsilon^2_{\mathrm{mem}}$
-estimate uses a centred approximation for the corner $\dot\varepsilon_{xy}$ terms rather than the
-exact four-corner form, so these are indicative to a factor.) Two consequences: lowering it changes
-SSA materially, not just DIVA; and it may well be a deliberate viscosity floor for solver
-robustness rather than a numerical nicety, which is a question for Doug rather than something to
-change unilaterally.
-
-**A structural constraint on any fix.** In the shear-dominated limit $\eta \sim \zeta^{1-n}$, so
-
-$$F_1 = H\!\int \frac{\zeta}{\eta}, \quad F_2 = H\!\int\frac{\zeta^2}{\eta} \quad\text{converge}, \qquad \bar\eta = \int \eta \quad\text{DIVERGES}$$
-
-Lowering $\varepsilon_{\mathrm{reg}}$ therefore makes $F_1$ and $F_2$ *more* accurate — they stay
-bounded, and a large $\eta$ simply means no deformation — while inflating $\bar\eta$ without bound
-in the idealized pure-shear case. A single value cannot serve both moments in that limit. In
-practice $\dot\varepsilon^2_{\mathrm{mem}} > 0$ bounds $\bar\eta$, but per the table above it is
-$\varepsilon_{\mathrm{reg}}$ and not the membrane strain that is doing the bounding today.
-
-Options, none taken:
-
-1. **Lower $\varepsilon_{\mathrm{reg}}$ globally.** Simplest, and the slab test says $10^{-10}$
-   brings $F_2$ to $\sim$1e-5. But it changes SSA everywhere per the table, so it needs the
-   regression fingerprint re-baselined and Doug's agreement on what the parameter is *for*.
-2. **A separate, smaller regularization for the shear moments only** — keep the current value for
-   $\bar\eta$, where it is protecting the membrane operator, and use a small one for $F_1$/$F_2$,
-   where a large $\eta$ is harmless. This is the option the convergence argument above actually
-   points at, and it is DIVA-contained, so it does not touch SSA. Costs either a second $\eta$ per
-   level or an upper clamp on $\bar\eta$'s integrand.
-3. **Leave it and document the bias**, which is the current state: the slab test prints the cost at
-   four driving stresses so the number is never a surprise.
-
-A modelling decision, not a bug fix — and after the measurement above, one with a wider blast
-radius than it first appeared.
-
-### 5.10a The first shear moment $F_1$, and the surface velocity
-
-$F_2$ is what the momentum balance needs. $F_1$ is what **observations** measure:
-
-$$F_1 = H\!\int_0^1 \frac{\zeta}{\eta}\,\mathrm d\zeta, \qquad u_s = u_b + \tau_b F_1$$
-
-which is Arthern's $\mathcal I_1$ (his eq 10). Accumulated in the same quadrature loop as $F_2$ at
-negligible cost, checked against its analytic slab value $2AH\tau_b^{n-1}/(n+1)$ in
-`diva_slab_test`, and exposed as `rheology.F1`.
-
-Why it matters beyond diagnostics: **GLIDE's inversions use $\bar u$ as the model counterpart to
-observed surface velocity.** That is *exact* for SSA, where the two coincide. Under DIVA they do
-not, and the difference is precisely the deformation — up to ~5% on ISMIP-HOM C (§5.11) and much
-more in slow interior ice. So a DIVA inversion against surface observations is systematically
-biased unless the objective uses $u_s$, and using $u_s$ means $F_1$ must enter the **adjoint**:
-$\partial F_1/\partial\dot\varepsilon^2_{\mathrm{mem}}$, $\partial F_1/\partial\bar U$ and the
-parameter analogues, contracted through a $W_{F_1}$ field. That is the same cell-local pattern as
-$F_2$'s, so the machinery exists, but it is a real extension with its own verification burden —
-not done, and scoped separately.
-
-### 5.10b Surface velocity in the adjoint -- stage 1 of 2
-
-The framework point first, because it is what makes this more than plumbing. With the objective a
-function of a *diagnostic* $u_s = g(x,p)$ rather than of the state directly, the adjoint identity
-gains a term that a depth-averaged objective simply does not have:
-
-$$\frac{\mathrm dJ}{\mathrm dp} = \underbrace{\frac{\partial J}{\partial p}}_{\text{NEW}} + \lambda^T\frac{\partial r}{\partial p}, \qquad \Big(\frac{\partial r}{\partial x}\Big)^{\!T}\lambda = -\frac{\partial J}{\partial x}$$
-
-with $\partial J/\partial x = (\partial J/\partial u_s)(\partial g/\partial x)$ changing the adjoint
-**right-hand side**, and $\partial J/\partial p = (\partial J/\partial u_s)(\partial g/\partial p)$
-being genuinely new: $u_s$ depends on $\beta$, $u_c$ and $m$ *directly* through the closure, which
-$\bar u$ never did.
-
-**Stage 1 (done).** `diva_coeffs_cell` now emits $u_s = U_b + \tau_b F_1$ as an output, so a dual
-seeding of any input yields $\mathrm d u_s/\mathrm d(\text{that input})$ with nothing hand-derived.
-`compute_diva_derivs` therefore gets all five sensitivities free from the seedings it already
-performs -- `dus_deps`, `dus_dU` for the right-hand side and `dus_dbeta`, `dus_duc`, `dus_dm` for
-the explicit parameter term. All five are FD-checked in `diva_derivs_test`, both sliding laws,
-agreement between 1.3e-6 and 3.3e-4, with the law-inert entries exactly zero. `state.u_s` is
-exposed and restricted through the hierarchy.
-
-Sanity note from those numbers: $\mathrm du_s/\mathrm d\bar U$ comes out at 1.003 (Weertman) and
-1.026 (Coulomb) -- just above one, which it must be, since raising the depth-averaged speed raises
-the surface speed slightly more than proportionally.
-
-**Stage 2 (done).** Two pieces, and the scatter turned out to be free.
-
-*The right-hand side.* $\partial J/\partial x$ is a cell-to-facet scatter of the cotangent through
-$\partial\dot\varepsilon^2_{\mathrm{mem}}/\partial\text{facet}$ and
-$\partial\bar U/\partial\text{facet}$ — **exactly the scatter the coefficient transpose already
-performs**, with $A$ and $B$ redefined from $(W_\eta,W_{\beta_{\mathrm{eff}}})\times$(coefficient
-derivatives) to $\text{cot}\times(\mathrm du_s/\mathrm d\cdot)$. So the body was extracted into
-`diva_scatter_cell_to_facets` and both callers share it; `compute_diva_us_vjp` is then twenty lines.
-Exposed as `AdjointOperators.diva_surface_misfit_rhs`.
-
-*The explicit parameter term.* Cell-local, so no kernel at all —
-`diva_surface_param_gradient` returns $\sum_c \text{cot}_c\,(\mathrm du_s/\mathrm dp)_c$ in cupy,
-which the caller adds to whatever `compute_gradient_<p>` produced.
-
-**Verification: `tests/diva_surface_gradient_test.py`.** Jake's SSA control, in two forms, and it is
-the sharp part — finite differences at the 1e-3 floor (Q7) could not resolve a sign error or a
-double count.
-
-*Structural.* Under SSA both new pieces must be **inactive**, returning `None` rather than a small
-number. That distinguishes "switched off" from "small in the configuration I tried".
-
-*Stiff limit.* The load-bearing one. Stiffening the ice removes the shear, so $u_s\to|\bar u|$ and
-the explicit term $\to 0$, and both schemes then compute the gradient of the **identical functional**
-of $\beta$ — observations taken from the SSA run, so it is the same function and not merely the same
-formula — one exercising the new path and the other using none of it:
-
-| $B$ scale | 1 | 4 | 16 | 64 | 256 |
-|---|---|---|---|---|---|
-| $\|\Delta\text{grad}\|/\|\text{grad}\|$ | 1.7e-1 | 5.4e-2 | 1.7e-2 | 5.4e-3 | 2.0e-3 |
-
-Monotone with **no plateau**, which is what says the path is right: as the shear vanishes DIVA's
-scatter reduces term by term to the $\mathrm d|\bar u|/\mathrm d\text{facet}$ scatter the SSA branch
-builds independently, so a residual error would appear as a floor. It falls somewhat slower than the
-shear itself (~3.1 per step against ~4.1) — expected for a max-norm of a difference the adjoint solve
-has spread nonlocally, not evidence of anything.
-
-*And then finite differences.* $\mathrm dJ/\mathrm d\beta$ for the surface objective: DIVA **3.9e-4**
-against an SSA control of 1.4e-3, i.e. at the floor and better than the control.
-
-### 5.12 A velocity profile at arbitrary depth: what it would take
-
-Integrating the shear ansatz up from the bed gives one family rather than a set of separate
-integrals:
-
-$$u(\zeta) = u_b + \tau_b\,G(\zeta), \qquad G(\zeta) = H\!\int_\zeta^1 \frac{\zeta'}{\eta}\,\mathrm d\zeta'$$
-
-with $G(1) = 0$ (bed), $G(0) = F_1$ (surface) and $\int_0^1 G\,\mathrm d\zeta = F_2$ (depth
-average) — all three verified, the last symbolically for the slab and numerically for arbitrary
-$\eta$. So $F_1$ and $F_2$ are the endpoint and the mean of the *same* partial moment.
-
-The practical consequence is that the whole 3-D velocity is **one scalar field per level**. Because
-$\mathbf u_b \parallel \bar{\mathbf u}$ (isotropic drag; Goldberg's collinearity),
-
-$$\mathbf u(\zeta) = \hat s(\zeta)\,\bar{\mathbf u}, \qquad \hat s(\zeta) = \frac{U_b + \tau_b G(\zeta)}{\bar U}$$
-
-applied to the existing staggered depth-averaged components. Direction is preserved automatically,
-and there are two free self-checks: $\hat s(1)$ is the sliding fraction and $\int \hat s\,\mathrm
-d\zeta = 1$ by construction.
-
-Not implemented. Two things to get right when it is:
-
-- **Gauss–Legendre does not give partial integrals.** It is optimal for $F_1$ and $F_2$ and useless
-  for $G(\zeta_k)$, so the profile needs its own scheme — GL on each subinterval, or a cumulative
-  rule alongside the moment rule.
-- Under the old midpoint rule the natural cumulative sum landed on cell *edges*, not the sample
-  points, which would have put an $O(h)$ error in the profile while $F_2$ stayed $O(h^2)$. The slab
-  gives an analytic profile $u(\zeta) = u_b + 2AH\tau_b^n(1-\zeta^{n+1})/(n+1)$ to check against.
-
-Beyond that, the thermal coupling also wants $w$, from $\partial_z w = -(\partial_x u + \partial_y v)$
-integrated from the bed — which needs horizontal derivatives of the reconstructed profile and is
-materially more work than the rest.
-
-### 5.11 ISMIP-HOM experiment C: SSA against DIVA
-
-`examples/ismip-hom/ismip-hom.py` already sets up experiment C correctly -- 1000 m slab, 0.1
-degree slope, $\beta = 1000 + 1000\sin(2\pi x/L)\sin(2\pi y/L)$, $A = 10^{-16}$, $L$ from 5 to
-160 km, tiled $5\times5$ because GLIDE has Dirichlet rather than periodic edges.
-`ismip_hom_c_ssa_vs_diva.py` runs both stress balances on it:
-
-| $L$ (km) | 5 | 10 | 20 | 40 | 80 | 160 |
-|---|---|---|---|---|---|---|
-| DIVA $-$ SSA, **surface** speed | +5.9% | +6.6% | +6.5% | +5.9% | +4.7% | +3.5% |
-| DIVA $-$ SSA, depth-averaged | +4.2% | +4.8% | +4.8% | +4.3% | +3.5% | +2.6% |
-| $u_s/\bar u$ | 1.016 | 1.017 | 1.016 | 1.015 | 1.012 | 1.009 |
-| sliding fraction $u_b/\bar u$ | 0.965 | 0.962 | 0.964 | 0.969 | 0.976 | 0.982 |
-
-The surface row is the published diagnostic and is now reported directly (§5.10a). Note it is
-consistently *larger* than the depth-averaged difference — by construction, since the surface sits
-at the top of the shear profile — which is precisely why an inversion that compares $\bar u$ against
-surface observations is biased.
-
-The difference is the vertical shear SSA cannot represent, and it behaves sensibly: largest at
-intermediate $L$, falling at large $L$ where the flow becomes sliding-dominated (sliding fraction
-rising toward 1). Both schemes solve the same 2-D operator, so the entire difference is in
-$\bar\eta$ and $\beta_{\mathrm{eff}}$.
-
-Diagnostic gotcha worth recording, since the first version of both this table and the SSA-limit
-test got it wrong: **`u_b` is a cell-centred SPEED while `u` is the x-component on a facet.**
-Dividing one by the other is not a sliding fraction and can exceed 1. It goes unnoticed in
-experiment C, where the flow is almost entirely in $x$ so the two nearly coincide -- but in the
-stiff-ice SSA-limit test it produced a *negative* deformation fraction, which is what exposed it.
-The denominator has to be the cell-centred $|\bar{\mathbf u}|$ from both averaged components.
-
-**The end-to-end SSA limit** is checked in `diva_solve_test`: stiffening the ice removes the
-vertical shear, since the shear strain rate scales like $B^{-n}$, so the DIVA solution must collapse
-onto the SSA one. It does, monotonically, and the deformation fraction tracks the gap closely --
-which is the internal consistency one wants, the gap being nothing other than the deformation:
-
-| $B$ scale | 1 | 4 | 16 |
-|---|---|---|---|
-| DIVA $-$ SSA | 4.59% | 0.92% | 0.21% |
-| deformation fraction | 3.54% | 0.77% | 0.19% |
-
-Together with `diva_closure_test` check 1 (the SSA limit at $\tau_b = 0$, coefficient level) and
-`diva_slab_test` (the SIA limit, analytic), both asymptotic limits are now pinned at both the
-coefficient and the solve level.
-
-**This is not yet a validation, and two things stand between it and one:**
-
-1. **No reference data.** ISMIP-HOM has no analytical solution; the reference is the spread of the
-   participating full-Stokes models, published as figures in Pattyn et al. (2008) and reproduced
-   for DIVA in Goldberg (2011). Those numbers are not in this repository. Getting them means the
-   ISMIP-HOM archive or digitising the figures.
-
-2. **We report the wrong quantity.** The published diagnostic is SURFACE velocity along $y=L/4$.
-   GLIDE's state variable is depth-averaged. For SSA they coincide; for DIVA they do not, and
-   recovering the surface value needs the first shear moment
-
-   $$F_1 = H\!\int_0^1 \frac{\zeta}{\eta}\,\mathrm d\zeta, \qquad u_s = u_b + \tau_b F_1$$
-
-   which is Arthern's $\mathcal I_1$ (his eq 10) and is one more running sum in the quadrature loop
-   that already computes $F_2$. Cheap, and required before any literature comparison.
-
-Also worth noting for that comparison: experiment C has a **flat bed**, so the bed-slope factor of
-§5.2.1b is irrelevant here. It becomes relevant for experiments A and B, whose bumpy beds are the
-point.
-
-## 6. Verification status
-
-| test | what it establishes |
-|------------------------------------|------------------------------------|
-| `ssa_regression_test.py` | SSA (both sliding laws) is **bit-identical** to the pre-DIVA reference. Run after every commit on this branch; it is what makes the shared-body refactors provably safe. |
-| `diva_closure_test.py` | $\bar\eta$ collapses onto the analytic SSA viscosity with no shear; $F_2$ matches the quadrature to 1e-6; the Newton reproduces the linear closed form to 6 digits; the Coulomb closure residual is 2e-7; $\beta_{\mathrm{eff}}$ matches (G-41) and $\tau_b=\beta_{\mathrm{eff}}\bar U$ holds. |
-| `diva_residual_test.py` | Handed the SSA coefficients, the DIVA residual reproduces the SSA residual **bit-for-bit** — pins the grounding/`water_drag` bookkeeping. |
-| `diva_condensation_test.py` | The condensed $5\times5$ reproduces the full $6\times6$ to 1.1e-7; DIVA converges under regularized Coulomb. |
-| `diva_solve_test.py` | End-to-end: DIVA converges as well as SSA ($1.0\times10^{-4}$ vs $9.9\times10^{-5}$), is 4.1 % faster than SSA (deformation on top of sliding), $0\le u_b\le\bar U$, $F_2>0$, deterministic, and agrees across multigrid depths to 2.2e-5. |
-
-**Cost:** 0.81 s vs SSA's 0.73 s for ten V-cycles on a 128×128 5-level slab — about 11 % more, matching Goldberg's "trivially more expensive than SSA".
-
-------------------------------------------------------------------------
-
-## 7. Status and what remains
-
-Done and verified (see `tests/` for each):
-
-- **The forward model.** Converges as well as SSA, **13.8%** more expensive, consistent across multigrid depths. SSA is bit-identical with `stress_balance = 0`.
-
-- **The closure solves properly.** Both nested root problems are Newton with the full slope: the per-level viscosity (§5.2.1) and the $U_b$ partition (§5.2.0). Verified against roots found by bisection from a cold start, agreement 5e-7, in the regimes where the previous block iteration 2-cycled. `diva_closure_test` checks 5 and 6 pin it; the closure residual $|r_{U_b}|/|\bar U|$ is reported every V-cycle (§5.2.0a) and reads ~2e-8.
-
-- **The exact coefficient adjoint.** `AdjointOperators.diva_exact_coeff_adjoint = True`, on by default. Dot-product identity $\langle J^T\lambda, x\rangle$ vs $\langle\lambda, Jx\rangle$ = **5.6e-7** against an SSA control of 1.2e-7, with **no symmetry assumed anywhere** in the DIVA path. `vanka_smooth_adjoint` is templated on DIVA and uses the uncondensed block; the smoother stays frozen-coefficient, which is fine because it is only a preconditioner -- exactly as in SSA, where the VJP carries $\partial\eta/\partial u$ and the smoother does not.
-
-  An earlier attempt appeared to stall the adjoint V-cycles at 1.1e-1. The cause was not the smoother but the **Dirichlet rows**: the coefficient gather ran after the main VJP kernel had replaced those rows with an identity, so what it added there could never be reduced and sat in the residual as a floor. Flat *and* omega-independent is the signature of that, as against a weak preconditioner, which responds to omega.
-
-- **All three sliding-parameter gradients**, $\partial J/\partial\beta$, $\partial J/\partial u_c$ and $\partial J/\partial m$, as one cell-local expression:
-
-```         
-  dJ/d(p)_c = W_eta_c * d(eta_bar_c)/d(p_c) + W_be_c * d(beta_eff_c)/d(p_c)
+It is therefore unique and well conditioned. Both bounds are provable, and they come from
+different places, which is what licenses the clamped warm start and bisection as an
+independent reference.
+
+*Upper bound, from the kinematics alone.* $\mathcal I_2>0$ strictly, since $\eta$ is
+finite and positive at every depth, and any physical law has $\tau_b\ge0$ for
+$U_b\ge0$. So
+
+$$\bar U-U_b=\tau_b\mathcal I_2\ \ge\ 0
+\qquad\Longrightarrow\qquad U_b\le\bar U,$$
+
+with equality iff $\tau_b\mathcal I_2=0$: deformation can only add to sliding, never
+subtract. This uses no property of $f$ beyond its sign, so it holds for a learned sliding
+law as much as for Weertman.
+
+*Lower bound, from the sign of $R$ at the endpoints.*
+
+$$R(0)=f(0)\mathcal I_2-\bar U=-\bar U\le0,
+\qquad R(\bar U)=f(\bar U)\mathcal I_2\ge0,$$
+
+using $f(0)=0$, which holds for both laws because $f=c(U)U$ carries an explicit factor of
+$U$ and $c(0)$ is finite — which is what $u_{\mathrm{reg}}$ is for, since $c\sim U^{m_s-1}$
+would otherwise diverge at $U=0$ for $m_s<1$. So $R$ changes sign on $[0,\bar U]$ and,
+being strictly increasing, does so exactly once.
+
+The bracket also gives the natural diagnostic, the sliding fraction
+$U_b/\bar U=1-\tau_b\mathcal I_2/\bar U\in[0,1]$: 1 for plug flow, 0 for a frozen bed. Once $U_b$ is known, the column
+also supplies $\tau_b=f(U_b)$. Momentum needs the corresponding drag vector as
+a function of its own unknown $\bar{\mathbf u}$. Since the two vectors are
+parallel,
+
+$$
+\vec{\tau}_b=\frac{\tau_b}{\bar U}\bar{\mathbf u}
+             =\beta_{\mathrm{eff}}\bar{\mathbf u}.
+$$
+
+Using $\bar U=U_b[1+c(U_b)\mathcal I_2]$ and
+$\tau_b=c(U_b)U_b$ gives
+
+$$
+\boxed{
+\tau_b=\beta_{\mathrm{eff}}\bar U,
+\qquad
+\beta_{\mathrm{eff}}=\frac{c(U_b)}{1+c(U_b)\mathcal I_2}.
+$$
+
+This algebraic expression, rather than an explicit numerical division by
+$\bar U$, is used at rest. The coefficient $\beta_{\mathrm{eff}}$ is the
+traction-to-velocity ratio required to insert the column response into the
+two-dimensional momentum equation.
+
+### 2.6 Limiting cases and analytic checks
+
+The equations recover the expected end members:
+
+- **SSA limit:** when vertical shear becomes negligible,
+  $\mathbf u_b$, $\bar{\mathbf u}$, and $\mathbf u_s$ coincide and the
+  depth-integrated balance reduces to SSA.
+- **SIA limit:** when membrane-stress gradients become negligible, basal drag
+  balances the driving stress and the vertical closure reproduces the
+  shear-dominated velocity profile.
+- **Frozen-bed limit:** as $U_b\to0$,
+  $\beta_{\mathrm{eff}}\to1/\mathcal I_2$.
+
+For a uniform slab, the shear integrals reduce to
+
+$$
+\mathcal I_1=\frac{2AH\tau_b^{n-1}}{n+1},
+\qquad
+\mathcal I_2=\frac{2AH\tau_b^{n-1}}{n+2}.
+$$
+
+These expressions are useful checks on both the normalization and the vertical
+quadrature.
+
+## 3. From the equations to GLIDE
+
+### 3.1 The local column calculation
+
+The preceding equations now define the computational dependency that each
+nonlinear residual evaluation must follow:
+
+$$
+\bar{\mathbf u}
+\longrightarrow(\dot\varepsilon_{\mathrm{mem}}^2,\bar U)
+\longrightarrow U_b
+\longrightarrow(\bar\eta,\mathcal I_1,\mathcal I_2,
+                 \beta_{\mathrm{eff}},U_s).
+$$
+
+The first arrow uses horizontal finite differences to compute membrane strain
+rates. The remaining work is cell-local: a short vertical quadrature, scalar
+viscosity solves at its nodes, and a scalar basal-speed solve. GLIDE therefore
+does not solve for or store a three-dimensional velocity field. It stores the
+column integrals and selected diagnostics needed by the two-dimensional
+momentum equation and inversion objective.
+
+In code, the notation maps as follows:
+
+| Quantity | Meaning | Code |
+|---|---|---|
+| $\bar\eta=H^{-1}\int_b^s\eta\,dz$ | depth-averaged viscosity | `eta_bar` |
+| $\dot\varepsilon_{\mathrm{mem}}^2$ | membrane invariant | `eps_mem_sq` |
+| $\mathcal I_1$ | basal-to-surface shear integral | `F1` |
+| $\mathcal I_2$ | basal-to-mean shear integral | `F2` |
+| $U_b,U_s$ | basal and surface speeds | `u_b`, `u_s` |
+| $\beta_{\mathrm{eff}}$ | drag coefficient in the nonlinear residual | `beta_eff` |
+| $\varphi$ | grounded fraction | `phi` |
+
+Goldberg's double integral satisfies
+
+$$
+\omega=H\mathcal I_2,
+\qquad \omega/H=\mathcal I_2=\texttt{F2}.
+$$
+
+This identity removes the common factor-of-$H$ ambiguity. The symbol $m_s$
+denotes the Weertman exponent (`m` in code), avoiding collision with
+Goldberg's bed-slope factor. The continuum equations above use physical stress
+units; GLIDE divides them by $\rho g$, so `B` is stored as
+$A^{-1/n}/(\rho g)$. `eps_reg` and `eps_reg_shear` are *squared*
+strain rates. The diagnostics `u_b` and `u_s` currently store speeds, with
+direction inherited from $\bar{\mathbf u}$.
+
+### 3.2 Drag in the residual and its linearizations
+
+The nonlinear basal drag defines a curve $\tau_b(\bar U)$. Evaluating the
+residual and differentiating the residual require two different quantities:
+the ratio $\tau_b/\bar U$ and the derivative $d\tau_b/d\bar U$. They coincide
+only for a linear drag law. In GLIDE, three related expressions appear:
+
+1. The nonlinear residual uses the traction-to-speed ratio
+   $\beta_{\mathrm{eff}}=c/(1+c\mathcal I_2)$. This rewrites the drag vector as
+   $\vec{\tau}_b=\beta_{\mathrm{eff}}\bar{\mathbf u}$ at the current state; it
+   is not a derivative.
+2. The Vanka preconditioner needs a local derivative. It freezes
+   $\mathcal I_2$ while differentiating the basal closure, giving
+   $$
+   \left.\frac{d\tau_b}{d\bar U}\right|_{\mathcal I_2}
+   =\frac{f'}{1+f'\mathcal I_2}.
+   $$
+   The Vanka block does not represent this derivative at all: it reads
+   $\beta_{\mathrm{eff}}$ as a frozen coefficient, which is the *secant*
+   $\tau_b/\bar U$ rather than any tangent (section 5.2).
+3. The fixed-$H$ velocity-block JVP and adjoint include the change in
+   $\mathcal I_2$ as traction changes. The full derivative is
+   $$
+   \frac{d\tau_b}{d\bar U}
+   =\frac{f'}{1+f'\mathcal I_2+ff'd\mathcal I_2/d\tau_b}.
+   $$
+
+Thus the residual coefficient, the preconditioner derivative, and the exact
+derivative have distinct roles. Freezing $\mathcal I_2$ changes only the
+preconditioner; it does not change the converged equations or their exact
+linearization.
+
+## 4. The DIVA coefficient refresh
+
+The existing SSA solver already knows how to solve a two-dimensional membrane
+stress balance. At each residual or smoothing step it needs two constitutive
+quantities: a membrane viscosity and a coefficient multiplying velocity in the
+basal-drag term. DIVA preserves that solver and supplies different values for
+those two quantities:
+
+$$
+\text{SSA-shaped operator inputs}
+\quad\longleftarrow\quad
+\bar\eta,\ \beta_{\mathrm{eff}}
+\quad\longleftarrow\quad
+\text{DIVA column closure}.
+$$
+
+The division of responsibility is important:
+
+| Quantity | Where it lives | Role |
+|---|---|---|
+| $\bar{\mathbf u}$ | staggered horizontal grid | globally coupled velocity solved by multigrid |
+| $U_b$ | one scalar per cell | local unknown solved by the DIVA basal closure |
+| $\bar\eta$ | one scalar per cell | membrane-viscosity coefficient read by the SSA stencil |
+| $\beta_{\mathrm{eff}}$ | one scalar per cell | basal-drag coefficient read by the SSA stencil |
+| $\mathcal I_1,\mathcal I_2,U_s$ | one scalar per cell | closure diagnostics and surface-observation terms |
+
+The essential cell-local problem is to determine the basal speed $U_b$ that is
+consistent with the current depth-averaged speed $\bar U$. Once $U_b$ is
+known, the sliding law gives the basal traction, and the column calculation can
+return the effective viscosity $\bar\eta$ and effective drag
+$\beta_{\mathrm{eff}}$ required by the SSA-shaped operator.
+
+The difficulty is that $U_b$ cannot be determined independently of the
+vertical column. Its nonlinear closure contains $\mathcal I_2$, and its Newton
+derivative contains $d\mathcal I_2/d\tau_b$. Evaluating either quantity
+requires a vertical integral involving $1/\eta(z)$, while $\eta(z)$ is itself
+defined implicitly by Glen's law and the DIVA shear-stress closure. This
+dependency is the reason for the nested viscosity solves, quadrature, and
+basal-speed Newton iteration described below.
+
+$U_b$ is therefore not a new global degree of freedom. It is one scalar
+diagnosed independently in each cell. Its direction is inherited from
+$\bar{\mathbf u}$; only its magnitude must be solved. Once horizontal finite
+differences have supplied the membrane strain rate, columns do not communicate
+while determining $U_b$, $\bar\eta$, or $\beta_{\mathrm{eff}}$.
+
+### 4.1 The refresh--use--update loop
+
+DIVA is coupled to the SSA solver through a repeated coefficient refresh:
+
+$$
+(\bar{\mathbf u},H)^{(k)}
+\xrightarrow{\text{DIVA column refresh}}
+(U_b,\bar\eta,\beta_{\mathrm{eff}},\mathcal I_1,\mathcal I_2,U_s)^{(k)}
+\xrightarrow{\text{SSA residual or smoother}}
+(\bar{\mathbf u},H)^{(k+1)}.
+$$
+
+One pass through this loop has three stages:
+
+1. From the current velocity field, compute $\bar U$ and the membrane strain
+   invariant in every cell.
+2. Independently in each cell, solve the basal-speed closure and vertical
+   constitutive problem. This produces the coefficients $\bar\eta$ and
+   $\beta_{\mathrm{eff}}$ required by the momentum stencil.
+3. Apply the usual SSA-shaped residual or Vanka block using those coefficient
+   fields. The resulting velocity update makes the old coefficients stale, so
+   they are refreshed before the next residual or smoothing application.
+
+This is a segregated nonlinear solve: the multigrid machinery updates the
+horizontal velocity, while the DIVA kernel makes the column state consistent
+with the latest velocity. There is no separate global solve for $U_b$ and no
+three-dimensional velocity array.
+
+### 4.2 Stage 1: form the inputs to each column
+
+A coefficient refresh begins with the current multigrid state
+$(\bar{\mathbf u},H)$. Horizontal finite differences of
+$\bar{\mathbf u}$ give the membrane strain invariant
+$\dot\varepsilon_{\mathrm{mem}}^2$, and interpolation to the cell center gives
+the depth-averaged speed $\bar U$. Each cell also reads its thickness,
+rheology, grounded fraction, and sliding-law parameters.
+
+These are the only inputs needed by the DIVA column calculation:
+
+$$
+(\dot\varepsilon_{\mathrm{mem}}^2,\bar U,H,B,
+  \beta,\varphi,u_c,m_s,\ldots)_c.
+$$
+
+Computing the membrane strain rate is the only part of the refresh that uses
+neighboring velocities. Once these cell-centered inputs are available, every
+column can be solved independently.
+
+### 4.3 Stage 2: solve the column and form its coefficients
+
+For each cell, the goal is to determine how much of $\bar U$ comes from basal
+sliding and how much comes from internal shear. The unknown is the scalar basal
+speed $U_b$. A trial value of $U_b$ determines the basal traction through the
+sliding law, but evaluating whether that trial is correct requires the
+viscosity and shear integrals throughout the column. The calculation is
+therefore nested:
+
+1. The outer solve proposes $U_b$ and computes $\tau_b=f(U_b)$.
+2. At each vertical quadrature node, an inner solve determines the viscosity
+   consistent with that traction.
+3. The quadrature gives $\bar\eta$, $\mathcal I_1$, and $\mathcal I_2$.
+4. The outer solve uses $\mathcal I_2$ to update $U_b$.
+
+The basal-speed equation depends directly on $\mathcal I_2$, not on
+$\bar\eta$. Both quantities nevertheless require the same viscosity profile:
+$\mathcal I_2$ integrates $1/\eta$, whereas $\bar\eta$ integrates $\eta$.
+GLIDE therefore accumulates them together during each evaluation of the
+basal-speed residual.
+
+#### 4.3.1 Why the viscosity requires a local Newton solve
+
+The viscosity closure is the discrete form of the continuum relation derived
+in Section 2.3. DIVA assumes that shear stress decreases linearly from its
+basal value to zero at the surface,
+
+$$
+\tau_{xz}=\tau_{b,x}\zeta,
+\qquad
+\tau_{yz}=\tau_{b,y}\zeta.
+$$
+
+Since $\tau_{xz}=\eta\,\partial_z u$ and
+$\tau_{yz}=\eta\,\partial_z v$, the vertical shear contribution to the
+strain-rate invariant is
+
+$$
+\dot\varepsilon_{xz}^2+\dot\varepsilon_{yz}^2
+=\frac{\tau_b^2\zeta^2}{4\eta^2}.
+$$
+
+Substitution into Glen's law gives, at each quadrature node,
+
+$$
+\boxed{
+\eta=\tfrac12B
+\left(
+A_{\mathrm{reg}}+\frac{\tau_b^2\zeta^2}{4\eta^2}
+\right)^p},
+\qquad
+A_{\mathrm{reg}}
+=\dot\varepsilon_{\mathrm{mem}}^2+\varepsilon_0^2.
+$$
+
+This equation is implicit: increasing viscosity reduces the shear strain rate,
+but the reduced strain rate feeds back into the viscosity. Equivalently, with
+$k=(\tau_b\zeta/2)^2$,
+
+$$
+F_\eta(\eta)=\eta-G(\eta)=0,
+\qquad
+G(\eta)=\tfrac12B(A_{\mathrm{reg}}+k/\eta^2)^p.
+$$
+
+GLIDE solves this scalar equation with Newton's method,
+
+$$
+\eta\leftarrow\eta-\frac{\eta-G}{1-G'},
+\qquad
+G'=-2p\frac{k/\eta^2}{A_{\mathrm{reg}}+k/\eta^2}\frac{G}{\eta}.
+$$
+
+A Newton solve is used because $\eta$ appears on both sides and GLIDE supports
+general Glen exponent $n$. For $n=3$ the equation can be rearranged as the
+cubic
+
+$$
+8A_{\mathrm{reg}}\eta^3+8k\eta-B^3=0,
+$$
+
+but the corresponding Cardano formula suffers float32 cancellation in the
+shear-dominated regime and does not extend to general $n$. The Newton problem
+is well behaved: at the root, $1/n\le1-G'\le1$, so its denominator stays
+bounded away from zero.
+
+#### 4.3.2 Integrate the converged node viscosities
+
+For a given trial traction, the node solves provide the viscosity values needed
+for Gauss--Legendre quadrature on $\zeta\in[0,1]$:
+
+$$
+\bar\eta\approx\sum_kw_k\eta_k,
+\qquad
+\mathcal I_\alpha\approx
+H\sum_kw_k\frac{\zeta_k^\alpha}{\eta_k}.
+$$
+
+No vertical array is stored; one CUDA thread solves and accumulates the nodes
+for one cell. The nodes and weights are generated and cached by
+`ForwardOperators._quadrature`. In the shear-dominated limit,
+$\eta\sim\zeta^{1-n}$, so the $\mathcal I_1$ and $\mathcal I_2$
+integrands behave like $\zeta^n$ and $\zeta^{n+1}$. For $n=3$, ideal-slab
+values are exact at two and three nodes; the default is $N_\sigma=8$.
+
+Interior Gauss nodes provide the complete integrals needed by the
+depth-integrated equations, but not partial integrals as a function of height.
+Reconstructing a full $\mathbf u(z)$ profile will therefore require a separate
+cumulative scheme.
+
+The implementation evaluates two regularized viscosities at each node:
+
+$$
+\begin{array}{lll}
+\eta_{\mathrm{mem}}:&
+\dot\varepsilon_{\mathrm{mem}}^2+\varepsilon_0^2
+&\longrightarrow\bar\eta,\\
+\eta_{\mathrm{sh}}:&
+\dot\varepsilon_{\mathrm{mem}}^2+\varepsilon_{0,\mathrm{sh}}^2
+&\longrightarrow\mathcal I_1,\mathcal I_2.
+\end{array}
+$$
+
+Defaults are $10^{-6}$ and $10^{-12}$. This split is an implementation
+regularization, not part of DIVA theory. `eta_bar` retains the SSA
+floor so the membrane operator remains bounded and reproduces the exact
+zero-shear SSA limit. The shear integrals use the smaller floor because the SSA
+floor makes slow columns spuriously soft. Setting the values equal recovers a
+single-viscosity calculation.
+
+#### 4.3.3 Enforce the basal-speed closure
+
+The quadrature for a trial $U_b$ supplies the value of
+$\mathcal I_2(\tau_b)$ needed by the depth-average relation. As derived in
+Section 2.5, the correct basal speed is the root of
+
+$$
+R(U_b)=U_b+f(U_b)\mathcal I_2(f(U_b))-\bar U=0.
+$$
+
+This is a second, outer scalar Newton solve. It is needed even for a linear
+sliding law: changing $U_b$ changes $\tau_b$, which changes the vertical shear,
+which changes the viscosity and therefore $\mathcal I_2$. Each evaluation of
+$R$ consequently runs the node-viscosity solves and quadrature described
+above.
+
+The Newton update is
+
+$$
+U_b\leftarrow U_b-\frac{R(U_b)}{R'(U_b)},
+$$
+
+with the complete derivative
+
+$$
+R'
+=1+f'\mathcal I_2
+ +ff'\frac{d\mathcal I_2}{d\tau_b}.
+$$
+
+The last term accounts for the response of the column viscosity to traction;
+it is obtained by differentiating the implicit viscosity closure at the
+quadrature nodes. Omitting it lags the column response and caused a high-drag
+two-cycle. For the monotone sliding laws and shear-thinning rheology used here,
+all three contributions are non-negative, so $R'\ge1$ and the root in
+$[0,\bar U]$ is unique.
+
+The complete per-cell calculation in `diva_coeffs_cell<T>` is
+
+```text
+inputs: membrane strain invariant, U_bar, H, rheology, and sliding parameters
+clamp stored U_b to [0, U_bar] as a warm start
+
+outer Newton iteration on R(U_b):
+    tau_b = c(U_b) U_b
+    for each quadrature node:
+        inner Newton solve for eta_mem using eps_reg
+        inner Newton solve for eta_sh  using eps_reg_shear
+        accumulate eta_bar, I1, I2, and dI2/dtau_b
+    update U_b using the complete derivative R'(U_b)
+
+perform a final quadrature at the converged traction
+write eta_bar, F1, F2, u_b, beta_eff, and u_s
 ```
 
-  `W_eta` and `W_be`, filled by `vjp_body`, already *are* $\lambda^T\,\partial r/\partial(\text{coefficient})$ summed over every row that touches the cell, so no facet loop is involved and nothing in the expression knows which parameter $p$ is -- the identity of $p$ lives entirely in which pair of derivative fields is passed. One kernel serves $\beta$ and $u_c$; a reducing variant serves the global $m$. Every input a gradient could be wanted for is templated in `get_diva_c_of_U`, so adding a parameter means seeding it and reading `.d`, with no second derivation to keep in sync. Contrast SSA, which needs a separate ~90-line facet-walking kernel per parameter because there the parameters enter the momentum stencils directly rather than through a state-dependent coefficient.
+The inner viscosity solve starts from the smaller of its shear-free and
+shear-dominated asymptotic estimates. The outer solve starts from the stored
+cell value of `u_b`, which is a warm start rather than an independently
+advanced state variable. The viscosity and basal-speed iteration caps are 12
+and 20, respectively, although typical warm-started counts are much lower.
+Both solves use a relative tolerance and stagnation detection.
 
-  Against finite differences (best of a bracketed step sweep):
+Once a primal solve has converged, one extra Newton step brings a dual
+derivative to the fixed-point sensitivity. Per-cell `cap_flags`
+report any iteration backstop hit; both cap counts should remain zero.
 
-  | | SSA control | DIVA |
-  |---|---|---|
-  | $\partial J/\partial\beta$ | 1.4e-4 | **2.2e-5** |
-  | $\partial J/\partial u_c$ | 2.6e-4 | **1.6e-4** |
-  | $\partial J/\partial m$ | 9.5e-5 | **5.5e-5** |
+#### 4.3.4 Form the coefficients returned to SSA
 
-  DIVA is at or better than the exact-adjoint SSA control throughout, i.e. all six are limited by the finite-difference reference rather than by the adjoint.
+At the converged $U_b$, the final quadrature gives a mutually consistent
+$\bar\eta$, $\mathcal I_1$, and $\mathcal I_2$. The sliding coefficient
+$c(U_b)$ then gives
 
-  Two implementation details that are easy to get wrong. The $\beta$ seeding perturbs by `grounded`, not 1, because the closure is handed $\beta\varphi$ -- otherwise the result is $\partial/\partial(\beta\varphi)$ rather than the $\partial/\partial\beta$ an inversion controls. And $m$ needs `__powf(dual, dual)`: it sits in the *exponent*, so $d(x^p) = x^p(\tfrac{p}{x}dx + \log x\,dp)$ and the existing `(dual, float)` overload cannot supply the second term.
+$$
+\beta_{\mathrm{eff}}
+=\frac{c(U_b)}{1+c(U_b)\mathcal I_2}.
+$$
 
-- **Methodological note, worth keeping.** $\partial J/\partial\beta$ read 9.6e-4 with a *wrong* (frozen) adjoint and 2.2e-2 with the right one, because a wrong $\lambda$ was partly cancelling the missing `eta_bar` path. Neither number was evidence about the gradient on its own. Relatedly, no single FD step is trustworthy here: two-sided truncation falls like $\varepsilon^2$ while float32 round-off grows like $1/\varepsilon$, so the tests sweep $\varepsilon$ to bracket the crossover and print the whole curve. $\partial J/\partial u_c$ under DIVA reads 1.6e-4 at $\varepsilon = 2$ and 1.4e-3 at $\varepsilon = 1$; judging on one step would have manufactured a defect that is not there.
+The two fields required by the SSA-shaped momentum operator are therefore
 
-Remaining, in order:
+$$
+\boxed{\bar\eta_c,\qquad \beta_{\mathrm{eff},c}}.
+$$
 
-- **ISMIP-HOM validation -- required, not optional.** Everything verified so far establishes internal consistency and the SSA limit; nothing yet compares DIVA against an external reference. Goldberg runs experiment C and the nonlinear-sliding cases, and reproducing those figures is the acceptance gate for this branch. The forward model and the gradients are both in place now, so they can be validated together.
+The same pass stores $U_b$, $\mathcal I_1$, $\mathcal I_2$, and
 
-- **Quadrature-order convergence in** $N_\sigma$. The default is 8 with midpoint quadrature; nothing yet establishes what that costs against, say, 32.
+$$
+U_s=U_b+\tau_b\mathcal I_1
+$$
 
-- **Thermomechanical** $B(z)$, which would use the vertical discretisation already here.
+for warm starts, diagnostics, and surface-velocity objectives. The kernel exits
+only after quadrature at the accepted traction, so all returned quantities
+describe the same column state. Only the owning non-halo thread writes these
+cell fields.
 
-- **Quadrature order**: midpoint is first-cut; Goldberg's factor conventions are pinned but the rule itself has not been convergence-tested in $N_\sigma$.
+### 4.4 Stage 3: apply the SSA-shaped operator
+
+The coefficient refresh is complete once every cell has supplied
+$\bar\eta$ and $\beta_{\mathrm{eff}}$. The existing residual or smoother then
+uses those fields exactly where the SSA path uses membrane viscosity and basal
+drag. During that one operator application the fields are held fixed. When the
+multigrid step updates $\bar{\mathbf u}$, the inputs in Stage 1 have changed and
+the loop begins again with another coefficient refresh.
+
+Section 5 describes where these refreshes occur in the residual, Vanka
+smoother, and multigrid hierarchy.
+
+## 5. Using the coefficients in SSA multigrid
+
+Once the column refresh has produced $\bar\eta$ and
+$\beta_{\mathrm{eff}}$, the rest of the forward solve deliberately looks as
+much like SSA as possible. The residual stencil, Vanka layout, FAS transfers,
+and global velocity unknowns are retained.
+
+### 5.1 Residual and refresh points
+
+`residual_body<bool DIVA>` is shared by SSA and DIVA. On the DIVA
+path it reads `eta_bar` and applies the basal term
+$-\beta_{\mathrm{eff}}\bar{\mathbf u}$. On the SSA path, viscosity and the
+sliding law are evaluated inline.
+
+`compute_diva_coeffs()` runs before every DIVA residual evaluation
+and before each Vanka relaxation step. The returned fields are held fixed only
+while that one residual or local block is evaluated. After the smoother changes
+velocity, the fields are stale until the next refresh. They are not treated as
+fixed coefficients for the nonlinear solve or for an entire multigrid V-cycle.
+
+### 5.2 The Vanka block
+
+The DIVA smoother's local block has exactly the same unknowns as SSA's,
+
+$$\mathbf x=(u_l,u_r,v_t,v_b,H_c),$$
+
+and reads $\bar\eta$ and $\beta_{\mathrm{eff}}$ as **frozen coefficients**. That is the
+whole of it. The block is structurally identical to SSA's, differing only in where its two
+coefficients come from, and it never sees $U_b$ — the kernel is not even passed it.
+
+**Ownership.** `compute_diva_coeffs` alone diagnoses $U_b$, $\bar\eta$,
+$\beta_{\mathrm{eff}}$, $\mathcal I_1$, $\mathcal I_2$ and $U_s$ from $(u,v,H)$, and
+refreshes them before every residual and every smoothing application. No solver block
+treats any of them as an unknown. This is the same contract SSA's smoother has with its
+frozen viscosity, and it is why the closure needs no representation inside the block: it is
+re-solved to tolerance immediately afterwards regardless of what the block did.
+
+#### Why $U_b$ is not an augmented unknown
+
+Earlier versions carried $U_b$ as a sixth local unknown with its closure row,
+
+$$
+\begin{bmatrix}\mathsf A&\mathbf b\\\mathbf c^T&d\end{bmatrix}
+\begin{bmatrix}\delta\mathbf x\\\delta U_b\end{bmatrix}
+=\begin{bmatrix}\mathbf r\\r_{U_b}\end{bmatrix},
+\qquad d=1+f'\mathcal I_2\ge1,
+$$
+
+and eliminated it exactly, $(\mathsf A-\mathbf b\mathbf c^T/d)\delta\mathbf x
+=\mathbf r-\mathbf b r_{U_b}/d$. That rank-1 update is the Newton tangent for the drag,
+and it was correct algebra. It was removed anyway, for three reasons.
+
+**It destabilizes the smoother for sublinear sliding.** Since
+
+$$
+\frac{\partial\beta_{\mathrm{eff}}}{\partial U_b}
+=\frac{c'(U_b)}{(1+c\mathcal I_2)^2},
+\qquad c'\propto(m_s-1)U ,
+$$
+
+the correction is negative for $m_s<1$, and the momentum diagonals are already negative
+because drag resists. On Greenland at $m_s=1/3$, $\Delta t=10$ a it drove
+$\max|u|$ through $4.8\to6.8\times10^4\to1.1\times10^7$ and overflowed float32 to NaN
+inside one V-cycle, at every multigrid level but one, while SSA on the same geometry was
+clean everywhere.
+
+**The failure was local, which is why damping could not fix it.** From one warmed state,
+enabling the correction left the *median* correction unchanged, $0.00289\to0.00300$, while
+the maximum went $5.31\to4108$ with six cells above $10^3$: the update nearly cancels the
+block diagonal in a handful of cells and leaves the $5\times5$ near-singular there. A global
+$\omega$ scales every cell alike, so $\omega=0.05$ still diverged.
+
+**It never bought anything.** Measured where it is stable, it ties at best:
+
+| | $U_b$ frozen | $U_b$ condensed |
+|---|---|---|
+| $m_s=1/3$, $\Delta t=0.1$ | 4 sweeps to a $10\times$ residual drop | diverges |
+| $m_s=1/2$, $\Delta t=0.1$ | 4 sweeps, $\lvert r\rvert\to0.018$ | 4 sweeps, $\lvert r\rvert\to0.026$ |
+| $m_s=1/2$, $\Delta t=1$ | 5 sweeps | 18 sweeps |
+| $m_s=1/3$, $\Delta t=1$ | 5 sweeps | NaN |
+
+At $m_s=1$ the correction is identically zero, so a linear law never saw it either way.
+
+None of this touches the answer. The residual, the JVP and the adjoint all carry the full
+closure response; only the preconditioner lags it, exactly as SSA's smoother uses a frozen
+viscosity while its VJP carries $d\eta/du$. `diva_smoother_stability_test.py` pins the
+outcome; `lu_6x6_solve` and its test existed only to verify the condensation and were
+removed with it.
+
+### 5.3 The adjoint smoother and off-equilibrium states
+
+The adjoint smoother needs one safeguard the forward one does not, and the reason is
+structural rather than incidental.
+
+**What DIVA loses.** SSA's momentum residual is the gradient of an action functional
+*including* the viscosity's dependence on strain rate, so its velocity-block Jacobian is a
+Hessian and is symmetric — measured at $1.2\times10^{-7}$, round-off. That is what lets
+`vjp_body` seed the viscosity tile with $\lambda$, and it is what makes $\omega=0.5$ safe
+by the standard argument for a definite operator.
+
+Goldberg derives DIVA variationally too, but his self-adjointness claim is explicitly
+conditional — self-adjoint *"ignoring dependence of viscosity on strain rate."* The
+implementation honours exactly that: freeze the coefficient path and DIVA's velocity block
+is symmetric to $2.3\times10^{-7}$; include it and the asymmetry is $6.3\times10^{-3}$.
+The term outside the guarantee is precisely the term that makes DIVA more than SSA.
+
+**What that costs.** Asymmetry removes the a priori bound on $\omega$, not convergence
+itself — the preconditioned spectrum stays in the right half plane, so a small enough step
+still converges. But the smoother acquires a growing eigenmode when it is linearised about
+a state far from equilibrium, which multigrid produces at every coarse level: a restricted
+fine solution does not satisfy the coarse equations (forward residual $4019$ against
+$0.0845$ for a native solve). Perturbing a *native* state with pure noise destabilises it
+identically once far enough off equilibrium, so restriction is the trigger, not the cause.
+
+**Why it is tractable.** The timescales separate. Amplification of a random adjoint field
+at a restricted state:
+
+| sweeps | 1 | 10 | 30 | 60 | 150 |
+|---|---|---|---|---|---|
+| $\lVert\lambda\rVert/\lVert\lambda_0\rVert$ | 0.85 | **0.67** | 1.98 | 518 | $1.1\times10^{10}$ |
+
+The modes a smoother exists to kill die in the first ten sweeps; the growing mode needs
+twenty to thirty to emerge. So a smoother doing its actual job never meets it. The failure
+appeared only because the Greenland example inherited `post_steps=150` from the *forward
+SSA* configuration — seven times this solver's own default, and far beyond what a smoother
+is for. SSA is indifferent to the excess; DIVA is not.
+
+**The safeguard.** `vanka_config.smoother_growth_check` (default 5) measures the adjoint
+residual every few sweeps and stops the sweep when it rises: a smoother that is increasing
+the residual is doing nothing useful, and because the iteration is linear with a fixed
+state the growth will not reverse. It exploits the separation above rather than fighting
+the spectrum, and costs nothing when nothing is wrong — on a well-conditioned solve the
+gradient is bit-identical with the check on or off. At level 1 with `post_steps=150`, the
+configuration that reached $2.4\times10^{16}$, the adjoint now converges in two V-cycles
+($6.9\times10^{-2}\to9.4\times10^{-3}$).
+
+Global under-relaxation was tried and rejected. `diva_omega` does stabilise the mode, but
+it scales the whole spectrum, so taming one eigenvalue cripples every mode the smoother
+exists to damp: on a well-conditioned case the adjoint needs 2 V-cycles at $\omega=0.5$
+and more than 200 at $\omega=0.3$. It remains available as an escape hatch, defaulting to
+$0.5$.
+
+Two things that look like fixes and are not. Making the block represent the closure path
+is *verified correct* — it matches finite differences to $1.7\times10^{-2}$ — and still
+diverges, because 47% of that path is cross-cell coupling a $5\times5$ block cannot hold,
+and half a term is worse than none. And equalising `eps_reg_shear` with `eps_reg` reduces
+the asymmetry fiftyfold, but against a frozen-operator baseline of $2.3\times10^{-7}$ it
+is a contributor, not the cause.
+
+### 5.4 Multigrid levels and convergence
+
+The FAS hierarchy continues to transfer and correct the same globally coupled
+state as SSA. Each level also owns cell-centered arrays for `u_b`,
+`eta_bar`, and `beta_eff`. A restricted `u_b`
+can provide a useful initial guess on the coarse level, but it is not accepted
+as the coarse-level solution: the DIVA kernel recomputes the closure and
+coefficients from that level's own velocity, thickness, and grid spacing before
+the coarse operator uses them.
+
+There are consequently two useful convergence diagnostics:
+
+1. The momentum residual is evaluated after refreshing the DIVA coefficients,
+   so it measures the actual nonlinear DIVA equations rather than an old
+   frozen-coefficient surrogate.
+2. The basal-closure residual can be measured immediately before a refresh to
+   show how far the stored column state drifted while the preceding velocity
+   update was applied.
+
+They are reported separately because the momentum residual has stress-balance
+units whereas the basal-closure residual has velocity units. At convergence,
+both the global momentum equations and the independent cell closures are
+consistent.
+
+## 6. Linearization and adjoint
+
+This section summarizes the adjoint structure needed to understand the
+numerical method. A step-by-step dependency trace, including the facet stencil,
+the nested implicit derivatives, and the CUDA call sequence, is given in
+[diva_adjoint.md](diva_adjoint.md).
+
+Let the coupled forward state be
+
+$$
+\mathbf x=(u,v,H),
+$$
+
+and let the two DIVA coefficients returned by cell $c$ be
+
+$$
+\mathbf C_c(\mathbf x)
+=\left(\bar\eta_c(\mathbf x),\,
+       \beta_{\mathrm{eff},c}(\mathbf x)\right).
+$$
+
+A momentum residual row depends on the state in two ways. There is a direct
+dependence through the usual SSA stencil, and an indirect dependence through
+the DIVA coefficients of the nearby cells used by that stencil:
+
+$$
+r_i=r_i\!\left(\mathbf x,\{\mathbf C_c(\mathbf x)\}_{c\in\mathcal N(i)}\right).
+$$
+
+For a perturbation $\delta\mathbf x$,
+
+$$
+\delta r_i
+=
+\left.\frac{\partial r_i}{\partial\mathbf x}\right|_{\mathbf C}
+\delta\mathbf x
++\sum_{c\in\mathcal N(i)}
+\left(
+\frac{\partial r_i}{\partial\bar\eta_c}\,\delta\bar\eta_c
++
+\frac{\partial r_i}{\partial\beta_{\mathrm{eff},c}}\,
+\delta\beta_{\mathrm{eff},c}
+\right).
+$$
+
+The first term is the familiar fixed-coefficient SSA linearization. The second
+term differentiates the cell-local column refresh. The Vanka smoother
+approximates the second term by freezing the column viscosity and
+$\mathcal I_2$ while eliminating the local $U_b$ increment, as described in
+Section 5.2. That approximation is appropriate for a preconditioner. A JVP or
+adjoint intended to represent the converged nonlinear equations must include
+the complete second term.
+
+### 6.1 Differentiating one cell closure
+
+Velocity enters the closure in cell $c$ through two cell-centered scalars,
+
+$$
+q_{1,c}=\dot\varepsilon_{\mathrm{mem},c}^2,
+\qquad
+q_{2,c}=\bar U_c.
+$$
+
+The required closure derivatives are
+
+$$
+\bar\eta_{,q_1},\quad \bar\eta_{,q_2},
+\qquad
+\beta_{\mathrm{eff},q_1},\quad
+\beta_{\mathrm{eff},q_2}.
+$$
+
+GLIDE obtains them by running the complete cell calculation in dual arithmetic,
+not by deriving separate formulas for every nested dependency.
+`compute_diva_derivs` seeds $q_1$ and $q_2$ in turn and executes the
+basal-speed Newton solve, every node-viscosity Newton solve, and the vertical
+quadrature in `DualFloat`. The derivative carried by the converged
+output therefore includes the paths through $U_b$, $\tau_b$, $\eta(z)$, and
+$\mathcal I_2$.
+
+For a forward JVP, `populate_diva_coeffs_dual` instead seeds a
+velocity direction directly. The finite-difference and interpolation operations
+produce directional derivatives of $q_1$ and $q_2$, and the same dual column
+solve returns the corresponding directional derivatives of $\bar\eta$ and
+$\beta_{\mathrm{eff}}$.
+
+### 6.2 The two-pass coefficient transpose
+
+For an adjoint vector $\vec{\lambda}$, the coefficient part of
+$\mathbf J^T\vec{\lambda}$ is evaluated in two passes.
+
+First, `vjp_body<true>` visits the momentum residual rows. In addition
+to transposing the direct fixed-coefficient stencil, it accumulates the
+sensitivity of all residual rows touching cell $c$ into two cell-centered
+weights:
+
+$$
+W_{\eta,c}
+=\sum_i\lambda_i\frac{\partial r_i}{\partial\bar\eta_c},
+\qquad
+W_{\beta,c}
+=\sum_i\lambda_i
+ \frac{\partial r_i}{\partial\beta_{\mathrm{eff},c}}.
+$$
+
+These weights answer a simple question: after contraction with the adjoint,
+how strongly does the objective depend on each coefficient produced by this
+cell?
+
+Second, `compute_diva_vjp_coeffs` combines those weights with the
+closure derivatives:
+
+$$
+A_c
+=W_{\eta,c}\bar\eta_{,q_1}
+ +W_{\beta,c}\beta_{\mathrm{eff},q_1},
+\qquad
+B_c
+=W_{\eta,c}\bar\eta_{,q_2}
+ +W_{\beta,c}\beta_{\mathrm{eff},q_2}.
+$$
+
+It then scatters
+
+$$
+A_c\frac{\partial q_{1,c}}{\partial(u,v)}
++
+B_c\frac{\partial q_{2,c}}{\partial(u,v)}
+$$
+
+back to the velocity facets that contribute to cell $c$. Splitting the
+transpose into residual-to-coefficient and coefficient-to-velocity passes keeps
+each kernel within a one-cell halo. Dirichlet facets are skipped.
+
+Together with the direct transpose from the first pass, this is the exact
+velocity-block transpose at fixed $H$. No symmetry of the full nonlinear
+Jacobian is assumed. The adjoint Vanka smoother instead transposes the same
+frozen-coefficient block used by the forward preconditioner.
+
+### 6.3 Thickness dependence of the closure
+
+The coefficient map also depends on thickness,
+
+$$
+\mathbf C_c
+=\mathbf C_c(q_{1,c},q_{2,c},H_c),
+$$
+
+because
+
+$$
+\mathcal I_\alpha
+=H_c\int_0^1\frac{\zeta^\alpha}{\eta(\zeta)}\,d\zeta .
+$$
+
+Changing $H_c$ changes $\mathcal I_2$, the solved $U_b$ and $\tau_b$, and
+therefore both $\bar\eta$ and $\beta_{\mathrm{eff}}$. Thickness is the only
+input that enters through the quadrature factor alone, which is why typing
+`H_c` as the templated scalar in `diva_coeffs_cell` captures the whole path.
+
+The coupled linearization therefore includes
+
+$$
+K_c
+=W_{\eta,c}\bar\eta_{,H}
+ +W_{\beta,c}\beta_{\mathrm{eff},H},
+$$
+
+added to the thickness component of $\mathbf J^T\vec{\lambda}$. Unlike the
+velocity inputs, which are assembled from surrounding facets and need a scatter,
+$H_c$ belongs to the cell itself, so $K_c$ lands on one cell with no stencil.
+`compute_diva_vjp_coeffs` accumulates it into the thickness cotangent that the
+first VJP pass already built from the residual's explicit $H$ terms.
+
+The JVP counterpart seeds the thickness direction in
+`populate_diva_coeffs_dual`, so a direction with $\delta H\ne0$ carries the
+closure's response and not merely the explicit terms.
+
+Consequently the DIVA JVP and adjoint are now exact for the coupled $(u,v,H)$
+velocity/thickness block at fixed auxiliary fields. If the grounded fraction is
+treated as a diagnostic function of $H$, its derivative remains a separate
+auxiliary-field path and is still outside the DIVA coefficient transpose
+described here.
+
+### 6.4 Parameter derivatives
+
+The same dual-number mechanism supplies derivatives with respect to the three
+supported sliding parameters. `compute_diva_derivs` currently uses
+six seeds in total:
+
+| Seed | Purpose |
+|---|---|
+| $q_1$, $q_2$ | velocity-block transpose and surface objective |
+| $H$ | thickness-block transpose and surface objective |
+| $\beta$ | drag gradient and surface explicit term |
+| $u_c$ | Coulomb gradient and surface explicit term |
+| $m_s$ | Weertman-exponent gradient and surface explicit term |
+
+Each seed yields derivatives of $\bar\eta$,
+$\beta_{\mathrm{eff}}$, and $U_s$, for 18 stored fields. For a parameter $p$,
+the coefficient contribution is
+
+$$
+\sum_c
+\left(
+W_{\eta,c}\bar\eta_{,p}
++W_{\beta,c}\beta_{\mathrm{eff},p}
+\right).
+$$
+
+Both paths matter: changing $\beta$, for example, changes the basal drag and
+also changes viscosity through the resulting vertical shear.
+
+### 6.5 Surface-speed objectives
+
+A surface-speed objective depends on the reconstructed surface speed,
+
+$$
+U_s=U_b+\tau_b\mathcal I_1,
+$$
+
+rather than directly on the depth-averaged velocity solved by multigrid.
+`diva_surface_misfit_rhs` uses $U_{s,q_1}$ and $U_{s,q_2}$ to
+transpose the surface misfit back to velocity facets. The objective also has
+the explicit parameter term
+
+$$
+\left.\frac{\partial J}{\partial p}\right|_{\mathrm{explicit}}
+=\sum_c\frac{\partial J}{\partial U_{s,c}}
+        \frac{\partial U_{s,c}}{\partial p},
+$$
+
+returned by `diva_surface_param_gradient`. Under SSA these helpers
+return `None`.
+
+As with the residual coefficients, $U_s$ also depends on $H$ through
+$\mathcal I_1$, $\mathcal I_2$, and the solved $U_b$. That derivative is stored
+as $U_{s,H}$ and `diva_surface_misfit_rhs` scatters it into the thickness
+right-hand side alongside the velocity one, so a surface objective is
+differentiated with respect to the full state.
+
+## 7. Verification, code map, and status
+
+The verification suite follows the same layers as the implementation: analytic
+limits check the continuum formulas, cell tests check the coefficient refresh,
+operator tests check its coupling to SSA, derivative tests check the
+implemented linearization in both velocity and thickness directions, and full
+solves check the multigrid integration.
+
+The tests are not interchangeable, and the useful thing to know is which are sharp.
+Strongest first:
+
+| strength | mechanism | resolves to | tests |
+|---|---|---|---|
+| exact | bit-for-bit against a reference | 0 | `ssa_regression`, `diva_residual` |
+| exact-arithmetic identity | an identity that must hold in any precision | round-off, $\sim$1e-7 | `diva_dotproduct` |
+| external truth | closed-form analytic solution | round-off if the formulation is right | `diva_slab` |
+| independent reference | the same quantity by a deliberately different algorithm | round-off | `diva_closure` |
+| finite differences | perturb and re-solve | $\sim$1e-3 at best | `diva_derivs`, `diva_gradient`, `diva_surface_gradient`, `diva_surface_torch` |
+| physical consistency | limits, invariants, determinism, boundedness | varies | `diva_solve`, `diva_smoother_stability` |
+
+Two consequences shape how the adjoint is verified. Finite differences cannot resolve it —
+the floor on this problem is $\sim$3e-3 ([open_questions.md](open_questions.md) Q7), so FD
+agreement at 1e-3 is consistent with a real defect. The load-bearing adjoint check is
+therefore the dot-product identity, which uses no FD and resolves to round-off. Where FD is
+the only instrument it is run against an **SSA control** — the same objective and harness
+through SSA's independently written exact adjoint — so the comparison measures against the
+shared floor rather than a guessed tolerance. And no single FD step is trustworthy:
+truncation falls like $\varepsilon^2$ while round-off grows like $1/\varepsilon$, so every
+FD test sweeps $\varepsilon$ and reports the curve.
+
+A caution the thickness work added: an end-to-end FD check can also be too *insensitive* to
+be the instrument. Removing the closure's $H$ path moved the residual FD by only a factor of
+two, because the residual's explicit $H$ dependence dominates it; the derivative had to be
+checked where its own signal was largest, in isolation. Test each link where it is loudest.
+
+| Test | Establishes |
+|---|---|
+| `ssa_regression_test.py` | SSA remains bit-for-bit identical |
+| `diva_residual_test.py` | DIVA with SSA coefficients reproduces SSA; catches grounding errors |
+| `diva_closure_test.py` | coefficients match independent bisection/Picard algorithms |
+| `diva_slab_test.py` | shear integrals match the analytic slab |
+| `diva_smoother_stability_test.py` | the smoother stays bounded for a sublinear sliding law |
+| `diva_derivs_test.py` | all 18 closure derivatives match finite differences, including the three thickness ones |
+| `diva_dotproduct_test.py` | velocity- and thickness-direction JVP checks, and the JVP/VJP transpose identity |
+| `diva_surface_torch_test.py` | surface-velocity and thickness objectives through the torch wrapper |
+| `diva_adjoint_test.py` | adjoint FAS converges |
+| `diva_gradient_test.py` | all three parameter gradients |
+| `diva_surface_gradient_test.py` | surface objective and SSA limit |
+| `diva_solve_test.py` | convergence, determinism, bounds, and multigrid consistency |
+
+Run from `glide/`:
+
+```bash
+for test in tests/diva_*_test.py tests/ssa_regression_test.py; do
+    uv run python "$test" || exit 1
+done
+```
+
+Float32 finite differences have a visible floor, so the dot-product identity is
+the load-bearing test that the implemented JVP and VJP are transposes. It
+cannot detect a dependency omitted from both. The independent finite-difference
+check currently perturbs velocity only; a corresponding thickness-direction
+check is needed. The independent closure implementation checks the algorithm,
+while the slab solution can expose a shared formulation error.
+
+| File | DIVA responsibility |
+|---|---|
+| `glide/cuda/diva.cu` | closure, quadrature, derivatives, coefficient and surface transposes |
+| `glide/cuda/viscosity.cu` | shared membrane invariant |
+| `glide/cuda/residuals.cu` | residual, fixed-$H$ velocity JVP, first VJP pass |
+| `glide/cuda/vanka.cu` | frozen-coefficient local block |
+| `glide/operators.py` | dispatch, refresh, gradients, surface helpers |
+| `glide/multigrid.py` | forward and adjoint FAS integration |
+| `glide/grid.py` | configuration and field allocation |
+
+Select DIVA with `grid.rheology.stress_balance.set(1.0)`; SSA (`0.0`) remains the
+default. `n_sigma` defaults to 8 and `eps_reg_shear` to $10^{-12}$.
+
+Implemented: isothermal DIVA for both sliding laws, forward and adjoint FAS,
+the coupled $(u,v,H)$ JVP/VJP including the closure's thickness path, all three
+sliding-parameter gradients, surface-speed objectives, and the analytic/SSA
+limits. A
+development benchmark on a $256^2$, five-level case measured about 11% overhead
+(107 ms versus 96 ms); this is hardware- and
+configuration-specific.
+
+Remaining work, in priority order:
+
+1. Validate ISMIP-HOM C against trusted first-order/full-Stokes reference data.
+2. Resolve the broader `eps_reg` modeling policy; see
+   [open_questions.md](open_questions.md).
+3. Add partial integrals for $\mathbf u(z)$, then vertical velocity and thermal
+   coupling.
+4. Allow depth-varying $B(z)$.
+5. Quantify the omitted bed-slope factor before validating steep-bed cases.
+
+## Appendix A. Shear-integral derivative
+
+At one quadrature node, write
+
+$$
+G(\eta,\tau_b)=\tfrac12BE^p,
+\quad E=A_{\mathrm{reg}}+s_{\mathrm{sh}},
+\quad s_{\mathrm{sh}}=\frac{\tau_b^2\zeta^2}{4\eta^2}.
+$$
+
+From the root $\eta=G$,
+
+$$
+\frac{d\eta}{d\tau_b}=\frac{G_{\tau_b}}{1-G_\eta},
+\quad
+G_\eta=-2p\frac{s_{\mathrm{sh}}}{E},
+\quad
+G_{\tau_b}=2p\frac{s_{\mathrm{sh}}\eta}{E\tau_b}.
+$$
+
+Therefore
+
+$$
+\frac{d\mathcal I_2}{d\tau_b}
+=H\int_0^1\zeta^2\left(-\eta^{-2}
+\frac{d\eta}{d\tau_b}\right)d\zeta.
+$$
+
+The kernel rewrites $s_{\mathrm{sh}}/\tau_b$ as
+$\tau_b\zeta^2/(4\eta^2)$, giving zero cleanly at $\tau_b=0$.
+
+## Appendix B. Invariants worth protecting
+
+Each row below is a place where a plausible-looking edit is wrong, with the test that
+catches it:
+
+| change | consequence | caught by |
+|---|---|---|
+| re-applying $\varphi$ in the momentum kernels | grounding counted twice | `diva_residual_test` |
+| collapsing the two level solves into one | $\mathcal I_2$ moves with $\varepsilon_0^2$, SSA limit drifts | `diva_slab_test` |
+| any non-smooth op inside `diva_coeffs_cell` (`min`, clamp, magnitude branch) | kink in the differentiated path | `diva_dotproduct_test` |
+| breaking either adaptive loop on the primal criterion | primal stays right, derivative degrades $10\times$ | `diva_dotproduct_test`, `diva_derivs_test` |
+| depositing on Dirichlet rows in the coefficient scatter | unreducible adjoint convergence floor | adjoint V-cycle norms |
+| letting the smoother's block see $U_b$ again | divergence for $m_s<1$, NaN on real geometry | `diva_smoother_stability_test` |
+| disabling `smoother_growth_check`, or raising the adjoint's `post_steps` far past its default | the adjoint smoother's growing mode reappears at fine resolution | adjoint V-cycle norms |
+| passing $H$ to the closure as a plain `float` | the thickness derivative silently becomes zero | `diva_derivs_test` |
+
+And the standing invariants:
+
+
+| Invariant | Primary test |
+|---|---|
+| Grounding enters `beta_eff` exactly once | `diva_residual_test.py` |
+| `eta_bar` keeps the SSA regularization | `diva_closure_test.py` |
+| `F1`, `F2` use the shear regularization | `diva_slab_test.py` |
+| Closure slope includes $d\mathcal I_2/d\tau_b$ | `diva_closure_test.py` |
+| The smoother reads $\bar\eta,\beta_{\mathrm{eff}}$ only, and stays bounded for $m_s<1$ | `diva_smoother_stability_test.py` |
+| A converged dual Newton solve takes the extra step | `diva_derivs_test.py`, `diva_dotproduct_test.py` |
+| Only owning threads write column fields | `diva_solve_test.py` |
+| VJP scatter skips Dirichlet facets | `diva_adjoint_test.py` |
+| Coefficients are recomputed on every multigrid level | `diva_solve_test.py`, `diva_adjoint_test.py` |

@@ -107,6 +107,7 @@ class Multigrid:
                                getattr(coarse_grid.rheology,nm).data)
         coarse_grid.rheology.n.set(fine_grid.rheology.n.value)
         coarse_grid.rheology.eps_reg.set(fine_grid.rheology.eps_reg.value)
+        coarse_grid.rheology.eps_reg_shear.set(fine_grid.rheology.eps_reg_shear.value)
         coarse_grid.rheology.stress_balance.set(fine_grid.rheology.stress_balance.value)
         coarse_grid.rheology.n_sigma.set(fine_grid.rheology.n_sigma.value)
     
@@ -480,6 +481,13 @@ class MGRheologyManager:
             name="eps_reg",
         )
 
+        self.eps_reg_shear = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.eps_reg_shear,
+            restrict=lambda f,c: c.set(f.value),
+            name="eps_reg_shear",
+        )
+
         self.stress_balance = HierarchyFieldManager(
             mg.levels,
             getter=lambda g: g.rheology.stress_balance,
@@ -651,7 +659,7 @@ class FASCDSolver:
                 # coefficients had DRIFTED during the V-cycle, i.e. whether the segregated
                 # refresh is keeping up with the velocity.  It is also a standing guard that
                 # the closure solve itself converges, which is what regressed silently before
-                # (notes/diva_numerics.md 5.2.0).  Reported separately and scaled by |Ubar|,
+                # (notes/diva_numerics.md 4.1).  Reported separately and scaled by |Ubar|,
                 # never folded into |r|: r_Ub is a velocity residual and r_u a momentum one
                 # (notes/open_questions.md Q6).
                 if r_ub is not None:
@@ -1038,10 +1046,12 @@ class FASAdjointSolver:
                       f"|r_v| = {float(rv):.2e}, "
                       f"|r_H| = {float(rH):.2e}")
             iteration += 1
-        if iteration < self._fas_config.maximum_vcycles:
-            converged = True
-        else:
-            converged = False
+        # A non-finite residual must NOT be reported as converged.  The while test above
+        # is `norm > tol`, and NaN > tol is False, so a solve that diverged to NaN exits
+        # the loop on its first check and would otherwise look like instant success --
+        # handing the caller a NaN state or gradient with a converged flag attached.
+        finite = bool(cp.isfinite(absolute_residual_norm))
+        converged = (iteration < self._fas_config.maximum_vcycles) and finite
         return converged
 
     def vcycle(self, l, finest=False):

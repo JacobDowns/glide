@@ -1,11 +1,31 @@
 """Operator-consistency tests for DIVA: JVP against finite differences, then the
 adjoint identity against the JVP.
 
-Two checks, in the order that makes them interpretable:
+Three checks, in the order that makes them interpretable:
 
-  1. **JVP vs FD of the residual.** Validates compute_jvp_diva itself as a faithful
-     Jacobian of compute_residual_diva. Without this, a failure in check 2 could equally
-     be a JVP bug.
+  1. **JVP vs FD of the residual, VELOCITY direction.** Validates compute_jvp_diva itself
+     as a faithful Jacobian of compute_residual_diva. Without this, a failure in check 3
+     could equally be a JVP bug.
+
+  1b. **JVP vs FD of the residual, THICKNESS direction.** The same check with d_H != 0 and
+     d_u = d_v = 0, covering the closure-through-thickness path
+
+         H -> I1, I2 -> U_b, tau_b -> eta_bar, beta_eff -> r
+
+     SSA is the control: there the residual still depends on H explicitly (through
+     H*eta_bar, the driving stress and the fluxes) but has no closure path at all.
+
+     This check is COARSE, and it is worth knowing by how much. Disabling the closure's H
+     seed and re-running moves it only from 5.7e-5 to 1.2e-4 -- about a factor of two --
+     because the residual's explicit H terms dominate its response to thickness, so the
+     closure-mediated part is a small correction on top of a large signal. It will catch a
+     gross error and not a subtle one. The SHARP checks for this path are elsewhere:
+     tests/diva_derivs_test.py finite-differences d(eta_bar)/dH, d(beta_eff)/dH and
+     d(u_s)/dH directly (agreement ~1e-4 or better), and check 3 below detects any
+     asymmetry between the two operators -- the same probe drove it from 1.3e-7 to 2.6e-5.
+
+     The one thing no combination of these can see is a term dropped from the JVP and the
+     VJP simultaneously; that is what the direct closure-derivative test is for.
 
   2. **Dot-product test**  <J^T lam, x>  vs  <lam, J x>  for seeded random lam, x.
      This is the sharp instrument: it uses **no finite differences**, so it resolves to
@@ -45,6 +65,7 @@ SEED = 3
 
 SSA_DOTPROD_BOUND = 1e-5     # exact transpose: round-off only
 JVP_FD_BOUND = 1e-3          # limited by the FD reference, not the JVP
+JVP_FD_H_BOUND = 5e-3        # thickness direction; judged against the SSA control below
 DIVA_FROZEN_BOUND = 0.5      # loose: the frozen VJP is knowingly incomplete (~1e-1)
 DIVA_EXACT_BOUND = 1e-5      # with the coefficient terms applied: round-off
 
@@ -140,6 +161,35 @@ def run(stress_balance, tag, exact_coeff_adjoint=False):
     sel = mu > 0
     jvp_err = np.abs(Ju[sel] - fd[sel]).max() / max(np.abs(fd[sel]).max(), 1e-30)
 
+    # --- 1b. JVP against FD in a THICKNESS direction ---
+    # d_u = d_v = 0, d_H = xH.  Under DIVA this exercises the closure's response to
+    # thickness; under SSA only the residual's explicit H terms, which is the control.
+    H0 = grid.state.H.data.copy()
+    fo.var_u.fill(0.0); fo.var_v.fill(0.0); fo.var_H[:, :] = cp.asarray(xH)
+    fo.compute_jvp(dt, use_mask=False, freeze_phi=True)
+    JuH = cp.asnumpy(fo.jvp_u).copy()
+
+    def residual_H(eps):
+        grid.state.H.data[:, :] = H0 + eps * cp.asarray(xH)
+        grid.state.u_b.data.fill(0.0)          # cold start -> pure function of the state
+        fo.compute_residual(dt, use_mask=False, freeze_phi=True)
+        return cp.asnumpy(fo.r_u).copy()
+
+    # H is O(1e3) and xH is O(1), so the step is swept in ABSOLUTE metres: too small and
+    # the difference is float32 round-off on a large H, too large and the closure's
+    # nonlinearity shows up as truncation error.
+    jvp_err_H = np.inf
+    for epsH in (1e-1, 3e-1, 1.0, 3.0):
+        fdH = (residual_H(epsH) - residual_H(-epsH)) / (2 * epsH)
+        err = np.abs(JuH[sel] - fdH[sel]).max() / max(np.abs(fdH[sel]).max(), 1e-30)
+        jvp_err_H = min(jvp_err_H, err)
+    grid.state.H.data[:, :] = H0
+    grid.state.u.data[:, :] = u0
+    grid.state.v.data[:, :] = v0
+    grid.state.u_b.data[:, :] = ub0
+    if stress_balance > 0.5:
+        fo.compute_diva_coeffs()
+
     # --- 2. dot-product test over all three components ---
     fo.var_u[:, :] = cp.asarray(xu); fo.var_v[:, :] = cp.asarray(xv); fo.var_H[:, :] = cp.asarray(xH)
     fo.compute_jvp(dt, use_mask=False, freeze_phi=True)
@@ -155,33 +205,42 @@ def run(stress_balance, tag, exact_coeff_adjoint=False):
     b = float((lu * Jx[0] * mu).sum() + (lv * Jx[1] * mv).sum() + (lH * Jx[2] * mh).sum())
     dot_err = abs(a - b) / max(abs(a), abs(b), 1e-30)
 
-    print(f"{tag}: JVP vs FD = {jvp_err:.3e} | "
+    print(f"{tag}: JVP vs FD (u) = {jvp_err:.3e}  (H) = {jvp_err_H:.3e} | "
           f"<J^T lam,x> = {a:+.6e}  <lam,Jx> = {b:+.6e}  rel diff = {dot_err:.3e}")
-    return jvp_err, dot_err
+    return jvp_err, jvp_err_H, dot_err
 
 
 def main():
-    jvp_ssa, dot_ssa = run(0.0, "SSA  (control)")
+    jvp_ssa, jvpH_ssa, dot_ssa = run(0.0, "SSA  (control)")
     assert jvp_ssa < JVP_FD_BOUND, f"SSA JVP disagrees with FD: {jvp_ssa:.3e}"
     assert dot_ssa < SSA_DOTPROD_BOUND, \
         f"SSA VJP is not the exact transpose of its JVP: {dot_ssa:.3e}"
 
-    jvp_diva, dot_frozen = run(1.0, "DIVA frozen   ")
+    jvp_diva, jvpH_diva, dot_frozen = run(1.0, "DIVA frozen   ")
     assert jvp_diva < JVP_FD_BOUND, f"DIVA JVP disagrees with FD: {jvp_diva:.3e}"
     assert dot_frozen < DIVA_FROZEN_BOUND, \
         f"DIVA frozen adjoint far worse than expected: {dot_frozen:.3e}"
 
-    _, dot_exact = run(1.0, "DIVA exact    ", exact_coeff_adjoint=True)
+    # Coarse by construction -- see the module docstring for the measured sensitivity.
+    # A gross error in the closure's H path lands here; a subtle one will not, which is
+    # why diva_derivs_test.py checks d(eta_bar)/dH and friends directly.
+    assert jvpH_diva < JVP_FD_H_BOUND, (
+        f"the DIVA JVP disagrees with FD in a THICKNESS direction: {jvpH_diva:.3e} "
+        f"(SSA control {jvpH_ssa:.3e}). Suspect the closure's H path -- H must be typed T "
+        f"in diva_coeffs_cell and d_H must reach populate_diva_coeffs_dual.")
+
+    _, _, dot_exact = run(1.0, "DIVA exact    ", exact_coeff_adjoint=True)
     assert dot_exact < DIVA_EXACT_BOUND, \
         f"the exact coefficient transpose is not exact: {dot_exact:.3e}"
 
-    print(f"\nDIVA JVP validated ({jvp_diva:.1e} vs FD, same order as SSA's {jvp_ssa:.1e}).")
+    print(f"\nDIVA JVP validated: velocity {jvp_diva:.1e} vs FD (SSA {jvp_ssa:.1e}), "
+          f"thickness {jvpH_diva:.1e} (SSA {jvpH_ssa:.1e}).")
     print(f"Frozen coefficient adjoint: {dot_frozen:.2e}  --  about 10% wrong.")
     print(f"Exact coefficient adjoint:  {dot_exact:.2e}  --  round-off, vs SSA control {dot_ssa:.1e}.")
     print("So the closure terms are exactly right, and they are ON by default.")
     print("The adjoint SMOOTHER still assembles the frozen block, which is fine -- it is")
     print("only a preconditioner, exactly as in SSA, where the VJP carries d(eta)/du and")
-    print("the smoother does not; see notes/diva_numerics.md section 7.")
+    print("the smoother does not; see notes/diva_numerics.md section 5.4.")
 
 
 if __name__ == '__main__':

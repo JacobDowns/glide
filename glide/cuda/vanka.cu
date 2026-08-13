@@ -88,57 +88,6 @@ __device__ void lu_5x5_solve(
     x[0] = (y[0] - LU[0][1]*x[1] - LU[0][2]*x[2] - LU[0][3]*x[3] - LU[0][4]*x[4]) / LU[0][0];
 }
 
-// ============================================================
-// LU Solve for 6x6 Systems (DIVA Vanka smoother)
-// ============================================================
-// Identical scheme to lu_5x5_solve, one row wider: DIVA augments the local system
-// with the basal speed U_b and its closure row.
-__device__ void lu_6x6_solve(
-    const float* A,  // 36 entries: full 6x6 row-major
-    const float* b,  // 6 entries
-    float* x)        // 6 entries (output)
-{
-    float LU[6][6];
-
-    #pragma unroll
-    for (int i = 0; i < 6; i++) {
-        #pragma unroll
-        for (int j = 0; j < 6; j++) {
-            LU[i][j] = A[i * 6 + j];
-        }
-    }
-
-    // LU factorization (Doolittle, no pivoting)
-    #pragma unroll
-    for (int k = 0; k < 6; k++) {
-        float inv_diag = 1.0f / LU[k][k];
-        #pragma unroll
-        for (int i = k + 1; i < 6; i++) {
-            LU[i][k] *= inv_diag;
-            #pragma unroll
-            for (int j = k + 1; j < 6; j++) {
-                LU[i][j] -= LU[i][k] * LU[k][j];
-            }
-        }
-    }
-
-    // Forward solve: L*y = b
-    float y[6];
-    y[0] = b[0];
-    y[1] = b[1] - LU[1][0]*y[0];
-    y[2] = b[2] - LU[2][0]*y[0] - LU[2][1]*y[1];
-    y[3] = b[3] - LU[3][0]*y[0] - LU[3][1]*y[1] - LU[3][2]*y[2];
-    y[4] = b[4] - LU[4][0]*y[0] - LU[4][1]*y[1] - LU[4][2]*y[2] - LU[4][3]*y[3];
-    y[5] = b[5] - LU[5][0]*y[0] - LU[5][1]*y[1] - LU[5][2]*y[2] - LU[5][3]*y[3] - LU[5][4]*y[4];
-
-    // Backward solve: U*x = y
-    x[5] = y[5] / LU[5][5];
-    x[4] = (y[4] - LU[4][5]*x[5]) / LU[4][4];
-    x[3] = (y[3] - LU[3][4]*x[4] - LU[3][5]*x[5]) / LU[3][3];
-    x[2] = (y[2] - LU[2][3]*x[3] - LU[2][4]*x[4] - LU[2][5]*x[5]) / LU[2][2];
-    x[1] = (y[1] - LU[1][2]*x[2] - LU[1][3]*x[3] - LU[1][4]*x[4] - LU[1][5]*x[5]) / LU[1][1];
-    x[0] = (y[0] - LU[0][1]*x[1] - LU[0][2]*x[2] - LU[0][3]*x[3] - LU[0][4]*x[4] - LU[0][5]*x[5]) / LU[0][0];
-}
 
 __device__ __forceinline__
 void mat5x5_mat(const float* __restrict__ A,
@@ -182,9 +131,9 @@ void mat5x5_vec(const float* __restrict__ A,
 	
 // Shared local-block assembly for the SSA and DIVA smoothers.  As in residual_body,
 // DIVA is a compile-time flag and the two schemes differ only in the basal stress:
-// SSA evaluates the sliding law, DIVA uses the effective drag beta_eff.  When DIVA is
-// set, dr_dU_b receives d(r)/d(beta_eff of this cell) for the four momentum rows --
-// the coupling the augmented block needs; it is left untouched for SSA.
+// SSA evaluates the sliding law, DIVA reads the effective drag beta_eff as a FROZEN
+// coefficient -- exactly as it reads the frozen eta_bar, and exactly as SSA's smoother
+// treats its own viscosity.
 // Assemble the local 5x5 Jacobian J and residual r for the cell (i,j).
 //
 // Every entry comes from the same get_*_jac functions the global residual uses, so this is
@@ -193,14 +142,14 @@ void mat5x5_vec(const float* __restrict__ A,
 // that is what makes it a block SMOOTHER rather than a solve, and what the outer multigrid
 // V-cycle exists to make up for.
 //
-// For DIVA it additionally returns dr_dbeta_eff, the five rows' sensitivity to this cell's
-// effective drag.  That is the vector the rank-1 condensation in vanka_smooth_body needs;
-// see the long comment there.
+// The block's unknowns are exactly (u_l, u_r, v_t, v_b, H_c).  U_b is NOT among them and is
+// not visible here: it is diagnosed by compute_diva_coeffs from (u,v,H), together with
+// eta_bar, beta_eff, F1, F2 and u_s, and nothing in the solver treats any of them as an
+// unknown.  See notes/diva_numerics.md 5.2.
 template <bool DIVA, int height, int width>
 __device__ void build_5x5_vanka(
     float* __restrict__ J,
     float* __restrict__ r,
-    float* __restrict__ dr_dbeta_eff,
     float u_l, float u_r,
     float v_t, float v_b,
     float H_c,
@@ -227,7 +176,6 @@ __device__ void build_5x5_vanka(
 
     for (int k=0;k<25;k++) J[k] = 0.0f;
     for (int k=0;k<5;k++) r[k] = 0.0f;
-    if (DIVA) { for (int k=0;k<5;k++) dr_dbeta_eff[k] = 0.0f; }
 
     float phi_c = get_cell(phi,i,j,ny,nx);
     float phi_l = get_cell(phi,i,j-1,ny,nx);
@@ -494,13 +442,11 @@ __device__ void build_5x5_vanka(
     float u_c_c = get_cell(u_c,i,j,ny,nx);
     if (DIVA) {
 	// This facet's cells are (i,j-1) and (i,j); the block owns (i,j), so it is the
-	// "r" side whose beta_eff carries the in-block U_b dependence.
 	float beta_eff_l = get_cell(beta_eff,i,j-1,ny,nx);
 	float beta_eff_c = get_cell(beta_eff,i,j,ny,nx);
 	TauBxDivaJacobian tau_bx_l = get_tau_bx_diva_jac(u_l,beta_eff_l,beta_eff_c);
 	r[0] += tau_bx_l.res;
 	J[0] += tau_bx_l.d_u;
-	dr_dbeta_eff[0] += tau_bx_l.d_beta_eff_r;
     } else {
 	TauBxJacobian tau_bx_l = get_tau_bx_jac({u_l,v_tl,v_t,v_bl,v_b,H_l,H_c,phi_l,phi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_l,u_c_c,sliding_law});
 	r[0] += tau_bx_l.res;
@@ -528,7 +474,6 @@ __device__ void build_5x5_vanka(
 	TauBxDivaJacobian tau_bx_r = get_tau_bx_diva_jac(u_r,beta_eff_c,beta_eff_r);
 	r[1] += tau_bx_r.res;
 	J[6] += tau_bx_r.d_u;
-	dr_dbeta_eff[1] += tau_bx_r.d_beta_eff_l;
     } else {
 	TauBxJacobian tau_bx_r = get_tau_bx_jac({u_r,v_t,v_tr,v_b,v_br,H_c,H_r,phi_c,phi_r,beta_c,beta_r,m,u_reg,water_drag,flotation_reg_sliding,u_c_c,u_c_r,sliding_law});
 	r[1] += tau_bx_r.res;
@@ -556,7 +501,6 @@ __device__ void build_5x5_vanka(
 	TauByDivaJacobian tau_by_t = get_tau_by_diva_jac(v_t,beta_eff_t,beta_eff_c);
 	r[2]  += tau_by_t.res;
 	J[12] += tau_by_t.d_v;
-	dr_dbeta_eff[2] += tau_by_t.d_beta_eff_b;
     } else {
 	TauByJacobian tau_by_t = get_tau_by_jac({v_t,u_tl,u_tr,u_l,u_r,H_t,H_c,phi_t,phi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding,u_c_t,u_c_c,sliding_law});
 	r[2]  += tau_by_t.res;
@@ -584,7 +528,6 @@ __device__ void build_5x5_vanka(
 	TauByDivaJacobian tau_by_b = get_tau_by_diva_jac(v_b,beta_eff_c,beta_eff_b);
 	r[3]  += tau_by_b.res;
 	J[18] += tau_by_b.d_v;
-	dr_dbeta_eff[3] += tau_by_b.d_beta_eff_t;
     } else {
 	TauByJacobian tau_by_b = get_tau_by_jac({v_b,u_l,u_r,u_bl,u_br,H_c,H_b,phi_c,phi_b,beta_c,beta_b,m,u_reg,water_drag,flotation_reg_sliding,u_c_c,u_c_b,sliding_law});
 	r[3]  += tau_by_b.res;
@@ -663,9 +606,7 @@ __device__ void vanka_smooth_body(
     const float* __restrict__ u_c,
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,     // DIVA only
-    const float* __restrict__ beta_eff,    // DIVA only
-    const float* __restrict__ u_b,         // DIVA only
-    const float* __restrict__ F2,          // DIVA only
+    const float* __restrict__ beta_eff,    // DIVA only: a frozen coefficient, like eta_bar
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
@@ -700,7 +641,6 @@ __device__ void vanka_smooth_body(
 
     if ( is_active ) {
 	float dx_inv = 1.0f/dx;
-	float dr_dbeta_eff[5] = {0};
 
 	float masked = get_cell(mask, i, j, ny, nx);
 	float u_l = get_vfacet(u, i, j, ny, nx);
@@ -725,7 +665,7 @@ __device__ void vanka_smooth_body(
 
 	while (k<newton_steps && rnorm>tol){
 
-	    build_5x5_vanka<DIVA>(J, r, dr_dbeta_eff,
+	    build_5x5_vanka<DIVA>(J, r,
 		    u_l, u_r, v_t, v_b, H_c,
 		    u, v, H, eta_local, phi,
                     bed, B, beta, u_c, beta_eff, gamma,
@@ -739,62 +679,6 @@ __device__ void vanka_smooth_body(
 	    r[2] -= get_hfacet(f_v,i,j,ny,nx);
 	    r[3] -= get_hfacet(f_v,i+1,j,ny,nx);
 	    r[4] -= get_hfacet(f_H,i,j,ny,nx);
-
-	    if (DIVA) {
-		// Augmented basal-speed unknown, eliminated exactly.  Carrying U_b as a
-		// sixth unknown gives the local system
-		//     [ A    b ] [ du   ]   [ r    ]
-		//     [ c^T  d ] [ dU_b ] = [ r_Ub ] ,
-		// whose (2,2) block is the scalar d = dR_Ub/dU_b = 1 + f'(U_b)*F2 >= 1.
-		// Being 1x1 and never singular, U_b can be condensed out analytically:
-		//     (A - b c^T/d) du = r - b*r_Ub/d,
-		// which is algebraically identical to solving the 6x6 but leaves the 5x5
-		// layout (and lu_5x5_solve) untouched.  This is what upgrades the secant
-		// drag that build_5x5_vanka assembled into the tangent the Newton step
-		// needs -- the two differ for any nonlinear sliding law.
-		//
-		// U_b itself is not updated here: compute_diva_coeffs re-solves the closure
-		// exactly before the next sweep, which is at least as good as taking one
-		// Newton step on it.
-		float phi_cc  = get_cell(phi,i,j,ny,nx);
-		float U_b_c   = get_cell(u_b,i,j,ny,nx);
-		float F2_c    = get_cell(F2,i,j,ny,nx);
-		float beta_g  = get_cell(beta,i,j,ny,nx)*phi_cc;
-		float u_c_cc  = get_cell(u_c,i,j,ny,nx);
-
-		DualFloat coeff = get_diva_drag_coeff({U_b_c,1.0f},beta_g,m,u_reg,water_drag,u_c_cc,sliding_law);
-		DualFloat f_b   = coeff * DualFloat{U_b_c,1.0f};       // f = c*U, f' = f_b.d
-		float d_diag    = 1.0f + f_b.d*F2_c;
-
-		float dbe = get_diva_dbeta_eff_du_b(U_b_c,F2_c,beta_g,m,u_reg,water_drag,u_c_cc,sliding_law);
-
-		float u_ctr = 0.5f*(u_l + u_r);
-		float v_ctr = 0.5f*(v_t + v_b);
-		float U_bar = sqrtf(u_ctr*u_ctr + v_ctr*v_ctr);
-		float inv_U = U_bar > 1e-6f ? 1.0f/U_bar : 0.0f;
-
-		// b = dr/dU_b, through beta_eff of this cell.
-		float bvec[5];
-		for (int a=0;a<4;a++) bvec[a] = dr_dbeta_eff[a]*dbe;
-		bvec[4] = 0.0f;
-
-		// c = dR_Ub/d(unknowns), through U_bar = |ubar|.  F2 is held fixed with
-		// respect to H inside the block, consistent with the lagged viscosity.
-		float cvec[5];
-		cvec[0] = -0.5f*u_ctr*inv_U;
-		cvec[1] = cvec[0];
-		cvec[2] = -0.5f*v_ctr*inv_U;
-		cvec[3] = cvec[2];
-		cvec[4] = 0.0f;
-
-		float r_Ub  = U_b_c + f_b.v*F2_c - U_bar;
-		float inv_d = 1.0f/d_diag;
-
-		for (int a=0;a<5;a++) {
-		    r[a] -= bvec[a]*r_Ub*inv_d;
-		    for (int b2=0;b2<5;b2++) J[a*5 + b2] -= bvec[a]*cvec[b2]*inv_d;
-		}
-	    }
 
 	    // Diagonal damping.  Note the SIGNS differ because the diagonals do: the
 	    // momentum diagonals are negative (drag resists), the mass diagonal is +1/dt.
@@ -943,7 +827,7 @@ void vanka_smooth(
     )
 {
     vanka_smooth_body<false>(delta_u,delta_v,delta_H,mask,u,v,H,phi,f_u,f_v,f_H,
-	    bed,B,beta,u_c,gamma,nullptr,nullptr,nullptr,nullptr,
+	    bed,B,beta,u_c,gamma,nullptr,nullptr,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
@@ -970,8 +854,6 @@ void vanka_smooth_diva(
     const float* __restrict__ gamma,
     const float* __restrict__ eta_bar,
     const float* __restrict__ beta_eff,
-    const float* __restrict__ u_b,
-    const float* __restrict__ F2,
     float n, float eps_reg, float flotation_reg_driving,
     float m, float u_reg, float water_drag, float flotation_reg_sliding, float sliding_law,
     float calving_rate, float flotation_reg_calving,
@@ -982,7 +864,7 @@ void vanka_smooth_diva(
     )
 {
     vanka_smooth_body<true>(delta_u,delta_v,delta_H,mask,u,v,H,phi,f_u,f_v,f_H,
-	    bed,B,beta,u_c,gamma,eta_bar,beta_eff,u_b,F2,
+	    bed,B,beta,u_c,gamma,eta_bar,beta_eff,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
@@ -990,18 +872,15 @@ void vanka_smooth_diva(
 }
 
 // Shared body for the SSA and DIVA adjoint smoothers.  For DIVA the block assembled here
-// is the *uncondensed* one, i.e. the frozen-coefficient block: it omits the closure path,
-// which is exactly what the rank-1 condensation in the forward smoother encodes, so there
-// is nothing to condense.
+// is the frozen-coefficient one: eta_bar and beta_eff enter as lagged coefficients and the
+// closure path is not represented -- the same contract the FORWARD smoother has.
 //
 // That is a deliberate choice, not a missing piece.  The exact closure and d(eta_bar)/du
 // paths DO exist -- they are in the VJP (see the note at the top of vjp_body in
 // residuals.cu), which is what defines the operator being solved.  The smoother only has
 // to PRECONDITION that operator, and the frozen block does so well: the adjoint V-cycles
 // converge to 1.0e-6, the same as SSA, whose VJP likewise carries d(eta)/du while its
-// smoother does not.  Making the smoother exact would mean transposing the condensed block,
-// (A - b c^T/d)^T, i.e. b and c swapping roles before the transpose below -- available if
-// convergence ever demands it, but it does not.
+// smoother does not.
 template <bool DIVA>
 __device__ void vanka_smooth_adjoint_body(
     float* __restrict__ lambda_u_out,
@@ -1027,7 +906,14 @@ __device__ void vanka_smooth_adjoint_body(
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo,
-    float ssa_damping, float mc_damping
+    float ssa_damping, float mc_damping,
+    const float* __restrict__ deta_deps,   // DIVA closure derivatives; used only when
+    const float* __restrict__ deta_dU,     // closure_block > 0
+    const float* __restrict__ dbe_deps,
+    const float* __restrict__ dbe_dU,
+    const float* __restrict__ deta_dH,
+    const float* __restrict__ dbe_dH,
+    float closure_block
     ) 
 {
     const int bny = 16;
@@ -1069,8 +955,7 @@ __device__ void vanka_smooth_adjoint_body(
 	float rhs[5] = {0};
 	// Note that the adjoint assembles a forward problem rhs, but it's 
 	// discarded.  
-	float dr_dbeta_eff[5] = {0};        // populated for DIVA but unused: no condensation here
-	build_5x5_vanka<DIVA>(J, rhs, dr_dbeta_eff,
+	build_5x5_vanka<DIVA>(J, rhs,
 		u_l, u_r, v_t, v_b, H_c,
 		u, v, H, eta_local, phi,
 		bed, B, beta, u_c, beta_eff, gamma,
@@ -1127,6 +1012,77 @@ __device__ void vanka_smooth_adjoint_body(
 	    rhs[4] = 0.0f;
 	} 
 
+	// ---- optional: represent the CLOSURE PATH in the block ----------------------
+	// The operator this smoother preconditions is
+	//     (dr/dx|_C + (dr/dC)(dC/dx))^T ,
+	// while the block above is only the first term -- eta_bar and beta_eff enter it
+	// as frozen coefficients.  That omitted term is the one Goldberg's self-adjointness
+	// argument explicitly excludes ("ignoring dependence of viscosity on strain rate"),
+	// and measured on the velocity block it is the whole of DIVA's asymmetry: frozen,
+	// the operator is symmetric to 2.3e-07; with the closure path, 6.3e-03.
+	//
+	// Restricted to the cell's own unknowns it is a rank-2 update,
+	//     dJ[a][j] = (dr_a/d(eta_bar_c)) * (d(eta_bar_c)/dx_j)
+	//              + (dr_a/d(beta_eff_c)) * (d(beta_eff_c)/dx_j) ,
+	// with the closure derivatives already stored by compute_diva_derivs and the input
+	// partials from diva_cell_own_partials.  Cross-cell coefficient coupling is dropped,
+	// as every other off-block term is -- this is a block smoother.
+	if (DIVA && closure_block != 0.0f) {
+	    float dq1[4], dq2[4];
+	    diva_cell_own_partials(i, j, u, v, dx, ny, nx, dq1, dq2);
+
+	    float de_eps = get_cell(deta_deps, i, j, ny, nx);
+	    float de_dU  = get_cell(deta_dU,   i, j, ny, nx);
+	    float db_eps = get_cell(dbe_deps,  i, j, ny, nx);
+	    float db_dU  = get_cell(dbe_dU,    i, j, ny, nx);
+	    float de_dH  = get_cell(deta_dH,   i, j, ny, nx);
+	    float db_dH  = get_cell(dbe_dH,    i, j, ny, nx);
+
+	    // c-vectors: how this cell's two coefficients move with its own five unknowns.
+	    float c_eta[5], c_be[5];
+	    for (int k = 0; k < 4; ++k) {
+		c_eta[k] = de_eps*dq1[k] + de_dU*dq2[k];
+		c_be[k]  = db_eps*dq1[k] + db_dU*dq2[k];
+	    }
+	    c_eta[4] = de_dH;      // thickness enters the closure directly
+	    c_be[4]  = db_dH;
+
+	    // b-vectors: how the five rows respond to this cell's coefficients.
+	    // beta_eff: the drag term of each momentum row averages the two cells sharing
+	    // the facet, so this cell contributes -u/2 to each of its four facets.
+	    float b_be[5] = {-0.5f*u_l, -0.5f*u_r, -0.5f*v_t, -0.5f*v_b, 0.0f};
+
+	    // eta_bar: through the cell's own normal stress and the four corner shears.
+	    // d(sigma)/d(eta*H) is 2*eps, and eta*H at a vertex averages four cells, hence
+	    // the H_c/4.  Signs follow residual_body's assembly of each row.
+	    float dx_inv2 = 1.0f/dx;
+	    float eps_xx = (2.0f*(u_r - u_l) + (v_t - v_b))*dx_inv2;
+	    float eps_yy = (2.0f*(v_t - v_b) + (u_r - u_l))*dx_inv2;
+	    float qH = 0.25f*H_c;
+	    float e_tl2 = 0.5f*((get_vfacet(u,i-1,j,ny,nx) - u_l)*dx_inv2
+			      + (v_t - get_hfacet(v,i,j-1,ny,nx))*dx_inv2);
+	    float e_tr2 = 0.5f*((get_vfacet(u,i-1,j+1,ny,nx) - u_r)*dx_inv2
+			      + (get_hfacet(v,i,j+1,ny,nx) - v_t)*dx_inv2);
+	    float e_bl2 = 0.5f*((u_l - get_vfacet(u,i+1,j,ny,nx))*dx_inv2
+			      + (v_b - get_hfacet(v,i+1,j-1,ny,nx))*dx_inv2);
+	    float e_br2 = 0.5f*((u_r - get_vfacet(u,i+1,j+1,ny,nx))*dx_inv2
+			      + (get_hfacet(v,i+1,j+1,ny,nx) - v_b)*dx_inv2);
+	    float sxx = 2.0f*eps_xx*H_c*dx_inv2;      // d(sigma_xx/dx)/d(eta_bar_c)
+	    float syy = 2.0f*eps_yy*H_c*dx_inv2;
+	    float stl = 2.0f*e_tl2*qH*dx_inv2, str_ = 2.0f*e_tr2*qH*dx_inv2;
+	    float sbl = 2.0f*e_bl2*qH*dx_inv2, sbr = 2.0f*e_br2*qH*dx_inv2;
+	    float b_eta[5];
+	    b_eta[0] =  sxx + stl - sbl;      // r_u, left facet
+	    b_eta[1] = -sxx + str_ - sbr;     // r_u, right facet
+	    b_eta[2] = -syy - stl + str_;     // r_v, top facet
+	    b_eta[3] =  syy - sbl + sbr;      // r_v, bottom facet
+	    b_eta[4] =  0.0f;                 // the mass row reads no coefficient
+
+	    for (int a = 0; a < 5; ++a)
+		for (int c2 = 0; c2 < 5; ++c2)
+		    J[a*5 + c2] += closure_block*(b_eta[a]*c_eta[c2] + b_be[a]*c_be[c2]);
+	}
+
         // The adjoint block is the literal transpose of the forward block.  Forming it
         // explicitly (rather than assuming symmetry) is what lets the same lu_5x5_solve
         // serve both, and it keeps the smoother honest for the terms that are genuinely
@@ -1182,7 +1138,8 @@ void vanka_smooth_adjoint(
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
-	    ssa_damping,mc_damping);
+	    ssa_damping,mc_damping,
+	    nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,0.0f);
 }
 
 extern "C" __global__
@@ -1210,14 +1167,22 @@ void vanka_smooth_adjoint_diva(
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
     int ny, int nx, int stride, int halo,
-    float ssa_damping, float mc_damping
+    float ssa_damping, float mc_damping,
+    const float* __restrict__ deta_deps,   // DIVA closure derivatives; used only when
+    const float* __restrict__ deta_dU,     // closure_block > 0
+    const float* __restrict__ dbe_deps,
+    const float* __restrict__ dbe_dU,
+    const float* __restrict__ deta_dH,
+    const float* __restrict__ dbe_dH,
+    float closure_block
     ) {
     vanka_smooth_adjoint_body<true>(lambda_u_out,lambda_v_out,lambda_H_out,u,v,H,phi,mask,
 	    r_adj_u,r_adj_v,r_adj_H,bed,B,beta,u_c,gamma,eta_bar,beta_eff,
 	    n,eps_reg,flotation_reg_driving,
 	    m,u_reg,water_drag,flotation_reg_sliding,sliding_law,
 	    calving_rate,flotation_reg_calving,dx,dt,ny,nx,stride,halo,
-	    ssa_damping,mc_damping);
+	    ssa_damping,mc_damping,
+	    deta_deps,deta_dU,dbe_deps,dbe_dU,deta_dH,dbe_dH,closure_block);
 }
 
 // Debug/verification hook: assemble the local blocks and copy them out to host arrays
@@ -1276,7 +1241,7 @@ void vanka_dump(
 	float J[25] = {0};
         float r[5] = {0};
 
-        build_5x5_vanka<false>(J, r, nullptr,
+        build_5x5_vanka<false>(J, r,
 	    u_l, u_r, v_t, v_b, H_c,
 	    u, v, H, eta_local, phi,
 	    bed, B, beta, u_c, nullptr, gamma,

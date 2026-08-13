@@ -60,3 +60,13 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Inversion run outputs: figures and beta fields are regenerable from the scripts
+# (plot_saved_beta.py re-renders any saved beta with one forward solve), and a single
+# level-0 beta_opt.nc is 20 MB.
+examples/surface-inverse/inverse_*/
+examples/surface-inverse/forward_*/
+examples/surface-inverse/benchmark_*/
+# The dataset loader caches into ./data relative to the CWD; the workspace copy at
+# glide-ism/data is the one to use.
+examples/surface-inverse/data/

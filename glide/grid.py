@@ -82,6 +82,9 @@ class Rheology:
     dus_dbeta: Field | None = None
     dus_duc: Field | None = None
     dus_dm: Field | None = None
+    deta_dH: Field | None = None      # closure derivatives w.r.t. THICKNESS: these are
+    dbe_dH: Field | None = None       # state derivatives, not parameter ones, and they
+    dus_dH: Field | None = None       # complete the coupled (u,v,H) linearization
     deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)   -- for the parameter gradients
     dbe_dbeta: Field | None = None    # d(beta_eff)/d(beta)
     deta_duc: Field | None = None     # d(eta_bar)/d(u_c)    -- zero under Weertman
@@ -101,6 +104,16 @@ class Rheology:
             name='eps_reg',
             units='s^{-2}',
             attrs={'long_name':'Strain invariant squared regularizer'})
+        )
+    eps_reg_shear: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(1e-12),
+            name='eps_reg_shear',
+            units='s^{-2}',
+            attrs={'long_name':'''DIVA-only strain-invariant regularizer for the SHEAR MOMENTS
+                         F1 and F2.  Much smaller than eps_reg because those integrals converge
+                         as it goes to zero, while eta_bar (which keeps eps_reg, applied as a
+                         cap) does not.  See notes/diva_numerics.md 3.2.'''})
         )
     stress_balance: Constant = field(
         default_factory = lambda: Constant(
@@ -467,6 +480,9 @@ class Grid:
                 dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'),
                 deta_duc=_cell('deta_duc','?','DIVA d(eta_bar)/d(u_c)'),
                 dbe_duc=_cell('dbe_duc','?','DIVA d(beta_eff)/d(u_c)'),
+                deta_dH=_cell('deta_dH','Pa a m^{-1}','DIVA d(eta_bar)/d(H)'),
+                dbe_dH=_cell('dbe_dH','?','DIVA d(beta_eff)/d(H)'),
+                dus_dH=_cell('dus_dH','a^{-1}','DIVA d(u_s)/d(H)'),
                 deta_dm=_cell('deta_dm','?','DIVA d(eta_bar)/d(m)'),
                 dbe_dm=_cell('dbe_dm','?','DIVA d(beta_eff)/d(m)'))
 

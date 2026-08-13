@@ -77,7 +77,7 @@ class ForwardOperators:
         The integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) where the shear
         dominates, so they behave like polynomials of degree n and n+1 -- which Gauss-Legendre
         integrates EXACTLY with ceil((n+2)/2) nodes.  Midpoint quadrature is only second order
-        and needed 32+ nodes for what 4 Gauss nodes deliver; see notes/diva_numerics.md 5.10.
+        and needed 32+ nodes for what 4 Gauss nodes deliver; see notes/diva_numerics.md 3.1.
 
         Built on the host by numpy, so any n_sigma works with no table in the kernel, and cached
         because it changes only if n_sigma does.  Weights are scaled to sum to 1, so the eta
@@ -213,7 +213,8 @@ class ForwardOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
-                *((int(rheology.n_sigma.value), *self._quadrature()) if diva else ()),
+                *((int(rheology.n_sigma.value), *self._quadrature(),
+                   rheology.eps_reg_shear.value) if diva else ()),
                 grid.ny, grid.nx, stride, halo)) 
 
     def compute_phi(self, relaxation=cp.float32(0.0)):
@@ -252,7 +253,8 @@ class ForwardOperators:
                     rheology.B.data, sliding.beta.data, sliding.u_c.data,
                     sliding.m.value, sliding.u_reg.value,
                     sliding.water_drag.value, sliding.sliding_law.value,
-                    rheology.n.value, rheology.eps_reg.value, grid.dx,
+                    rheology.n.value, rheology.eps_reg.value,
+                    rheology.eps_reg_shear.value, grid.dx,
                     int(rheology.n_sigma.value),
                     grid.ny, grid.nx,
                     stride, halo))
@@ -324,11 +326,13 @@ class ForwardOperators:
                     rheology.deta_dm.data, rheology.dbe_dm.data,
                     rheology.dus_deps.data, rheology.dus_dU.data,
                     rheology.dus_dbeta.data, rheology.dus_duc.data, rheology.dus_dm.data,
+                    rheology.deta_dH.data, rheology.dbe_dH.data, rheology.dus_dH.data,
                     state.u.data, state.v.data, state.H.data, state.phi.data,
                     rheology.B.data, sliding.beta.data, sliding.u_c.data, state.u_b.data,
                     sliding.m.value, sliding.u_reg.value,
                     sliding.water_drag.value, sliding.sliding_law.value,
-                    rheology.n.value, rheology.eps_reg.value, grid.dx,
+                    rheology.n.value, rheology.eps_reg.value,
+                    rheology.eps_reg_shear.value, grid.dx,
                     int(rheology.n_sigma.value),
                     *self._quadrature(),
                     grid.ny, grid.nx,
@@ -375,8 +379,9 @@ class ForwardOperators:
                 geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data,
                 self.gamma)
         if diva:
-            args += (rheology.eta_bar.data, sliding.beta_eff.data,
-                     state.u_b.data, rheology.F2.data)
+            # Two frozen coefficients and nothing else: U_b and F2 are not the block's
+            # business, so the smoother is not given them (notes/diva_numerics.md 5.2).
+            args += (rheology.eta_bar.data, sliding.beta_eff.data)
         args += (rheology.n.value, rheology.eps_reg.value, 
                 geometry.sigmoid_c.value,
                 sliding.m.value, sliding.u_reg.value, 
@@ -390,7 +395,6 @@ class ForwardOperators:
                 self.vanka_config.newton_config.relaxation,
                 self.vanka_config.newton_config.ssa_damping,
                 self.vanka_config.newton_config.mc_damping)
-
         kernel(grid_size, block_size, args)
 
     def vanka_sweep(self, dt, n_iter, 
@@ -474,6 +478,59 @@ class NewtonConfig:
 @dataclass
 class VankaConfig:
     omega: cp.float32 = cp.float32(0.5)
+    # ADJOINT + DIVA only: the under-relaxation applied to the adjoint smoother when
+    # DIVA is active.  It is NOT the same as `omega` because the requirement is not the
+    # same: SSA's adjoint operator is self-adjoint (its residual is the gradient of an
+    # action functional, viscosity dependence included), so omega = 0.5 is safe by the
+    # standard SPD argument.  DIVA's is not -- the closure path (dr/dC)(dC/dx) is
+    # asymmetric, and Goldberg's self-adjointness claim explicitly excludes exactly that
+    # term ("ignoring dependence of viscosity on strain rate").  Measured on the velocity
+    # block: frozen, DIVA is symmetric to 2.3e-07; with the closure path, 6.3e-03.
+    #
+    # Losing symmetry removes the a priori bound on omega, not convergence itself: the
+    # preconditioned spectrum stays in the right half plane, so a small enough step
+    # converges -- it just has to be found by measurement.  Amplification of a random
+    # adjoint field at a restricted state (the off-equilibrium state a V-cycle hands its
+    # coarse levels), over 150 sweeps:
+    #
+    #     omega   0.5     0.3     0.2     0.15    0.1     0.05
+    #     |lam|   1.1e10  2.7e05  9.8e02  55      3.0     0.66
+    #
+    # A V-cycle applies at most pre_steps + post_steps sweeps to a level, so with the
+    # default 10 + 20 the relevant column is 30-60 sweeps, where 0.15 is still
+    # contracting (0.68) with room to spare.
+    #
+    # DEFAULT 0.5 ANYWAY, i.e. no under-relaxation.  Lowering it globally is not a usable
+    # trade: measured on a well-conditioned idealized case, the adjoint reaches 1e-6 in
+    #
+    #     omega        0.5     0.3     0.15
+    #     V-cycles     2       >200    >200
+    #
+    # Under-relaxing every sweep cripples the multigrid convergence that makes the solve
+    # cheap in the first place, and the instability it guards against appears only at
+    # fine resolution on real geometry with off-equilibrium (restricted) states.  Paying
+    # 100x on every problem to protect against that is the wrong bargain.
+    #
+    # Use this knob when you hit the instability -- the table above says which value --
+    # and prefer capping the adjoint's post_steps (30 is verified on Greenland), which
+    # costs nothing on problems that converge in one or two cycles.  The principled fix
+    # is adaptive: back omega off only when a V-cycle increases the residual.  See
+    # notes/diva_numerics.md 5.3.
+    diva_omega: cp.float32 = cp.float32(0.5)
+    # ADJOINT + DIVA only: sweeps between growth checks in the smoother, 0 to disable.
+    # A smoother that is INCREASING the residual is doing nothing useful, so stop.  This
+    # exploits the timescale separation that makes DIVA's instability tractable: the
+    # modes a smoother exists to kill die in the first ~10 sweeps, while the growing mode
+    # an off-equilibrium state introduces needs ~20-30 to emerge (|lam|/|lam0| runs
+    # 0.85, 0.67, 1.98, 518 at 1, 10, 30, 60 sweeps).  Checking every few sweeps catches
+    # it early and costs nothing when nothing is wrong -- unlike under-relaxation, which
+    # slows every mode to tame one.  See notes/diva_numerics.md 5.3.
+    smoother_growth_check: int = 5
+    # ADJOINT + DIVA only. 1.0 makes the smoother's block represent the closure path
+    # (dr/dC)(dC/dx) that the frozen block omits -- the term Goldberg's self-adjointness
+    # argument excludes, and the whole of DIVA's velocity-block asymmetry. 0.0 (default)
+    # leaves the frozen block. Preconditioner only. See notes/diva_numerics.md 5.4.
+    diva_adjoint_closure_block: cp.float32 = cp.float32(0.0)
     newton_config: NewtonConfig = field(default_factory = lambda: NewtonConfig())
     relax_phi: cp.float32 = cp.float32(0.0)
     hook_interval: int = 1
@@ -595,14 +652,14 @@ class AdjointOperators:
                 grid.ny, grid.nx, stride, halo)) 
 
         if diva_exact:
-            self._apply_diva_coeff_adjoints(self.r_u, self.r_v)
+            self._apply_diva_coeff_adjoints(self.r_u, self.r_v, self.r_H)
 
         if return_norms:
             return cp.linalg.norm(self.r_u),cp.linalg.norm(self.r_v),cp.linalg.norm(self.r_H)
 
 
 
-    def _apply_diva_coeff_adjoints(self, out_u, out_v):
+    def _apply_diva_coeff_adjoints(self, out_u, out_v, out_H):
         """Second half of the DIVA transpose.  vjp_body pushes
         lambda_row * d(r_row)/d(coefficient) onto the owning cell, filling W_eta and
         W_be; this converts those per-cell coefficient adjoints into velocity
@@ -620,11 +677,12 @@ class AdjointOperators:
         grid.forward_operators.compute_diva_derivs()
 
         kernel(grid_size, block_size,
-               (out_u, out_v,
+               (out_u, out_v, out_H,
                 grid.state.u.data, grid.state.v.data,
                 self.W_eta, self.W_be,
                 rheology.deta_deps.data, rheology.deta_dU.data,
                 rheology.dbe_deps.data, rheology.dbe_dU.data,
+                rheology.deta_dH.data, rheology.dbe_dH.data,
                 grid.dx,
                 grid.ny, grid.nx, stride, halo))
 
@@ -684,7 +742,7 @@ class AdjointOperators:
                 grid.ny, grid.nx, stride, halo)) 
 
         if diva_exact:
-            self._apply_diva_coeff_adjoints(self.vjp_u, self.vjp_v)
+            self._apply_diva_coeff_adjoints(self.vjp_u, self.vjp_v, self.vjp_H)
 
 
     def vanka_smooth(self, dt,
@@ -711,37 +769,60 @@ class AdjointOperators:
         self.delta_lambda_u.fill(0.0)
         self.delta_lambda_v.fill(0.0)
         self.delta_lambda_H.fill(0.0)
-        kernel(grid_size, block_size,
-               (self.delta_lambda_u, self.delta_lambda_v, self.delta_lambda_H, 
-                state.u.data, state.v.data, state.H.data, 
+        args = (self.delta_lambda_u, self.delta_lambda_v, self.delta_lambda_H,
+                state.u.data, state.v.data, state.H.data,
                 state.phi.data, state.mask.data,
                 self.r_u, self.r_v, self.r_H,
-                geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data, 
+                geometry.bed.data, rheology.B.data, sliding.beta.data, sliding.u_c.data,
                 self.gamma,
                 *((rheology.eta_bar.data, sliding.beta_eff.data) if diva else ()),
-                rheology.n.value, rheology.eps_reg.value, 
+                rheology.n.value, rheology.eps_reg.value,
                 geometry.sigmoid_c.value,
-                sliding.m.value, sliding.u_reg.value, 
-                sliding.water_drag.value, 
+                sliding.m.value, sliding.u_reg.value,
+                sliding.water_drag.value,
                 sliding.flotation_reg_sliding.value, sliding.sliding_law.value,
-                calving_rate, 
+                calving_rate,
                 calving.flotation_reg_calving.value,
                 grid.dx, dt,
                 grid.ny, grid.nx, stride, halo,
                 self.vanka_config.newton_config.ssa_damping,
                 self.vanka_config.newton_config.mc_damping)
-        )
+        if diva:
+            # The closure derivatives the block needs when it represents the closure path.
+            args += (rheology.deta_deps.data, rheology.deta_dU.data,
+                     rheology.dbe_deps.data, rheology.dbe_dU.data,
+                     rheology.deta_dH.data, rheology.dbe_dH.data,
+                     cp.float32(self.vanka_config.diva_adjoint_closure_block))
 
-    def vanka_sweep(self, dt, n_iter, 
+        kernel(grid_size, block_size, args)
+
+    def vanka_sweep(self, dt, n_iter,
             freeze_calving=False):
+        # DIVA's adjoint operator is not self-adjoint, so it does not inherit SSA's
+        # a priori safe step; see VankaConfig.diva_omega for the measurement.
+        diva = float(self.grid.rheology.stress_balance.value) > 0.5
+        omega = self.vanka_config.diva_omega if diva else self.vanka_config.omega
+        check = int(self.vanka_config.smoother_growth_check) if diva else 0
+        prev = None
         for i in range(n_iter):
-            self.compute_residual(dt,freeze_calving=freeze_calving)
+            measure = check > 0 and (i % check) == 0
+            norms = self.compute_residual(dt,freeze_calving=freeze_calving,
+                                          return_norms=measure)
+            if measure:
+                nrm = float(cp.sqrt(sum(n*n for n in norms)))
+                # Stop as soon as smoothing stops helping.  Not a tolerance: the smoother
+                # is only asked to reduce the residual, and one that is raising it will go
+                # on raising it -- the growth is a fixed eigenmode of a linear iteration,
+                # not a transient.
+                if prev is not None and not (nrm < prev):
+                    break
+                prev = nrm
             self.vanka_smooth(dt,freeze_calving=freeze_calving)
-            self.grid.adjoint.lambda_u.data[:] -= self.vanka_config.omega * self.delta_lambda_u
-            self.grid.adjoint.lambda_v.data[:] -= self.vanka_config.omega * self.delta_lambda_v
-            self.grid.adjoint.lambda_H.data[:] -= self.vanka_config.omega * self.delta_lambda_H
+            self.grid.adjoint.lambda_u.data[:] -= omega * self.delta_lambda_u
+            self.grid.adjoint.lambda_v.data[:] -= omega * self.delta_lambda_v
+            self.grid.adjoint.lambda_H.data[:] -= omega * self.delta_lambda_H
 
-    def diva_surface_misfit_rhs(self, cot, out_u=None, out_v=None):
+    def diva_surface_misfit_rhs(self, cot, out_u=None, out_v=None, out_H=None):
         """Adjoint right-hand side for an objective built on SURFACE velocity.
 
         Given the per-cell cotangent ``cot = dJ/d(u_s)``, returns ``(f_u, f_v) = -dJ/d(u,v)``,
@@ -751,7 +832,7 @@ class AdjointOperators:
         but use ``ubar`` as the counterpart.  That is exact for SSA, where the two coincide.
         Under DIVA they differ by the vertical shear -- ~6% on ISMIP-HOM C and much more in slow
         interior ice -- so an inversion that ignores it is systematically biased.  See
-        notes/diva_numerics.md 5.10b.
+        notes/diva_numerics.md 5.6.
 
         Under SSA this is a no-op and returns None: there is no shear, u_s is ubar, and the
         caller should build the right-hand side from the depth-averaged misfit directly.
@@ -761,8 +842,12 @@ class AdjointOperators:
         grid = self.grid
         if out_u is None:
             out_u, out_v = self.f_u, self.f_v
+            if out_H is None:
+                out_H = self.f_H
         out_u.fill(0)
         out_v.fill(0)
+        if out_H is not None:
+            out_H.fill(0)
 
         # dus_* must correspond to the current state, and they are written by the forward
         # operators' derivative kernel.
@@ -771,13 +856,16 @@ class AdjointOperators:
         kernel = self.kernels.get_function('compute_diva_us_vjp')
         grid_size, block_size, stride, halo = self._kernel_config
         kernel(grid_size, block_size,
-               (out_u, out_v,
+               (out_u, out_v, out_H,
                 grid.state.u.data, grid.state.v.data,
                 cot, grid.rheology.dus_deps.data, grid.rheology.dus_dU.data,
+                grid.rheology.dus_dH.data,
                 grid.dx, grid.ny, grid.nx, stride, halo))
         # f = -dJ/dx
         out_u *= -1.0
         out_v *= -1.0
+        if out_H is not None:
+            out_H *= -1.0
         return out_u, out_v
 
     def diva_surface_param_gradient(self, cot, param):

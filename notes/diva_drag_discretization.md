@@ -7,12 +7,21 @@ term recurs below. The punchline: stock DIVA is the **mass-lumped** discretizati
 **consistent** one, and that single quadrature choice is the entire origin of stock DIVA's
 non-self-adjointness.*
 
+> **Status in this tree.** The shipped branch implements a single basal-drag discretization —
+> the mass-lumped `get_tau_bx_diva_jac`/`get_tau_by_diva_jac` (`stress.cu`). The consistent
+> `variational_drag`/DIVA-A path this note contrasts it against was **not ported**. Self-adjointness
+> in the shipped code is verified directly (`tests/diva_selfadjoint_test.py`, round-off at every $m$)
+> and comes from the **sum-of-squares** $\bar U=\sqrt{\tfrac12(u_\ell^2+u_r^2)+\tfrac12(v_t^2+v_b^2)}$
+> in $\beta_{\mathrm{eff}}$'s argument, a mechanism separate from the lumped-vs-consistent quadrature
+> choice analysed below; read this note as the finite-element background, not as a description of two
+> live code paths.
+
 Companion notes:
 
 - [stress_balance_variational_structure.md](/home/bizon/glaciers/notes/stress_balance_variational_structure.md)
   — why DIVA's Jacobian is non-symmetric while SSA/MOLHO are self-adjoint; the variational anchor and
   the "closure path" framing this note refines.
-- [diva_column_energy_derivation.md](/home/bizon/glaciers/notes/diva_column_energy_derivation.md)
+- [diva_column_energy_derivation.md](diva_column_energy_derivation.md)
   — DIVA as the condensation of a per-column dissipation potential $\Phi$; source of "residual $=\nabla\Phi$".
 - [variational_condensation_primer.md](/home/bizon/glaciers/notes/variational_condensation_primer.md)
   — functional / self-adjoint / condensation / Schur complement from the ground up.
@@ -214,8 +223,9 @@ The drag on facet $f$ now depends only on $u_f$ (diagonal). This is literally th
 consistent form: sending $\bar u_\ell,\bar u_c\to u_f$ collapses
 $\tfrac12(\beta_\ell\bar u_\ell+\beta_c\bar u_c)\to\tfrac12(\beta_\ell+\beta_c)u_f$.
 
-These two expressions are exactly GLIDE's DIVA-A drag (`variational_drag` branch) and stock DIVA drag
-(`get_tau_bx_diva_jac`, which returns $-\tfrac12(\beta_{\mathrm{eff},\ell}+\beta_{\mathrm{eff},c})u_f$).
+These two expressions are the *consistent* (DIVA-A) drag — a theoretical alternative, **not present in
+this tree** — and the *mass-lumped* drag GLIDE actually uses, `get_tau_bx_diva_jac` (`stress.cu`), which
+returns $-\tfrac12(\beta_{\mathrm{eff},\ell}+\beta_{\mathrm{eff},c})u_f$.
 
 ---
 

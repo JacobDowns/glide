@@ -112,9 +112,9 @@ All three are **closed-form via the implicit function theorem** at the converged
 
 GLIDE's nonlinear solve is a tripartite pattern, and DIVA slots into it rather than replacing it — mirroring Goldberg's own "iteration on viscosity" scheme (eqs 41–44: diagnose $\bar\eta,\omega,\beta_{\mathrm{eff}}$ from the iterate, solve the SSA-sparsity linear system, repeat):
 
-- **Smoother (Vanka block):** viscosity is *frozen* — `build_5x5_vanka` (`vanka.cu:91`) assembles a local Jacobian with $\eta$ as a frozen tile, refreshed between sweeps. This is exactly the level at which Goldberg's self-adjointness holds. DIVA freezes $\beta_{\mathrm{eff}},\bar\eta$ here the same way.
+- **Smoother (Vanka block):** viscosity is *frozen* — `build_9x9_vanka` (`vanka.cu`) assembles a local Jacobian with $\eta$ as a frozen tile, refreshed between sweeps; on the `GLIDE_MOLHO=0` (SSA-shaped) path SSA and DIVA solve the 5-unknown block (no $u_d,v_d$ rows) via the templated `lu_factor<N>`/`lu_solve_factored<N>` with $N=5$. This is exactly the level at which Goldberg's self-adjointness holds. DIVA freezes $\beta_{\mathrm{eff}},\bar\eta$ here the same way.
 - **Residual:** uses the true $\eta$ (and, for DIVA, the true secant $\beta_{\mathrm{eff}}$).
-- **JVP / adjoint:** carries the exact coefficient–velocity coupling via the `DualFloat` dual-number path; $\partial\eta/\partial u$ (and, for DIVA, $\partial\beta_{\mathrm{eff}}/\partial u$) live here, *not* in the smoother. The adjoint solve transposes the local block (`lu_5x5_solve` on $J^{\mathsf T}$, `vanka.cu:800`).
+- **JVP / adjoint:** carries the exact coefficient–velocity coupling via the `DualFloat` dual-number path; $\partial\eta/\partial u$ (and, for DIVA, $\partial\beta_{\mathrm{eff}}/\partial u$) live here, *not* in the smoother. The adjoint solve transposes the same local block ($J^{\mathsf T}$, solved by the same templated `lu_factor<N>`/`lu_solve_factored<N>`).
 
 The DIVA auxiliaries ($\eta_k$ over levels, $U_b$) are **cell-local** — no spatial coupling — so they are eliminated locally, never carried through the multigrid transfer operators.
 
@@ -132,11 +132,11 @@ The local Vanka system grows $5\times5 \to 6\times6$. The existing 5 unknowns ar
 - $\partial R_{U_b}/\partial(u,v\ \text{facets})$ — through $|\bar{\mathbf u}|$.
 - $\partial R_{U_b}/\partial U_b = 1 + f'(U_b)\,F_2$ — the diagonal (always $>0$).
 
-**Write $R_{U_b}$ in dual arithmetic.** Because the closure is *new code we own* (unlike the legacy hand-derived stress Jacobians), express $R_{U_b}$ and $\beta_{\mathrm{eff}}$ with `DualFloat` so their partials — for the 6×6 block **and** the transposed adjoint block — fall out automatically, **for every sliding law $f$**, amortizing the per-law derivation across the Weertman / Coulomb / NN zoo. This is the honest realization of "dualize the local law," and it is what makes the many-laws goal cheap.
+**Write $R_{U_b}$ in dual arithmetic.** Because the closure is *new code we own* (unlike the legacy hand-derived stress Jacobians), express $R_{U_b}$ and $\beta_{\mathrm{eff}}$ with `DualFloat` so their partials fall out automatically, **for every sliding law $f$**, amortizing the per-law derivation across the Weertman / Coulomb / NN zoo. This is the honest realization of "dualize the local law," and it is what makes the many-laws goal cheap.
 
-Cost: extend `DualFloat` (`common.cu:4`, currently `+ − *  /scalar  __powf`) with $\div(\text{dual},\text{dual})$ and $\sqrt{\ }(\text{dual})$ overloads — a few lines each, one-time. Caveat: duals give the *local partials*; the cross-terms still have to be **wired into the 6×6 $J$** (and its transpose) by hand — dualization kills the derivation, not the assembly.
+Cost: extend `DualFloat` (`common.cu`, currently `+ − *  /scalar  __powf`) with $\div(\text{dual},\text{dual})$ and $\sqrt{\ }(\text{dual})$ overloads — a few lines each, one-time. Caveat: duals give the *local partials*; the coefficient–velocity cross-terms still have to be **wired into the JVP and its transpose** by hand — dualization kills the derivation, not the assembly.
 
-The LU solve extension is trivial: `lu_5x5_solve` (Doolittle, no pivot, `vanka.cu:5`) becomes `lu_6x6_solve` by adding one forward/back-substitution row. The block size is the *free* part.
+> **Note — final design.** An earlier sketch carried $U_b$ as a sixth Vanka-block unknown (a $6\times6$ local solve). That was **abandoned**: the drag Newton tangent $\partial\beta_{\mathrm{eff}}/\partial U_b$ is *negative* for a sublinear law and eroded the block diagonal, producing NaNs at $m=1/3$ (see `diva_numerics.md` 5.2 and `tests/diva_smoother_stability_test.py`). In the shipped code $U_b$ is **not** a block unknown — it is diagnosed cell-locally by `compute_diva_coeffs`, and the smoother consumes only the two frozen coefficients $\bar\eta,\beta_{\mathrm{eff}}$. The Vanka block is therefore the same SSA-shaped 5-unknown patch as SSA, solved by the templated `lu_factor<N>`/`lu_solve_factored<N>` (`vanka.cu`) with $N=5$; nothing about it is DIVA-specific.
 
 ## Vertical discretization
 

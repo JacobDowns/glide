@@ -65,7 +65,8 @@ class IceDynamics:
 
     def backward(self,t,dt,dJdu=None,dJdv=None,dJdud=None,dJdvd=None,dJdH=None,dJdu_s=None,
             compute_beta_grad=True,compute_bed_grad=True,
-            compute_H_prev_grad=True,compute_smb_grad=True):
+            compute_H_prev_grad=True,compute_smb_grad=True,
+            compute_uc_grad=False,compute_m_grad=False):
         """Solve the adjoint and reduce it onto the parameter gradients.
 
         ``dJdu``/``dJdv``/``dJdud``/``dJdvd``/``dJdH`` are cotangents on the solved state.
@@ -101,11 +102,19 @@ class IceDynamics:
         ao.compute_gradient_bed()
         ao.compute_gradient_H_prev(dt)
         ao.compute_gradient_smb()
+        # Coulomb threshold u_c and Weertman exponent m are DIVA-only sliding-law parameters
+        # (see AdjointOperators.compute_gradient_{u_c,m}); off by default.
+        if compute_uc_grad: ao.compute_gradient_u_c()
+        if compute_m_grad: ao.compute_gradient_m()
 
         # The explicit parameter dependence of u_s, which only a surface objective has.
         if dJdu_s is not None:
             sliding = self.mg.levels[self.top_level].sliding
             sliding.beta.grad[:] += ao.diva_surface_param_gradient(dJdu_s,'beta')
+            if compute_uc_grad:
+                sliding.u_c.grad[:] += ao.diva_surface_param_gradient(dJdu_s,'u_c')
+            if compute_m_grad:
+                sliding.m.grad = float(sliding.m.grad) + ao.diva_surface_param_gradient(dJdu_s,'m')
 
         return converged
         

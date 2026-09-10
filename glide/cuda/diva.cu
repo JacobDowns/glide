@@ -24,7 +24,7 @@
   so this is a genuine root find for every sliding law, linear included.  It is
   cell-local: Goldberg's eqs 38-39, "solved at a location along the base independently
   of other locations".  No spatial coupling, so no multigrid transfer is involved, and
-  nothing in this file is reached unless stress_balance = 1.
+  nothing in this file is compiled or reached unless GLIDE_DIVA = 1 (stress_scheme='diva').
 
   The full derivation, the convergence analysis and the measurements behind the
   iteration counts are in notes/diva_numerics.md sections 2.5-2.7 and 4.

@@ -4,8 +4,8 @@
 
 Companion notes:
 
--   [diva_drag_discretization.md](/home/bizon/glaciers/notes/diva_drag_discretization.md) — the drag stencil and the C-grid staggering, with figures; consistent-vs-lumped mass in finite-element terms.
--   [diva_column_energy_derivation.md](/home/bizon/glaciers/notes/diva_column_energy_derivation.md) — how the continuum column energy is condensed so that a functional of $\bar{\mathbf u}$ alone remains.
+-   [diva_drag_discretization.md](diva_drag_discretization.md) — the drag stencil and the C-grid staggering, with figures; consistent-vs-lumped mass in finite-element terms.
+-   [diva_column_energy_derivation.md](diva_column_energy_derivation.md) — how the continuum column energy is condensed so that a functional of $\bar{\mathbf u}$ alone remains.
 
 ------------------------------------------------------------------------
 

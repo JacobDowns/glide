@@ -17,13 +17,14 @@ The closure derivatives themselves are checked separately and much more sharply 
 tests/diva_derivs_test.py; what this test adds is that they are contracted with the right
 adjoint-weighted W and assembled into the right thing.
 
-SCOPE (unified tree): only the **beta** (Weertman drag) gradient is exercised here, because
-that is what is wired end-to-end so far.  The u_c (regularized-Coulomb threshold) and m
-(Weertman exponent) parameter gradients are not yet plumbed (no compute_gradient_u_c /
-compute_gradient_m, and u_c is a DIVA-only field), so they are left for the sliding-law-gradient
-work.  The closure's d(.)/d(u_c) and d(.)/d(m) derivative fields are already validated against FD
-in tests/diva_derivs_test.py; restoring the PARAMS entries below will extend this test once the
-adjoint contraction and the SSA controls for those two are in.
+SCOPE (unified tree): beta is checked under BOTH schemes (SSA is the exact-adjoint control).
+u_c and m are checked under DIVA only, against finite differences directly, because this tree
+makes SSA/MOLHO Weertman-only: u_c (the regularized-Coulomb threshold) exists solely as a DIVA
+field, and the SSA Weertman-exponent gradient kernel is not ported.  There is therefore no SSA
+control for those two -- but the beta case has already established that the FD harness is sound,
+so FD is a trustworthy reference on its own.  All three DIVA gradients flow through the same
+cell-local closure contraction (compute_gradient_{beta,u_c,m} -> _diva_param_gradient), whose
+per-parameter closure derivatives are validated much more sharply in tests/diva_derivs_test.py.
 
 Unlike tests/grad_test.py the perturbation direction is **seeded**, the forward solves are
 cold-started and converged, and per-cell directions are masked to the interior so the
@@ -51,15 +52,18 @@ SEED = 12345
 
 U_C_0 = 100.0
 M_0 = 1.0
+# beta doubles as tau_max in Coulomb mode, so it is scaled there to give a comparable drag
+# magnitude at these speeds (tau_max ~ beta*(|u| + u_c)).
+COULOMB_BETA_SCALE = 120.0
 
-# The FD error is NOT monotonic in eps -- two-sided truncation falls like eps^2 while
-# float32 round-off grows like 1/eps -- so no single step is trustworthy.  Sweep and judge
-# on the best.  (u_c and m entries are retained, commented, for when those gradients land.)
+# The FD error is NOT monotonic in eps -- two-sided truncation falls like eps^2 while float32
+# round-off grows like 1/eps -- so no single step is trustworthy.  Sweep and judge on the best.
+# ssa_control: beta has an exact-adjoint SSA control; u_c/m are DIVA-only here (see the docstring).
 PARAMS = {
-    #        sliding_law  scalar  offset from truth   eps sweep
-    'beta': (0.0,         False,  1.3,                (1e-3, 3e-4, 1e-4)),
-    # 'u_c':  (1.0,         False,  1.3,                (3.0,  2.0,  1.0)),  # pending: Coulomb gradient
-    # 'm':    (0.0,         True,   0.7,                (1e-2, 3e-3, 1e-3)),  # pending: exponent gradient
+    #        sliding_law  scalar  offset  eps sweep              ssa_control
+    'beta': (0.0,         False,  1.3,    (1e-3, 3e-4, 1e-4),    True),
+    'u_c':  (1.0,         False,  1.3,    (3.0,  2.0,  1.0),     False),
+    'm':    (0.0,         True,   0.7,    (1e-2, 3e-3, 1e-3),    False),
 }
 
 
@@ -80,7 +84,10 @@ def interior_mask():
 
 def baseline(law):
     """The reference ('true') sliding parameters for a given law."""
-    return dict(beta=reference_beta(),
+    beta = reference_beta()
+    if law > 0.5:                              # Coulomb: beta is tau_max, scaled for a comparable drag
+        beta = beta * COULOMB_BETA_SCALE
+    return dict(beta=beta,
                 u_c=cp.full((ny, nx), U_C_0, dtype=cp.float32),
                 m=M_0)
 
@@ -138,7 +145,7 @@ def objective(u, v, u_obs, v_obs, w_u, w_v):
 
 
 def run(param, scheme, tag):
-    law, is_scalar, offset, eps_sweep = PARAMS[param]
+    law, is_scalar, offset, eps_sweep, _ = PARAMS[param]
 
     w = interior_mask()
     # objective weights on the velocity grids (facet-centred), from the cell mask
@@ -229,28 +236,36 @@ def main():
     results = {}
     for param in PARAMS:
         law = 'Coulomb' if PARAMS[param][0] > 0.5 else 'Weertman'
-        # Control first: the SSA adjoint is exact, so this measures the harness.
-        rel_ssa = run(param, 'ssa', f"dJ/d({param}) {law}  SSA  (control, exact adjoint)")
-        assert rel_ssa < SANITY, \
-            f"harness or SSA dJ/d({param}) is broken: rel diff {rel_ssa:.3e}"
+        has_control = PARAMS[param][4]
+
+        rel_ssa = None
+        if has_control:
+            # Control first: the SSA adjoint is exact, so this measures the harness.
+            rel_ssa = run(param, 'ssa', f"dJ/d({param}) {law}  SSA  (control, exact adjoint)")
+            assert rel_ssa < SANITY, \
+                f"harness or SSA dJ/d({param}) is broken: rel diff {rel_ssa:.3e}"
 
         rel_diva = run(param, 'diva', f"dJ/d({param}) {law}  DIVA (under test)")
         assert rel_diva < SANITY, \
             f"DIVA dJ/d({param}) is grossly wrong: rel diff {rel_diva:.3e}"
-        # Judged against the control, not an absolute number: both share the same FD reference.
-        bound = max(DIVA_VS_CONTROL * rel_ssa, DIVA_FLOOR)
-        assert rel_diva < bound, (
-            f"DIVA dJ/d({param}) is materially worse than the exact-adjoint control: "
-            f"{rel_diva:.3e} vs control {rel_ssa:.3e} (bound {bound:.3e})")
+        if has_control:
+            # Judged against the control, not an absolute number: both share the same FD reference.
+            bound = max(DIVA_VS_CONTROL * rel_ssa, DIVA_FLOOR)
+            assert rel_diva < bound, (
+                f"DIVA dJ/d({param}) is materially worse than the exact-adjoint control: "
+                f"{rel_diva:.3e} vs control {rel_ssa:.3e} (bound {bound:.3e})")
         results[param] = (rel_ssa, rel_diva)
         print()
 
     print("summary (best relative difference vs finite differences):")
     for param, (rel_ssa, rel_diva) in results.items():
-        flag = "DIVA better" if rel_diva <= rel_ssa else f"{rel_diva / rel_ssa:.1f}x control"
-        print(f"  dJ/d({param}):  SSA control {rel_ssa:.3e}   DIVA {rel_diva:.3e}   ({flag})")
-    print("\nOK: the DIVA drag gradient is at least as good as the exact SSA adjoint\n"
-          "    evaluated through the same finite-difference harness")
+        if rel_ssa is None:
+            print(f"  dJ/d({param}):  DIVA {rel_diva:.3e}   (DIVA-only; no SSA control)")
+        else:
+            flag = "DIVA better" if rel_diva <= rel_ssa else f"{rel_diva / rel_ssa:.1f}x control"
+            print(f"  dJ/d({param}):  SSA control {rel_ssa:.3e}   DIVA {rel_diva:.3e}   ({flag})")
+    print("\nOK: every DIVA sliding-parameter gradient (beta, u_c, m) agrees with finite\n"
+          "    differences; beta additionally matches the exact-adjoint SSA control")
 
 
 if __name__ == '__main__':

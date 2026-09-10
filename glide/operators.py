@@ -936,7 +936,38 @@ class AdjointOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value,
                 calving.calving_rate.value, calving.flotation_reg_calving.value,
                 grid.dx, cp.float32(0.0),
-                grid.ny, grid.nx, stride, halo)) 
+                grid.ny, grid.nx, stride, halo))
+
+    def compute_gradient_u_c(self):
+        """Gradient w.r.t. the per-cell regularized-Coulomb threshold u_c.
+
+        DIVA only: u_c enters solely through the cell closure (beta_eff/eta_bar), so the whole
+        gradient is the coefficient-adjoint contraction dJ/du_c = W_eta*deta_duc + W_be*dbe_duc.
+        SSA/MOLHO are Weertman-only in this tree (no u_c field), so there is nothing to
+        differentiate; invert beta instead, or make u_c a shared field first."""
+        grid = self.grid
+        if not grid.diva:
+            raise NotImplementedError(
+                "compute_gradient_u_c requires DIVA: the Coulomb threshold u_c exists only under "
+                "stress_scheme='diva' (SSA/MOLHO are Weertman-only here).")
+        self._diva_param_gradient(grid.sliding.u_c.grad,
+                                  grid.rheology.deta_duc, grid.rheology.dbe_duc)
+
+    def compute_gradient_m(self):
+        """Gradient w.r.t. the global Weertman exponent m (a single scalar), stored on
+        sliding.m.grad.
+
+        DIVA only: under DIVA m enters solely through the closure, so the gradient is the
+        coefficient-adjoint contraction reduced to a scalar.  The SSA/MOLHO Weertman-exponent
+        gradient kernel is not ported (m is rarely inverted; add a grad.cu kernel if needed)."""
+        grid = self.grid
+        if not grid.diva:
+            raise NotImplementedError(
+                "compute_gradient_m is wired for DIVA only; the SSA/MOLHO Weertman-exponent "
+                "gradient kernel is not ported.")
+        grad_m = cp.zeros(1, dtype=cp.float32)
+        self._diva_param_gradient(grad_m, grid.rheology.deta_dm, grid.rheology.dbe_dm, reduce=True)
+        grid.sliding.m.grad = float(grad_m[0])
 
     def compute_gradient_bed(self):
         kernel = self.kernels.get_function('compute_gradient_bed')

@@ -794,7 +794,7 @@ DualFloat get_tau_dy_dual(
 
 
 /*=========================================================
-  ============ Basal Stress: DIVA (stress_balance = 1) ====
+  ========= Basal Stress: DIVA (#if GLIDE_DIVA) ===========
   =========================================================*/
 /*
   Under DIVA the momentum balance sees the depth-averaged velocity resisted by an

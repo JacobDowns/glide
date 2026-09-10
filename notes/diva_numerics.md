@@ -1283,8 +1283,9 @@ while the slab solution can expose a shared formulation error.
 | `glide/multigrid.py` | forward and adjoint FAS integration |
 | `glide/grid.py` | configuration and field allocation |
 
-Select DIVA with `grid.rheology.stress_balance.set(1.0)`; SSA (`0.0`) remains the
-default. `n_sigma` defaults to 8 and `eps_reg_shear` to $10^{-12}$.
+Select DIVA at construction with `stress_scheme='diva'` (a compile-time choice: the DIVA
+kernels are built with `-DGLIDE_DIVA=1` on the `GLIDE_MOLHO=0` path); `'ssa'` is the default.
+`n_sigma` defaults to 8 and `eps_reg_shear` to $10^{-12}$.
 
 Implemented: isothermal DIVA for both sliding laws, forward and adjoint FAS,
 the coupled $(u,v,H)$ JVP/VJP including the closure's thickness path, all three

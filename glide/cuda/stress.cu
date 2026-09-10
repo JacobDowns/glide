@@ -818,11 +818,9 @@ DualFloat get_diva_drag_coeff(
     float beta_grounded, float m, float u_reg, float water_drag,
     float u_c, float sliding_law){
 
-    // Basal drag COEFFICIENT c(U), i.e. |tau_b| = c(U)*U, as a function of the basal
-    // speed, returned as a dual number so c'(U) -- and hence f'(U) by the product
-    // rule -- falls out of the same evaluation instead of being hand-derived per law.
-    // The same helper therefore serves the closure Newton in compute_diva_coeffs and
-    // the augmented Jacobian and its transpose, for every sliding law.
+    // Basal drag COEFFICIENT c(U), i.e. |tau_b| = c(U)*U, as a function of the basal speed,
+    // returned as a dual so c'(U) (hence f'(U)) falls out of the same evaluation.  Serves both
+    // the closure Newton in compute_diva_coeffs and the Jacobian/transpose, for every law.
     //
     // Returning the coefficient rather than the drag keeps the effective drag free of
     // a 0/0: beta_eff = c/(1 + c*F2) needs no division by the speed.

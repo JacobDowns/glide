@@ -28,11 +28,9 @@
 
   ==================================================*/
 
-// Thin wrappers over membrane_eps_sq<T> (viscosity.cu), which is the single definition of
-// the membrane strain-rate invariant shared with populate_viscosity.  DIVA needs it
-// UNREGULARIZED so the vertical shear terms can be added before eta is formed -- see
-// diva_coeffs_cell -- whereas populate_viscosity adds eps_reg immediately.  That is the only
-// difference between the two uses, and it is why the shared function returns the raw sum.
+// Thin wrappers over membrane_eps_sq<T> (viscosity.cu), shared with populate_viscosity.  DIVA
+// reads it UNREGULARIZED so the vertical shear terms can be added before eta is formed (see
+// diva_coeffs_cell); populate_viscosity instead adds eps_reg immediately.
 __device__ __forceinline__
 float get_membrane_eps_sq(
     const float* __restrict__ u,
@@ -61,27 +59,20 @@ DualFloat get_membrane_eps_sq(
 __device__ __forceinline__
 void diva_add_W(float* __restrict__ W, int i, int j, int ny, int nx, float val){
     // Bounds-guarded global accumulate.  Used by the DIVA VJP to push
-    // lambda_row * d(r_row)/d(coefficient) onto the owning CELL.  Splitting the
-    // transpose at the cell like this keeps both halves within a +/-1 reach: the
-    // composite row->facet dependence is +/-2, but row->cell and cell->facet are each
-    // +/-1, so neither step needs a wider halo.
+    // lambda_row * d(r_row)/d(coefficient) onto the owning CELL.
     if (i >= 0 && i < ny && j >= 0 && j < nx) atomicAdd(&W[i*nx + j], val);
 }
 
 __device__ __forceinline__ float diva_primal(float x)     { return x; }
 __device__ __forceinline__ float diva_primal(DualFloat x) { return x.v; }
 
-// Seed a scalar of either type from a float.  A dual gets a zero perturbation, which is
-// correct for the closure's warm start: the converged sensitivity is fixed by the fixed
-// point, not by where the iteration started.
+// Seed a scalar of either type from a float; a dual gets a zero perturbation.
 __device__ __forceinline__ void diva_from_float(float& x, float v)     { x = v; }
 __device__ __forceinline__ void diva_from_float(DualFloat& x, float v) { x = {v, 0.0f}; }
 
-// Number of closure-Newton steps to take AFTER the primal convergence criterion fires.  The
-// outer closure step uses a PRIMAL (frozen) denominator Fp, so the "one extra step" fixed-point
-// trick makes the first derivative exact (N'(root) ~ 1 - F_Ub/Fp ~ 0).  float/DualFloat carry at
-// most a first derivative, so one extra step is exact and bit-identical to before.  The inner
-// level-viscosity Newton uses a dual denominator and is self-correcting, so it needs no analogue.
+// Number of closure-Newton steps to take AFTER the convergence criterion fires.  The outer
+// closure step uses a frozen (primal) denominator, so one extra step makes the first derivative
+// exact; the inner level-viscosity Newton uses a dual denominator and needs no analogue.
 __device__ __forceinline__ int diva_n_post(float)      { return 1; }
 __device__ __forceinline__ int diva_n_post(DualFloat)  { return 1; }
 
@@ -91,14 +82,11 @@ T get_diva_c_of_U(
     T U, T beta_grounded, T m, float u_reg, float water_drag,
     T u_c, float sliding_law){
 
-    // The drag coefficient c(U) of get_diva_drag_coeff (stress.cu), templated on the
-    // scalar type so the same expression serves the diagnostic kernel (T = float) and
-    // the JVP/derivative kernels, where T = DualFloat carries d/d(seeded direction).
-    //
-    // Every input a gradient is ever wanted for is typed T, not float: the velocity
-    // (through U), and the three sliding parameters beta, m and u_c.  Seeding any one of
-    // them and reading the .d of the outputs is then the whole parameter gradient, with
-    // no second derivation to keep in sync with this expression.
+    // The drag coefficient c(U) of get_diva_drag_coeff (stress.cu), templated on the scalar
+    // type so one expression serves the diagnostic kernel (T = float) and the JVP/derivative
+    // kernels (T = DualFloat).  Every input a gradient is wanted for is typed T -- the velocity
+    // (through U) and the sliding parameters beta, m, u_c -- so seeding one and reading the
+    // outputs' .d gives that parameter's gradient directly.
     T U_sq_reg = U*U + u_reg;
 
     T c;
@@ -116,18 +104,14 @@ T get_diva_c_of_U(
 //
 //   eta = 0.5*B*[ A + k/eta^2 ]^p  =  G(eta),   k = (tau_b*zeta/2)^2,  p = glen_exp
 //
-// A is the regularized membrane strain rate; which regularization goes in it is the caller's
-// choice, and diva_coeffs_cell calls this twice with two different ones (see 3.2).
+// A is the regularized membrane strain rate; diva_coeffs_cell calls this twice with two
+// different regularizations.
 //
 // Solved by Newton on eta - G(eta).  G' lies in (0, 2|p|) subset (0,1), so 1 - G' is bounded
-// away from zero and the step needs no safeguarding, for any p.
+// away from zero and the step needs no safeguarding.
 //
-// For n = 3 this is a depressed cubic, 8A*eta^3 + 8k*eta - B^3 = 0, with a Cardano solution --
-// deliberately NOT used: its two cube roots nearly cancel when the shear dominates and it
-// loses three digits in float32, precisely in the regime of interest.  See 4.3.
-//
-// k must be typed T, not taken from primals: it carries tau_b, hence the seeded perturbation,
-// so a primal-only k would silently drop d(eta)/d(tau_b).
+// k must be typed T (not a primal): it carries tau_b, hence the seeded perturbation, so a
+// primal-only k would drop d(eta)/d(tau_b).
 //
 // Returns false if the iteration ran out of steps, which the caller must report.
 template <typename T>
@@ -200,28 +184,20 @@ __device__ void diva_coeffs_cell(
     // u_s = u_b + tau_b*F1 (Arthern eq 10), which is what velocity observations measure.  For
     // SSA that coincides with the depth average; under DIVA it does not.
     //
-    // TWO REGULARIZATIONS, which is deliberate.  The level viscosity is solved twice per
-    // quadrature node, from the same shear term but two different regularized membrane strain
-    // rates: eps_reg for eta_bar, which the membrane operator sees, and the much smaller
-    // eps_reg_shear for F1 and F2.  Rationale at the level solve below; setting the two equal
-    // reduces this exactly to a single viscosity.  SSA is untouched, since it uses neither
-    // F1/F2 nor this closure.
+    // The level viscosity is solved twice per quadrature node, with two different regularized
+    // membrane strain rates: eps_reg for eta_bar (which the membrane operator sees) and the
+    // smaller eps_reg_shear for F1 and F2.  Setting the two equal reduces to a single viscosity.
     //
-    // The quadrature rule is passed IN rather than built here.  It is Gauss-Legendre: the
-    // integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) in the shear-dominated
-    // limit, so they behave like zeta^n and zeta^(n+1) -- polynomials for integer n, which
-    // Gauss-Legendre integrates EXACTLY with ceil((n+2)/2) nodes.  Midpoint needed 32+ nodes
-    // for what 3 or 4 Gauss nodes deliver.  Nodes and weights
-    // come from numpy on the host, so any n_sigma works without a table here.
+    // The Gauss-Legendre quadrature is passed in (built by numpy on the host, so any n_sigma
+    // works).  The integrands zeta/eta and zeta^2/eta behave like zeta^n and zeta^(n+1) in the
+    // shear-dominated limit, which Gauss-Legendre integrates exactly with ceil((n+2)/2) nodes.
     //
-    // Newton on F, with the FULL slope
+    // Newton on F, with the full slope
     //
     //     F'(U_b) = 1 + f'*F2 + f*f' * dF2/dtau_b
     //
-    // Every term is non-negative (monotone law => f, f' >= 0; F2 > 0; dF2/dtau_b > 0 because
-    // more drag means more shear means thinner ice), so F' >= 1: the root is unique and no
-    // safeguarding or relaxation is needed.  All three terms matter -- dropping the third
-    // makes the iteration 2-cycle at high basal drag.
+    // Every term is non-negative for a monotone law (f, f' >= 0; F2 > 0; dF2/dtau_b > 0), so
+    // F' >= 1: the root is unique and needs no safeguarding.
     //
     //   closure Newton   solve F(U_b) = 0
     //     n_sigma loop   quadrature for eta_bar, F2 and dF2/dtau_b -- a sum, not a solve
@@ -229,14 +205,11 @@ __device__ void diva_coeffs_cell(
     //
     // The quadrature sits inside the Newton loop because F2 depends on U_b.
     //
-    // Shared by compute_diva_coeffs (T = float) and the JVP/derivative kernels
-    // (T = DualFloat).  Newton DENOMINATORS are taken from primals even when T is dual: by the
-    // implicit function theorem the converged root and its sensitivity do not depend on the
-    // step size used to reach them, so an inexact denominator costs iterations, never
-    // accuracy.  A term dropped from a residual has no such licence.
-    // Both loops are ADAPTIVE: they run to a tolerance and stop, with the counts below as
-    // backstops rather than the operating cost.  Typical usage is far lower -- most sigma
-    // levels exit in 2 to 5, and a warm-started closure in 1 to 2.
+    // Shared by compute_diva_coeffs (T = float) and the JVP/derivative kernels (T = DualFloat).
+    // Newton denominators are taken from primals even when T is dual: by the implicit function
+    // theorem the converged root and its sensitivity do not depend on the step size, so a primal
+    // denominator costs iterations, not accuracy.  Both loops are adaptive; the counts below are
+    // backstops, not the operating cost.
     const int eta_iters_max    = 12;
     const int newton_iters_max = 20;
     const float eta_tol     = 1e-7f;    // on the relative Newton step in eta
@@ -244,25 +217,13 @@ __device__ void diva_coeffs_cell(
     const float near_tol    = 1e-4f;    // arm stagnation detection below this
     const float stag_gain   = 0.5f;     // a step that shrank by less than this has stalled
     //
-    // Three properties of the termination that are not obvious, all three necessary:
-    //
-    //  1. Accepted on a tolerance OR on STAGNATION.  __powf under --use_fast_math leaves a
-    //     few ulp in G(eta), so the correction bottoms out in a limit cycle instead of
-    //     reaching zero; a pure tolerance would have to be tuned above a parameter-dependent
-    //     floor.  Stagnation is a RATIO test -- a step that failed to shrink by stag_gain has
-    //     stalled -- rather than merely a non-decreasing one: at the floor the jitter can
-    //     drift downward for many iterations, which a monotonicity test sits through (it cost
-    //     13 of the 12 permitted iterations once eps_reg_shear made the shear term dominant).
-    //     Both loops converge quadratically, so below near_tol the next step should be roughly
-    //     squared, and a ratio anywhere near 1 is the floor and not slow progress.
-    //
-    //  2. Exactly ONE MORE iteration after the criterion fires.  The criterion is on the
-    //     primal and the seeded derivative rides one step behind it.  Newton's map N has
-    //     N'(root) = 0, so a further step leaves the value at the root while replacing the
-    //     derivative with d(root)/d(seed) exactly.
-    //
-    //  3. Failure to converge is REPORTED, via cap_flags_out.  A loop that silently caps is
-    //     worse than a fixed count, because it looks converged.
+    // Termination (all three necessary):
+    //  1. Accept on tolerance OR on stagnation.  __powf under --use_fast_math leaves a few ulp
+    //     in G(eta), so the step bottoms out in a limit cycle rather than reaching zero.
+    //     Stagnation is a ratio test: a step that failed to shrink by stag_gain has stalled.
+    //  2. Exactly one more iteration after the criterion fires, so the seeded derivative (one
+    //     step behind the primal) catches up -- Newton's map has N'(root) = 0.
+    //  3. Failure to converge is reported via cap_flags_out (a silent cap looks converged).
 
     cap_flags_out = 0;
 
@@ -304,22 +265,9 @@ __device__ void diva_coeffs_cell(
             //   eta_mem, with eps_reg        -> eta_bar, which the 2-D membrane operator sees
             //   eta_sh,  with eps_reg_shear  -> F1 and F2, the shear moments
             //
-            // eta_bar must carry eps_reg because at zero shear it has to reproduce SSA's
-            // viscosity EXACTLY, or DIVA stops being a strict generalization of SSA -- and it
-            // is bounded by 0.5*B*eps_reg^p for free, so the membrane operator's conditioning
-            // cannot get worse than SSA's.
-            //
-            // The moments must carry the much smaller eps_reg_shear because eps_reg was sized
-            // for membrane strain rates and swamps the far smaller vertical shear one.  Adding
-            // to the strain rate can only LOWER eta, so an oversized regularization makes the
-            // column spuriously SOFT and F2 too large -- 9% at 44 kPa and 60x in nearly
-            // stagnant ice, measured in tests/diva_slab_test.py against the analytic slab.
-            //
-            // The second solve costs 0.5% of the forward solve, measured -- eta_mem's fixed
-            // point is dominated by eps_reg and converges in 2-3 steps against eta_sh's 8.
-            // When the two regularizations are set equal the two solves coincide and this
-            // reduces to the single-viscosity form exactly, which is the whole of what would
-            // be needed to adopt a single DIVA-wide eps_reg if SSA's ever changes (5.10).
+            // eta_bar carries eps_reg so it reproduces SSA's viscosity exactly at zero shear;
+            // the moments carry the much smaller eps_reg_shear, since the membrane-sized eps_reg
+            // would over-regularize the far smaller vertical shear and make F2 too large.
             T k_shear = tau_b*(0.5f*zeta);
             k_shear = k_shear*k_shear;
             T A_sh  = eps_mem_sq + eps_reg_shear;
@@ -336,16 +284,11 @@ __device__ void diva_coeffs_cell(
             F1_c    = F1_c + wq*zeta/eta_k;
             F2_c    = F2_c + wq*zeta*zeta/eta_k;
 
-            // d(F2)/d(tau_b) for the closure Newton's slope, accumulated here because
-            // everything it needs is already in registers.  From the implicit function theorem
-            // on the converged level root eta = G(eta; tau_b):
-            //
-            //   d(eta)/d(tau_b) = G_tau/(1 - G_eta),
-            //       G_tau = 2p*s*eta/(E*tau_b),   G_eta = -2p*s/E
-            //
-            // s/tau_b is written as tau_b*zeta^2/(4*eta^2) so nothing divides by tau_b, making
-            // the expression correctly zero at tau_b = 0 rather than 0/0.  1 - G_eta lies in
-            // (1/3, 1] for n = 3, so the denominator never pinches.
+            // d(F2)/d(tau_b) for the closure Newton's slope, accumulated here while its inputs
+            // are in registers.  From the implicit function theorem on the level root
+            // eta = G(eta; tau_b):  d(eta)/d(tau_b) = G_tau/(1 - G_eta), with G_tau = 2p*s*eta/
+            // (E*tau_b), G_eta = -2p*s/E.  Written so nothing divides by tau_b, so it is
+            // correctly zero (not 0/0) at tau_b = 0.
             float eta_p = diva_primal(eta_k);
             float s_p   = diva_primal(k_shear)/(eta_p*eta_p);
             float E_p   = diva_primal(A_sh) + s_p;
@@ -353,15 +296,12 @@ __device__ void diva_coeffs_cell(
             float deta_dtau = glen_exp*tau_p*zeta*zeta/(2.0f*eta_p*E_p*dnm);
             dF2_dtau += wq*zeta*zeta*(-deta_dtau/(eta_p*eta_p));
         }
-        // H is the ONLY place thickness enters the closure: the quadrature runs over
-        // zeta in [0,1], so the shear moments carry one factor of H and everything else
-        // -- the level viscosities, the sliding law, the closure root -- depends on H
-        // only through them.  Typing H_c as T therefore captures the whole path
-        //     H -> I1, I2 -> U_b, tau_b -> eta_bar, beta_eff, u_s.
+        // H is the only place thickness enters the closure: the shear moments carry one factor
+        // of H, and everything else depends on H only through them.  Typing H_c as T captures
+        // the whole path  H -> I1, I2 -> U_b, tau_b -> eta_bar, beta_eff, u_s.
         F1_c     = F1_c * H_c;
         F2_c     = F2_c * H_c;
-        // Primal only: this is a Newton DENOMINATOR (see the note at the top), so it may
-        // be inexact without costing accuracy in the converged root or its sensitivity.
+        // Primal only: a Newton denominator (see above), so it may be inexact.
         dF2_dtau = dF2_dtau * diva_primal(H_c);
 
         // The closure residual at the CURRENT U_b, scaled by a velocity that cannot vanish
@@ -395,10 +335,8 @@ __device__ void diva_coeffs_cell(
     F2_out       = F2_c;
     U_b_out      = U_b;
     beta_eff_out = coeff/(1.0f + coeff*F2_c);
-    // Surface SPEED, u_s = u_b + tau_b*F1.  Emitted from here rather than assembled by the
-    // caller so that a dual seeding of any input yields d(u_s)/d(that input) directly -- which
-    // is what an objective built on surface-velocity observations needs, both for the adjoint
-    // right-hand side (seeds 1-2) and for the parameter gradient's explicit term (seeds 3-5).
+    // Surface SPEED u_s = u_b + tau_b*F1.  Emitted here so a dual seeding of any input yields
+    // d(u_s)/d(input) directly, which a surface-velocity objective needs.
     u_s_out      = U_b + coeff*U_b*F1_c;
 }
 
@@ -430,9 +368,7 @@ __device__ void populate_diva_coeffs_dual(
 
     // Fills the eta_bar and beta_eff tiles as DUALS: the exact d/d(velocity direction) of the
     // whole cell-local closure -- quadrature, per-level eta Newton and closure Newton all
-    // differentiated by running them in dual arithmetic, nothing hand-derived.  The
-    // frozen-coefficient adjoint (still selectable) drops this path;
-    // tests/diva_dotproduct_test.py measures what that costs.
+    // differentiated in dual arithmetic, nothing hand-derived.
     float glen_exp = (1.0f - n)/(2.0f * n);
 
     DualFloat eps_mem_sq = get_membrane_eps_sq(u, v, du, dv, i, j, dx, ny, nx);
@@ -718,11 +654,9 @@ void compute_diva_derivs(
     float d_be_dU  = be_d.d;
     float d_us_dU  = us_d.d;
 
-    // Seed 3: d/d(beta).  The perturbation is `grounded` rather than 1 because the
-    // closure is given beta*grounded, so this yields the derivative with respect to the
-    // raw beta the inversion actually controls.  Note beta moves eta_bar as well as
-    // beta_eff (beta -> c -> tau_b -> shear term), which is the path the parameter
-    // gradient was missing.
+    // Seed 3: d/d(beta).  The perturbation is `grounded` rather than 1 because the closure
+    // sees beta*grounded, so this is d/d(raw beta), the quantity the inversion controls.
+    // beta moves eta_bar as well as beta_eff (beta -> c -> tau_b -> shear term).
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
             {H_c,0.0f}, B_c, {beta_grounded,grounded}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
@@ -743,10 +677,8 @@ void compute_diva_derivs(
     float d_be_duc  = be_d.d;
     float d_us_duc  = us_d.d;
 
-    // Seed 5: d/d(m), the Weertman exponent.  m is a single global scalar, so these are
-    // the per-cell contributions that compute_gradient_param_sum_diva reduces.  Getting
-    // this needed __powf(dual, dual) -- the exponent, not just the base, is now dual.
-    // Identically zero under regularized Coulomb.
+    // Seed 5: d/d(m), the Weertman exponent.  m is a single global scalar, so these are the
+    // per-cell contributions that compute_gradient_param_sum_diva reduces.  Zero under Coulomb.
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
             {H_c,0.0f}, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,1.0f}, u_reg, water_drag, sliding_law,
@@ -756,13 +688,11 @@ void compute_diva_derivs(
     float d_be_dm  = be_d.d;
     float d_us_dm  = us_d.d;
 
-    // Seed 6: d/d(H).  Thickness is a STATE variable, not a parameter, so this one
-    // completes the coupled (u,v,H) Jacobian rather than adding a control.  H enters the
-    // closure only through the shear moments I1 = H*int(zeta/eta) and I2 = H*int(zeta^2/eta),
-    // but that is enough to move everything downstream of them: thicker ice means a larger
-    // I2, hence a smaller basal speed for the same depth-averaged speed, hence a different
-    // traction, vertical shear, viscosity profile and therefore eta_bar and beta_eff too.
-    // Without this the DIVA adjoint is exact only at fixed thickness.
+    // Seed 6: d/d(H).  Thickness is a STATE variable, so this completes the coupled (u,v,H)
+    // Jacobian rather than adding a control.  H enters the closure only through the shear
+    // moments I1 = H*int(zeta/eta), I2 = H*int(zeta^2/eta), but that moves everything downstream
+    // (basal speed, traction, viscosity profile, hence eta_bar and beta_eff).  Without it the
+    // DIVA adjoint is exact only at fixed thickness.
     diva_coeffs_cell<DualFloat>({eps_mem_v,0.0f}, {U_bar_v,0.0f},
             {H_c,1.0f}, B_c, {beta_grounded,0.0f}, {u_c_c,0.0f},
             {m,0.0f}, u_reg, water_drag, sliding_law,
@@ -807,10 +737,8 @@ void compute_diva_derivs(
       A_c = W_eta_c * d(eta_bar)/d(eps_mem^2) + W_be_c * d(beta_eff)/d(eps_mem^2)
       B_c = W_eta_c * d(eta_bar)/d(Ubar)      + W_be_c * d(beta_eff)/d(Ubar)
 
-  One thread per cell, scattering to that cell's own stencil, so the reach is +/-1 --
-  the composite row->facet dependence is +/-2 but neither half exceeds +/-1.  No
-  symmetry is assumed anywhere: this is the honest transpose of the coefficient paths,
-  which is what the frozen adjoint omitted.
+  One thread per cell, scattering to that cell's own stencil (reach +/-1).  This is the
+  exact transpose of the coefficient paths.
 */
 /*
   The cell->facet half of a coefficient transpose.  One thread owns a cell, is handed that
@@ -832,8 +760,8 @@ void compute_diva_derivs(
   facet the inputs touch, whereas the Vanka block needs only the four it owns, and needs
   them as coefficients rather than as a scatter.
 
-  Kept adjacent to the scatter deliberately: the two must agree term for term, and
-  membrane_eps_sq is the definition both are differentiating.
+  Kept adjacent to the scatter: the two must agree term for term, and membrane_eps_sq is
+  the definition both are differentiating.
 */
 __device__ __forceinline__
 void diva_cell_own_partials(
@@ -1052,8 +980,7 @@ void compute_diva_vjp_coeffs(
   which is the same scatter as the adjoint residual's coefficient transpose with A and B
   redefined.  The caller negates this to form the adjoint right-hand side, f = -d(obj)/d(x).
 
-  Under SSA there is no vertical shear, u_s == |ubar|, and this whole path is unnecessary --
-  which is what makes the SSA limit a usable control on it.
+  Under SSA there is no vertical shear, u_s == |ubar|, and this whole path is unnecessary.
 */
 extern "C" __global__
 void compute_diva_us_vjp(
@@ -1105,14 +1032,12 @@ void compute_diva_us_vjp(
 
   Nothing in this expression knows *which* parameter p is -- the identity of p lives
   entirely in which pair of derivative fields the caller passes.  So one kernel serves
-  beta and u_c, and the reducing variant below serves the global m.  Compare the SSA
-  path, which needs a separate ~90-line facet-walking kernel per parameter
-  (compute_gradient_beta / _u_c / _m in grad.cu) because there beta, u_c and m enter the
-  momentum stencils directly rather than through a state-dependent coefficient.
+  beta and u_c, and the reducing variant below serves the global m.  (Under SSA a
+  parameter enters the momentum stencils directly and needs a separate facet-walking
+  kernel -- compute_gradient_beta in grad.cu.)
 
-  This replaced an earlier facet-walking compute_gradient_beta_diva that carried only the
-  beta_eff path.  Every parameter also moves eta_bar, through p -> c -> tau_b -> the
-  shear term in the effective strain rate; for beta that omission was the whole error.
+  Every parameter moves eta_bar as well as beta_eff, through p -> c -> tau_b -> the shear
+  term in the effective strain rate, so both derivative fields matter.
 */
 template <bool REDUCE>
 __device__ __forceinline__
@@ -1140,9 +1065,8 @@ void diva_param_gradient_body(
 
     if (REDUCE) {
         // A single global scalar (the Weertman m), so every cell's contribution is summed
-        // into one slot.  Same convention as SSA's compute_gradient_m; note the atomics
-        // make the summation order nondeterministic, so this gradient is reproducible
-        // only to float32 round-off, unlike the per-cell variant.
+        // into one slot.  The atomics make the summation order nondeterministic, so this
+        // gradient is reproducible only to float32 round-off, unlike the per-cell variant.
         atomicAdd(&grad[0], g);
     } else {
         grad[idx] = g;

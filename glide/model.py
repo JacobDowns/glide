@@ -75,7 +75,7 @@ class IceDynamics:
         u_s is not a state variable, so its cotangent is scattered to the velocity/thickness rows
         through the closure (diva_surface_misfit_rhs), and u_s depends on the sliding parameters
         DIRECTLY, so an explicit sum_c cot_c d(u_s)_c/dp term is added after the reduction.  DIVA
-        only.  See notes/diva_numerics.md 6.5, notes/diva_adjoint_map.md."""
+        only."""
         ao = self.mg.levels[self.top_level].adjoint_operators
 
         # Surface term first: diva_surface_misfit_rhs FILLS f_u/f_v/f_H with -dJ/d(u,v,H), so the

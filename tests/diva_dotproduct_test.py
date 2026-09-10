@@ -33,7 +33,7 @@ it on the coupled asymmetry collapses by ~400x.  The exact case is the default i
 
 NOTE (unified tree): the COUPLED (u,v,H) dot product does not fall all the way to round-off
 for exact DIVA -- it lands near ~2e-4 -- because this build carries one deliberate approximation
-in the closure's THICKNESS/coefficient path (dF2/du; notes/diva_numerics.md 6.1).  The VELOCITY
+in the closure's THICKNESS/coefficient path (dF2/du).  The VELOCITY
 block is an exact transpose (tests/diva_selfadjoint_test.py checks that with lambda_H = 0 and hits
 1e-4/round-off); it is only the H leg that carries the approximation, and ~2e-4 is far below what
 any finite-difference gradient check can resolve and negligible for inversions.  The frozen vs
@@ -239,7 +239,7 @@ def main():
     print("So the coefficient terms are applied and the velocity-block transpose is exact.")
     print("The adjoint SMOOTHER still assembles the frozen block, which is fine -- it is")
     print("only a preconditioner, exactly as in SSA, where the VJP carries d(eta)/du and")
-    print("the smoother does not; see notes/diva_numerics.md section 5.4.")
+    print("the smoother does not.")
 
 
 if __name__ == '__main__':

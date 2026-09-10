@@ -125,7 +125,7 @@ class GlideStep(torch.autograd.Function):
 
         # The surface cotangent (DIVA) takes a different route into the adjoint than the state
         # cotangents: it is scattered to the velocity facets through the closure and contributes an
-        # explicit parameter term.  model.backward handles both; see notes/diva_adjoint_map.md.
+        # explicit parameter term.  model.backward handles both.
         dJdu_s = None if gu_s is None else cp.asarray(gu_s)
 
         # autograd passes None for outputs the objective never touched;

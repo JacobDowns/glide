@@ -106,7 +106,7 @@ H_C = 1000.0
 B_C = (1e-16 ** -(1. / 3)) / (RHO_I * GRAV)
 U_C_C, U_REG, WATER_DRAG = 100.0, 1.0, 0.0
 GLEN_N, EPS_REG, N_SIGMA = 3.0, 1e-6, 8
-# The production split (notes/diva_numerics.md 3.2), not the reduced eps_reg_shear == eps_reg
+# The production split (eps_reg != eps_reg_shear), not the reduced eps_reg_shear == eps_reg
 # case: eta_bar and the shear moments come from two separate level solves, so the fifteen
 # derivatives below are seeded through both of them and this is the configuration that matters.
 EPS_REG_SHEAR = 1e-12

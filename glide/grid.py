@@ -138,7 +138,7 @@ class Rheology:
             attrs={'long_name':'''DIVA-only strain-invariant regularizer for the SHEAR MOMENTS
                          F1 and F2.  Much smaller than eps_reg because those integrals converge
                          as it goes to zero, while eta_bar (which keeps eps_reg, applied as a
-                         cap) does not.  See notes/diva_numerics.md 3.2.'''})
+                         cap) does not.'''})
         )
     n_sigma: Constant = field(
         default_factory = lambda: Constant(

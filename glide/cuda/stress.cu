@@ -809,7 +809,7 @@ DualFloat get_tau_dy_dual(
   The result is linear in the velocity, so these stencils are far simpler than their
   SSA counterparts: all of the velocity dependence of the real sliding law has moved
   into the closure that produces U_b.  The smoother treats beta_eff as a frozen
-  coefficient and never sees U_b at all -- see notes/diva_numerics.md 5.2.
+  coefficient and never sees U_b at all.
 */
 
 __device__ __forceinline__

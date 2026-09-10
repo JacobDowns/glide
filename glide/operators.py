@@ -83,7 +83,7 @@ class ForwardOperators:
 
         The integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) where the shear
         dominates, so Gauss-Legendre integrates them exactly with a handful of nodes (4 Gauss
-        nodes match 32+ midpoint nodes; notes/diva_numerics.md 3.1).  Built on the host, cached
+        nodes match 32+ midpoint nodes).  Built on the host, cached
         on n_sigma, weights scaled to sum to 1 so the eta accumulation is a depth AVERAGE.
         """
         n = int(self.grid.rheology.n_sigma.value)
@@ -845,7 +845,7 @@ class AdjointOperators:
         the vertical shear (the whole point of the scheme), so an inversion against surface data
         should route the misfit through here rather than through dJdu/dJdv.  Under SSA there is no
         shear (u_s == |ubar|), so this is a no-op and returns (None, None); build the RHS from the
-        depth-averaged misfit directly.  See notes/diva_numerics.md 6.5, notes/diva_adjoint_map.md."""
+        depth-averaged misfit directly."""
         if not self.grid.diva:
             return None, None
         grid = self.grid

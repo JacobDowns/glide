@@ -7,7 +7,7 @@ with the coefficients recomputed per level from the restricted forward state.
 This runs whatever AdjointOperators is configured for, which by default is the **exact**
 coefficient transpose -- the d(eta_bar)/du and closure paths included. The smoother remains
 the frozen block, which is deliberate: it is only a preconditioner, and the frozen operator
-is the one Goldberg proves self-adjoint (see notes/diva_numerics.md 5.8), so it makes a good
+is the one Goldberg proves self-adjoint, so it makes a good
 one. SSA works the same way -- its VJP carries d(eta)/du and its smoother does not.
 
 Convergence is therefore the thing under test here, not correctness of the transpose;

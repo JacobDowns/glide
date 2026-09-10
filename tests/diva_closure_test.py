@@ -154,8 +154,7 @@ def check_shear_dominated(glen_exp):
             f"converged")
         worst = max(worst, d_eta, d_F2, d_ub)
     assert worst < 1e-4, (
-        f"closure does not reach the true root: worst relative error {worst:.2e}. "
-        f"see notes/diva_numerics.md 5.2.0")
+        f"closure does not reach the true root: worst relative error {worst:.2e}.")
     return worst
 
 

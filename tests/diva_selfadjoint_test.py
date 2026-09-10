@@ -6,15 +6,14 @@ Two probes on a converged slab, for stress_scheme in {'ssa','diva'} and m in {1,
      This is the exact tangent (compute_jvp carries the full d(eta_bar)/du and
      d(beta_eff)/du through dual arithmetic), so a symmetric J means the discrete
      momentum operator is the gradient of a potential -- the property the sum-of-squares
-     basal-drag closure was chosen to give (notes/diva_discrete_variational_principle.md
-     sections 5, 7).  It should hold to float32 round-off at EVERY m; that it does is what
+     basal-drag closure was chosen to give.  It should hold to float32 round-off at EVERY m; that it does is what
      distinguishes the sum-of-squares closure from a cell-centered mean-speed one, which is
      symmetric only at m = 1.
 
   B. **VJP == JVP transpose**  <J^T y, x> vs <y, J x>  (no finite differences, so round-off,
      not the ~1e-3 an FD check tops out at).  Confirms the adjoint operator is the exact
      transpose of the tangent.  DIVA carries one deliberate approximation in the closure's
-     thickness/coefficient path (d F2/d u, notes/diva_numerics.md 6.1), so this is asserted
+     thickness/coefficient path (d F2/d u), so this is asserted
      at m = 1 where it is exact; the JVP probe A is the all-m guarantee.
 
     uv run python tests/diva_selfadjoint_test.py

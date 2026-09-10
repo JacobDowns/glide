@@ -34,7 +34,7 @@ F2 (F1) removes that singularity, which is why the moments are the well-posed qu
 is the one the momentum balance actually consumes.
 
 The shear moments are regularized on the unified tree by `eps_reg_shear` -- distinct from the
-membrane `eps_reg` that conditions eta_bar (notes/diva_numerics.md 3.2).  Part 1 drives
+membrane `eps_reg` that conditions eta_bar.  Part 1 drives
 `eps_reg_shear` to zero (F2 converges); part 3 shows why the split matters: at the DEFAULT
 eps_reg_shear the moments are already accurate at realistic driving stresses, where a single
 SSA-sized eps_reg would have softened the column badly.
@@ -177,7 +177,7 @@ def main():
   limited even at 1e-12, but tau_b*F2 there is ~2e-3 m/a -- negligible, so it does not matter.  The
   split lets the shear moments use a regularization far below SSA's membrane one, so DIVA captures
   the deformational velocity it exists for without the operator-conditioning cost of a tiny eps_reg
-  on eta_bar.  See notes/diva_numerics.md section 3.2 / 5.10.""")
+  on eta_bar.""")
 
     print("\nOK: DIVA reproduces the analytic SIA slab solution")
 

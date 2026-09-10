@@ -26,8 +26,6 @@
   of other locations".  No spatial coupling, so no multigrid transfer is involved, and
   nothing in this file is compiled or reached unless GLIDE_DIVA = 1 (stress_scheme='diva').
 
-  The full derivation, the convergence analysis and the measurements behind the
-  iteration counts are in notes/diva_numerics.md sections 2.5-2.7 and 4.
   ==================================================*/
 
 // Thin wrappers over membrane_eps_sq<T> (viscosity.cu), which is the single definition of
@@ -206,15 +204,14 @@ __device__ void diva_coeffs_cell(
     // quadrature node, from the same shear term but two different regularized membrane strain
     // rates: eps_reg for eta_bar, which the membrane operator sees, and the much smaller
     // eps_reg_shear for F1 and F2.  Rationale at the level solve below; setting the two equal
-    // reduces this exactly to a single viscosity.  Motivation and measurements in
-    // notes/diva_numerics.md 3.2; SSA is untouched, since it uses neither F1/F2 nor this
-    // closure.
+    // reduces this exactly to a single viscosity.  SSA is untouched, since it uses neither
+    // F1/F2 nor this closure.
     //
     // The quadrature rule is passed IN rather than built here.  It is Gauss-Legendre: the
     // integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) in the shear-dominated
     // limit, so they behave like zeta^n and zeta^(n+1) -- polynomials for integer n, which
     // Gauss-Legendre integrates EXACTLY with ceil((n+2)/2) nodes.  Midpoint needed 32+ nodes
-    // for what 3 or 4 Gauss nodes deliver (notes/diva_numerics.md 3.1).  Nodes and weights
+    // for what 3 or 4 Gauss nodes deliver.  Nodes and weights
     // come from numpy on the host, so any n_sigma works without a table here.
     //
     // Newton on F, with the FULL slope
@@ -224,7 +221,7 @@ __device__ void diva_coeffs_cell(
     // Every term is non-negative (monotone law => f, f' >= 0; F2 > 0; dF2/dtau_b > 0 because
     // more drag means more shear means thinner ice), so F' >= 1: the root is unique and no
     // safeguarding or relaxation is needed.  All three terms matter -- dropping the third
-    // makes the iteration 2-cycle at high basal drag (notes/diva_numerics.md 4.1).
+    // makes the iteration 2-cycle at high basal drag.
     //
     //   closure Newton   solve F(U_b) = 0
     //     n_sigma loop   quadrature for eta_bar, F2 and dF2/dtau_b -- a sum, not a solve
@@ -302,7 +299,7 @@ __device__ void diva_coeffs_cell(
             // ---- per-level viscosities ----
             //
             // TWO of them, from the same shear term but two different regularizations of the
-            // membrane strain rate (notes/diva_numerics.md 3.2):
+            // membrane strain rate:
             //
             //   eta_mem, with eps_reg        -> eta_bar, which the 2-D membrane operator sees
             //   eta_sh,  with eps_reg_shear  -> F1 and F2, the shear moments
@@ -573,7 +570,7 @@ void compute_diva_coeffs(
   compute_diva_coeffs call, or it is zero by construction and says nothing.
 
   Reported separately and scaled by |Ubar|, never folded into the combined momentum norm:
-  r_Ub is a velocity residual and r_u a momentum one (notes/open_questions.md Q6).
+  r_Ub is a velocity residual and r_u a momentum one.
 */
 extern "C" __global__
 void compute_diva_closure_residual(

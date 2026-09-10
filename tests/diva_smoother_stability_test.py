@@ -20,9 +20,8 @@ not: omega = 0.05 still diverged.
 U_b is no longer the block's business.  It is diagnosed by compute_diva_coeffs from
 (u,v,H) along with eta_bar, beta_eff, F1, F2 and u_s, and the smoother consumes exactly
 two frozen coefficients -- eta_bar and beta_eff -- which is the same contract SSA's
-smoother has with its frozen viscosity.  The measurements behind that decision, including
-the convergence comparison that showed the exact tangent never won, are in
-notes/diva_numerics.md 5.2.
+smoother has with its frozen viscosity.  The exact drag tangent was measured never to beat the
+frozen block as a preconditioner, which is why the smoother consumes the frozen coefficients.
 
 What this test pins is the outcome: several sweeps at a step size and geometry that used
 to blow up must stay bounded, for a strongly sublinear law as well as a linear one.
@@ -115,7 +114,7 @@ def main():
         f'the DIVA smoother diverges for a sublinear sliding law: max|u| reached '
         f'{max(sub):.3g} over {N_SWEEPS} sweeps. Something has reintroduced a velocity '
         f'dependence of the drag coefficient into the local block -- beta_eff must enter '
-        f'it as a FROZEN coefficient, like eta_bar. See notes/diva_numerics.md 5.2.')
+        f'it as a FROZEN coefficient, like eta_bar.')
 
     # The two laws must stay comparable: a sublinear law is not intrinsically harder for a
     # frozen-coefficient block, and a large gap would be the early warning.

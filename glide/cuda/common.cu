@@ -12,6 +12,17 @@
 #ifndef GLIDE_MOLHO
 #define GLIDE_MOLHO 1
 #endif
+
+// Second compile-time switch, orthogonal to GLIDE_MOLHO. GLIDE_DIVA=1 (passed
+// as -DGLIDE_DIVA=1 when grid.stress_scheme == 'diva') selects the depth-
+// integrated viscosity approximation. It is only ever set together with
+// GLIDE_MOLHO=0: DIVA reuses the SSA 2-field momentum system and 5-DOF patch,
+// and differs only by reading two cell-local closure coefficients (the depth-
+// averaged viscosity eta_bar and the effective drag beta_eff, produced by
+// cuda/diva.cu) in place of the inline SSA viscosity and Weertman drag.
+#ifndef GLIDE_DIVA
+#define GLIDE_DIVA 0
+#endif
 struct DualFloat {
     float v; // Primal value
     float d; // Derivative/Perturbation component
@@ -61,6 +72,28 @@ struct DualFloat {
 	return {a.v * inv_s, a.d * inv_s};
     }
 
+    // Division: (u / v, (du*v - u*dv) / v^2)
+    __device__ __forceinline__ friend DualFloat operator/(DualFloat a, DualFloat b) {
+        float inv_b = 1.0f / b.v;
+        return {a.v * inv_b, (a.d * b.v - a.v * b.d) * inv_b * inv_b};
+    }
+
+    // Scalar over dual: (s / v, -s*dv / v^2)
+    __device__ __forceinline__ friend DualFloat operator/(float s, DualFloat a) {
+        float inv_a = 1.0f / a.v;
+        return {s * inv_a, -s * a.d * inv_a * inv_a};
+    }
+
+    // Scalar minus dual: (s - u, -du)
+    __device__ __forceinline__ friend DualFloat operator-(float s, DualFloat a) {
+        return {s - a.v, -a.d};
+    }
+
+    // Negation: (-u, -du)
+    __device__ __forceinline__ friend DualFloat operator-(DualFloat a) {
+        return {-a.v, -a.d};
+    }
+
 };
 
 __device__ __forceinline__ DualFloat __powf(DualFloat u, float p) {
@@ -72,6 +105,39 @@ __device__ __forceinline__ DualFloat __powf(DualFloat u, float p) {
     float deriv = p * __powf(u.v, p - 1.0f) * u.d;
 
     return {val, deriv};
+}
+
+// DualFloat math helpers used by the DIVA closure (diva.cu).  Each applies the plain-float
+// intrinsic to the value and carries the derivative analytically; the plain-float calls resolve
+// to the builtins (different signature), so there is no recursion.
+__device__ __forceinline__ DualFloat fmaxf(DualFloat a, float s) {
+    return a.v >= s ? a : DualFloat{s, 0.0f};
+}
+
+__device__ __forceinline__ DualFloat fminf(DualFloat a, float s) {
+    return a.v <= s ? a : DualFloat{s, 0.0f};
+}
+
+__device__ __forceinline__ DualFloat fminf(DualFloat a, DualFloat b) {
+    return a.v <= b.v ? a : b;
+}
+
+__device__ __forceinline__ DualFloat logf(DualFloat u) {
+    // d/dx(log u) = du/u.  Needed for the d/dm parameter derivative of the Weertman power.
+    return {logf(u.v), u.d / u.v};
+}
+
+__device__ __forceinline__ DualFloat __powf(DualFloat u, DualFloat p) {
+    // Both base and exponent carry a perturbation: d(u^p) = u^p*((p/u)du + log(u)dp).
+    float val = __powf(u.v, p.v);
+    float deriv = val * (p.v * u.d / u.v + logf(u.v) * p.d);
+    return {val, deriv};
+}
+
+__device__ __forceinline__ DualFloat sqrtf(DualFloat u) {
+    // d/dx(sqrt u) = du/(2 sqrt u); callers regularize u.v away from 0 (eps_reg).
+    float val = sqrtf(u.v);
+    return {val, u.d / (2.0f * val)};
 }
 
 __device__ __forceinline__ float sigmoid(const float z, const float c) {
@@ -145,6 +211,37 @@ __device__ __forceinline__ DualFloat get_cell(const float* __restrict__ arr, con
     j = max(min(j,nx - 1),0);
     int idx = i * nx + j;
     return {arr[idx],darr[idx]};
+}
+
+// Templated facet reads: pick the plain get_* for T=float (perturbation array ignored, may be
+// nullptr) and the dual get_* for T=DualFloat.  A body templated on T (membrane_eps_sq, the DIVA
+// closure) needs this to choose between the two get_* overloads, which differ only in return type.
+template <typename T>
+__device__ __forceinline__ T read_vfacet(const float* __restrict__ u, const float* __restrict__ du,
+                                         int i, int j, int ny, int nx);
+template <>
+__device__ __forceinline__ float read_vfacet<float>(const float* __restrict__ u, const float* __restrict__ du,
+                                         int i, int j, int ny, int nx) {
+    return get_vfacet(u, i, j, ny, nx);
+}
+template <>
+__device__ __forceinline__ DualFloat read_vfacet<DualFloat>(const float* __restrict__ u, const float* __restrict__ du,
+                                         int i, int j, int ny, int nx) {
+    return get_vfacet(u, du, i, j, ny, nx);
+}
+
+template <typename T>
+__device__ __forceinline__ T read_hfacet(const float* __restrict__ v, const float* __restrict__ dv,
+                                         int i, int j, int ny, int nx);
+template <>
+__device__ __forceinline__ float read_hfacet<float>(const float* __restrict__ v, const float* __restrict__ dv,
+                                         int i, int j, int ny, int nx) {
+    return get_hfacet(v, i, j, ny, nx);
+}
+template <>
+__device__ __forceinline__ DualFloat read_hfacet<DualFloat>(const float* __restrict__ v, const float* __restrict__ dv,
+                                         int i, int j, int ny, int nx) {
+    return get_hfacet(v, dv, i, j, ny, nx);
 }
 
 /* =====================================================================

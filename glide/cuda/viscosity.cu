@@ -628,3 +628,71 @@ DualFloat get_eta_H_vertex_dual(EtaHVertexStencilDual s) {
 }
 
 
+
+
+/*=========================================================
+  ==== DIVA: shared membrane strain invariant (eps_II) ====
+  =========================================================*/
+// Templated, UNREGULARIZED second invariant of the horizontal strain rate, used by the DIVA
+// closure (diva.cu) which must add the vertical shear terms before forming eta.  Same formula
+// as the inline strain in populate_viscosity above; kept as a standalone helper so the DIVA
+// path can reuse it for both the primal (T=float) and the tangent (T=DualFloat).
+template <typename T>
+__device__ __forceinline__
+T membrane_eps_sq(
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ du,     // perturbation arrays; ignored when T = float
+    const float* __restrict__ dv,
+    int i, int j,
+    float dx,
+    int ny, int nx){
+
+    // THE single definition of the membrane strain-rate invariant, returned UNREGULARIZED
+    // so callers can add eps_reg (SSA) or the vertical shear terms first (DIVA).
+    //
+    // Templated on the scalar type: T = float for the residual and the smoothers, T =
+    // DualFloat for the JVP and VJP, where the same expression run in dual arithmetic
+    // yields d(eps)/d(direction) with nothing differentiated by hand.  This expression used
+    // to exist in four near-identical copies -- float and dual populate_viscosity here, and
+    // float and dual get_membrane_eps_sq in diva.cu -- which all had to be kept in step by
+    // hand.  They are now thin wrappers around this.
+    //
+    // Each corner term carries a mask because the accessors CLAMP out-of-range indices
+    // (see common.cu): a clamped read at the domain edge would otherwise fabricate a
+    // strain rate from a repeated value.  The masks stay plain floats -- they are geometry,
+    // not state, so they carry no derivative.
+    float dx_inv = 1.0f/dx;
+
+    T u_l = read_vfacet<T>(u, du, i, j, ny, nx);
+    T u_r = read_vfacet<T>(u, du, i, j + 1, ny, nx);
+    T v_t = read_hfacet<T>(v, dv, i, j, ny, nx);
+    T v_b = read_hfacet<T>(v, dv, i + 1, j, ny, nx);
+
+    T dudx = (u_r - u_l)*dx_inv;
+    T dvdy = (v_t - v_b)*dx_inv;
+
+    float tl_mask = i > 0 && j > 0;
+    T u_tl = read_vfacet<T>(u, du, i - 1, j, ny, nx);
+    T v_lt = read_hfacet<T>(v, dv, i, j - 1, ny, nx);
+    T eps_xy_tl = 0.5f*((u_tl - u_l)*dx_inv + (v_t - v_lt)*dx_inv)*tl_mask;
+
+    float tr_mask = i > 0 && j < (nx - 1);
+    T u_tr = read_vfacet<T>(u, du, i - 1, j + 1, ny, nx);
+    T v_rt = read_hfacet<T>(v, dv, i, j + 1, ny, nx);
+    T eps_xy_tr = 0.5f*((u_tr - u_r)*dx_inv + (v_rt - v_t)*dx_inv)*tr_mask;
+
+    float bl_mask = i < (ny - 1) && j > 0;
+    T u_bl = read_vfacet<T>(u, du, i + 1, j, ny, nx);
+    T v_lb = read_hfacet<T>(v, dv, i + 1, j - 1, ny, nx);
+    T eps_xy_bl = 0.5f*((u_l - u_bl)*dx_inv + (v_b - v_lb)*dx_inv)*bl_mask;
+
+    float br_mask = i < (ny - 1) && j < (nx - 1);
+    T u_br = read_vfacet<T>(u, du, i + 1, j + 1, ny, nx);
+    T v_rb = read_hfacet<T>(v, dv, i + 1, j + 1, ny, nx);
+    T eps_xy_br = 0.5f*((u_r - u_br)*dx_inv + (v_rb - v_b)*dx_inv)*br_mask;
+
+    T eps_xy2_bar = 0.25f*(eps_xy_tl*eps_xy_tl + eps_xy_tr*eps_xy_tr + eps_xy_bl*eps_xy_bl + eps_xy_br*eps_xy_br);
+
+    return dudx*dudx + dvdy*dvdy + dudx*dvdy + eps_xy2_bar;
+}

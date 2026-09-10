@@ -63,36 +63,49 @@ class IceDynamics:
         for f in self._post_forward_hooks:
             f(t+dt)
 
-    def backward(self,t,dt,dJdu=None,dJdv=None,dJdud=None,dJdvd=None,dJdH=None,
+    def backward(self,t,dt,dJdu=None,dJdv=None,dJdud=None,dJdvd=None,dJdH=None,dJdu_s=None,
             compute_beta_grad=True,compute_bed_grad=True,
             compute_H_prev_grad=True,compute_smb_grad=True):
-        if dJdu is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_u[:,:] = -dJdu
+        """Solve the adjoint and reduce it onto the parameter gradients.
+
+        ``dJdu``/``dJdv``/``dJdud``/``dJdvd``/``dJdH`` are cotangents on the solved state.
+
+        ``dJdu_s`` is the cotangent on the DIVA SURFACE speed (per cell), and enters differently:
+        u_s is not a state variable, so its cotangent is scattered to the velocity/thickness rows
+        through the closure (diva_surface_misfit_rhs), and u_s depends on the sliding parameters
+        DIRECTLY, so an explicit sum_c cot_c d(u_s)_c/dp term is added after the reduction.  DIVA
+        only.  See notes/diva_numerics.md 6.5, notes/diva_adjoint_map.md."""
+        ao = self.mg.levels[self.top_level].adjoint_operators
+
+        # Surface term first: diva_surface_misfit_rhs FILLS f_u/f_v/f_H with -dJ/d(u,v,H), so the
+        # depth-averaged cotangents accumulate on top of it rather than the reverse.
+        if dJdu_s is not None:
+            if ao.diva_surface_misfit_rhs(dJdu_s)[0] is None:
+                raise ValueError(
+                    "dJdu_s requires DIVA (stress_scheme='diva'): under SSA/MOLHO the surface and "
+                    "depth-averaged velocities coincide, so pass the misfit through dJdu/dJdv.")
         else:
-            self.mg.levels[self.top_level].adjoint_operators.f_u.fill(0.0)            
-        if dJdud is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_ud[:,:] = -dJdud
-        else:
-            self.mg.levels[self.top_level].adjoint_operators.f_ud.fill(0.0)            
-        if dJdv is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_v[:,:] = -dJdv
-        else:
-            self.mg.levels[self.top_level].adjoint_operators.f_v.fill(0.0)
-        if dJdvd is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_vd[:,:] = -dJdvd
-        else:
-            self.mg.levels[self.top_level].adjoint_operators.f_vd.fill(0.0)            
-        if dJdH is not None:
-            self.mg.levels[self.top_level].adjoint_operators.f_H[:,:] = -dJdH
-        else:    
-            self.mg.levels[self.top_level].adjoint_operators.f_H.fill(0.0)
+            ao.f_u.fill(0.0); ao.f_v.fill(0.0); ao.f_H.fill(0.0)
+        if dJdu is not None: ao.f_u -= dJdu
+        if dJdv is not None: ao.f_v -= dJdv
+        if dJdH is not None: ao.f_H -= dJdH
+
+        # Deformational rows (MOLHO only); u_s has no deformational analogue.
+        if dJdud is not None: ao.f_ud[:,:] = -dJdud
+        else: ao.f_ud.fill(0.0)
+        if dJdvd is not None: ao.f_vd[:,:] = -dJdvd
+        else: ao.f_vd.fill(0.0)
 
         converged = self.adjoint_solver.solve(dt,start_level=self.top_level)
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_beta()
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_bed()
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_H_prev(dt)
-        self.mg.levels[self.top_level].adjoint_operators.compute_gradient_smb()
+        ao.compute_gradient_beta()
+        ao.compute_gradient_bed()
+        ao.compute_gradient_H_prev(dt)
+        ao.compute_gradient_smb()
 
+        # The explicit parameter dependence of u_s, which only a surface objective has.
+        if dJdu_s is not None:
+            sliding = self.mg.levels[self.top_level].sliding
+            sliding.beta.grad[:] += ao.diva_surface_param_gradient(dJdu_s,'beta')
 
         return converged
         

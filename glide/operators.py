@@ -1,4 +1,5 @@
 import cupy as cp
+import numpy as np
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -12,8 +13,8 @@ class ForwardOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu']
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu',
+                          'flux.cu', 'residuals.cu', 'vanka.cu', 'grad.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:
@@ -23,6 +24,9 @@ class ForwardOperators:
         # Compile-time stress scheme specialization: the SSA build removes
         # all deformational physics and solves 5x5 patches (see common.cu)
         options += ("-DGLIDE_MOLHO=%d" % (0 if grid.ssa else 1),)
+        # DIVA rides the SSA-shaped build (GLIDE_MOLHO=0) and toggles the
+        # closure-coefficient reads; only ever 1 when grid.ssa is also True.
+        options += ("-DGLIDE_DIVA=%d" % (1 if grid.diva else 0),)
 
         self.kernels = cp.RawModule(code=cuda_source, options=options)
 
@@ -67,6 +71,86 @@ class ForwardOperators:
 
         self.vanka_config = VankaConfig()
 
+        # DIVA: cached Gauss-Legendre quadrature (rebuilt only when n_sigma changes) and the
+        # per-cell closure-cap counter.  Unused (and unallocated) under SSA/MOLHO.
+        self._gl_n = None
+        self._gl_zeta = None
+        self._gl_w = None
+        self._diva_caps = None
+
+    def _quadrature(self):
+        """Gauss-Legendre nodes and weights on [0,1] for DIVA's vertical integrals.
+
+        The integrands are zeta/eta and zeta^2/eta, and eta ~ zeta^(1-n) where the shear
+        dominates, so Gauss-Legendre integrates them exactly with a handful of nodes (4 Gauss
+        nodes match 32+ midpoint nodes; notes/diva_numerics.md 3.1).  Built on the host, cached
+        on n_sigma, weights scaled to sum to 1 so the eta accumulation is a depth AVERAGE.
+        """
+        n = int(self.grid.rheology.n_sigma.value)
+        if self._gl_n != n:
+            x, w = np.polynomial.legendre.leggauss(n)
+            self._gl_zeta = cp.asarray(0.5*(x + 1.0), dtype=cp.float32)
+            self._gl_w = cp.asarray(0.5*w, dtype=cp.float32)
+            self._gl_n = n
+        return self._gl_zeta, self._gl_w
+
+    def compute_diva_coeffs(self):
+        """Diagnose the DIVA coefficients (eta_bar, F1, F2, beta_eff) and the basal/surface
+        speeds (u_b, u_s) from the current state, via the per-cell column closure.  Only called
+        on DIVA grids; the residual/JVP/Vanka read these as frozen coefficients."""
+        kernel = self.kernels.get_function('compute_diva_coeffs')
+        grid_size, block_size, stride, halo = self._kernel_config
+        if self._diva_caps is None:
+            self._diva_caps = cp.zeros((self.grid.ny, self.grid.nx), dtype=cp.float32)
+
+        grid = self.grid
+        state, rheology, sliding = grid.state, grid.rheology, grid.sliding
+
+        kernel(grid_size, block_size,
+                   (rheology.eta_bar.data, rheology.F2.data, state.u_b.data,
+                    sliding.beta_eff.data, rheology.F1.data, state.u_s.data, self._diva_caps,
+                    *self._quadrature(),
+                    state.u.data, state.v.data, state.H.data, state.phi.data,
+                    rheology.B.data, sliding.beta.data, sliding.u_c.data,
+                    sliding.m.value, sliding.u_reg.value,
+                    sliding.water_drag.value, sliding.sliding_law.value,
+                    rheology.n.value, rheology.eps_reg.value,
+                    rheology.eps_reg_shear.value, grid.dx,
+                    int(rheology.n_sigma.value),
+                    grid.ny, grid.nx,
+                    stride, halo))
+
+    def diva_cap_counts(self):
+        """Cells whose closure Newton (bit 0) or per-level eta solve (bit 1) hit its iteration
+        cap in the last compute_diva_coeffs.  An adaptive loop that silently caps looks converged,
+        so this lets a test assert it did not.  Returns (n_closure_capped, n_eta_capped)."""
+        if self._diva_caps is None:
+            return 0, 0
+        flags = self._diva_caps.astype(cp.int32)
+        return int(cp.count_nonzero(flags & 1)), int(cp.count_nonzero(flags & 2))
+
+    def compute_diva_derivs(self):
+        """Total derivatives of the DIVA cell closure (one dual seeding per input): eta_bar,
+        beta_eff and u_s w.r.t. eps_mem^2, Ubar and H (state legs) and beta, u_c, m (parameters).
+        These are what the exact adjoint and the parameter gradients consume."""
+        kernel = self.kernels.get_function('compute_diva_derivs')
+        grid_size, block_size, stride, halo = self._kernel_config
+        grid = self.grid
+        state, rheology, sliding = grid.state, grid.rheology, grid.sliding
+        kernel(grid_size, block_size,
+               (rheology.deta_deps.data, rheology.deta_dU.data, rheology.dbe_deps.data, rheology.dbe_dU.data,
+                rheology.deta_dbeta.data, rheology.dbe_dbeta.data, rheology.deta_duc.data, rheology.dbe_duc.data,
+                rheology.deta_dm.data, rheology.dbe_dm.data,
+                rheology.dus_deps.data, rheology.dus_dU.data, rheology.dus_dbeta.data,
+                rheology.dus_duc.data, rheology.dus_dm.data,
+                rheology.deta_dH.data, rheology.dbe_dH.data, rheology.dus_dH.data,
+                state.u.data, state.v.data, state.H.data, state.phi.data,
+                rheology.B.data, sliding.beta.data, sliding.u_c.data, state.u_b.data,
+                sliding.m.value, sliding.u_reg.value, sliding.water_drag.value, sliding.sliding_law.value,
+                rheology.n.value, rheology.eps_reg.value, rheology.eps_reg_shear.value, grid.dx,
+                int(rheology.n_sigma.value), *self._quadrature(),
+                grid.ny, grid.nx, stride, halo))
+
     @property
     def _kernel_config(self):
         block_size = (16, 16)
@@ -75,7 +159,7 @@ class ForwardOperators:
         grid_size = (self.grid.nx // stride + 1, self.grid.ny // stride + 1)
         return grid_size, block_size, stride, halo
 
-    def compute_residual(self, dt, 
+    def compute_residual(self, dt,
             use_mask=True, 
             operator_only=False, 
             freeze_calving=False, 
@@ -117,23 +201,28 @@ class ForwardOperators:
             out_H = self.r_H
             use_forcing = True
 
-        kernel(grid_size, block_size,
-               (out_u, out_v, out_ud, out_vd, out_H,
-                state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data, 
+        if grid.diva:
+            self.compute_diva_coeffs()      # refresh eta_bar/beta_eff consistent with the state
+
+        args = (out_u, out_v, out_ud, out_vd, out_H,
+                state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data,
                 state.phi.data, state.xi.data, state.mask.data,
                 self.f_u, self.f_v, self.f_ud, self.f_vd, self.f_H,
-                geometry.bed.data, 
-                rheology.B.data, 
+                geometry.bed.data,
+                rheology.B.data,
                 sliding.beta.data,
                 self.gamma,
                 use_forcing,use_mask,bool(grid.ssa),
                 rheology.n.value, rheology.eps_reg.value, rheology.H_reg.value,
                 geometry.sigmoid_c.value,
-                sliding.m.value, sliding.u_reg.value, 
+                sliding.m.value, sliding.u_reg.value,
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
-                grid.ny, grid.nx, stride, halo)) 
+                grid.ny, grid.nx, stride, halo)
+        if grid.diva:
+            args = args + (rheology.eta_bar.data, sliding.beta_eff.data)
+        kernel(grid_size, block_size, args)
 
         if return_norms:
             return cp.linalg.norm(out_u),cp.linalg.norm(out_v),cp.linalg.norm(out_ud),cp.linalg.norm(out_vd),cp.linalg.norm(out_H)
@@ -164,8 +253,10 @@ class ForwardOperators:
             self.compute_phi()
             self.compute_xi()
 
-        kernel(grid_size, block_size,
-               (self.jvp_u, self.jvp_v, self.jvp_ud, self.jvp_vd, self.jvp_H,
+        if grid.diva:
+            self.compute_diva_coeffs()      # refresh u_b warm-start / current state
+
+        args = (self.jvp_u, self.jvp_v, self.jvp_ud, self.jvp_vd, self.jvp_H,
                 state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data,
                 self.var_u, self.var_v, self.var_ud, self.var_vd, self.var_H,
                 state.phi.data, state.xi.data, state.mask.data,
@@ -181,7 +272,12 @@ class ForwardOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
-                grid.ny, grid.nx, stride, halo))
+                grid.ny, grid.nx, stride, halo)
+        if grid.diva:
+            args = args + (sliding.u_c.data, state.u_b.data,
+                           sliding.sliding_law.value, rheology.eps_reg_shear.value,
+                           int(rheology.n_sigma.value), *self._quadrature())
+        kernel(grid_size, block_size, args)
 
         if return_norms:
             return (cp.linalg.norm(self.jvp_u), cp.linalg.norm(self.jvp_v),
@@ -247,10 +343,12 @@ class ForwardOperators:
             # the SSA kernel build never scatters deformational deltas
             self.delta_ud.fill(0.0)
             self.delta_vd.fill(0.0)
-        kernel(grid_size, block_size,
-               (self.delta_u, self.delta_v, self.delta_ud, self.delta_vd, self.delta_H,
+        if grid.diva:
+            self.compute_diva_coeffs()      # frozen coefficients consistent with the current state
+
+        args = (self.delta_u, self.delta_v, self.delta_ud, self.delta_vd, self.delta_H,
                 state.mask.data,
-                state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data, 
+                state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data,
                 state.phi.data, state.xi.data,
                 self.f_u, self.f_v, self.f_ud, self.f_vd, self.f_H,
                 geometry.bed.data, rheology.B.data, sliding.beta.data,
@@ -270,7 +368,9 @@ class ForwardOperators:
                 cp.float32(self.vanka_config.newton_config.momentum_damping),
                 cp.float32(self.vanka_config.newton_config.mc_damping),
                 bool(grid.ssa))
-        )
+        if grid.diva:
+            args = args + (rheology.eta_bar.data, sliding.beta_eff.data)
+        kernel(grid_size, block_size, args)
 
     def vanka_sweep(self, dt, n_iter, 
             freeze_calving=False,
@@ -425,8 +525,8 @@ class AdjointOperators:
         cuda_dir = Path(__file__).parent / "cuda"
 
         # Concatenate ice kernel files in dependency order
-        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'flux.cu',
-                          'residuals.cu', 'vanka.cu', 'grad.cu']
+        cuda_files = ['common.cu', 'viscosity.cu', 'stress.cu', 'diva.cu',
+                          'flux.cu', 'residuals.cu', 'vanka.cu', 'grad.cu']
         cuda_source = '\n'.join((cuda_dir / f).read_text() for f in cuda_files)
         
         if use_fast_math:
@@ -436,6 +536,9 @@ class AdjointOperators:
         # Compile-time stress scheme specialization: the SSA build removes
         # all deformational physics and solves 5x5 patches (see common.cu)
         options += ("-DGLIDE_MOLHO=%d" % (0 if grid.ssa else 1),)
+        # DIVA rides the SSA-shaped build (GLIDE_MOLHO=0) and toggles the
+        # closure-coefficient reads; only ever 1 when grid.ssa is also True.
+        options += ("-DGLIDE_DIVA=%d" % (1 if grid.diva else 0),)
 
         self.kernels = cp.RawModule(code=cuda_source, options=options)
 
@@ -473,6 +576,14 @@ class AdjointOperators:
 
         self.gamma = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
         self.gamma.fill(grid.geometry.thklim.value)
+
+        # DIVA exact adjoint: per-cell coefficient adjoints (eta_bar, beta_eff) accumulated by
+        # the transpose kernel, then pushed back to velocity/thickness by compute_diva_vjp_coeffs.
+        # Because stock DIVA's velocity block is self-adjoint, this exact 2-pass transpose is the
+        # forward transpose (no growing-mode smoother guard needed).
+        self.diva_exact_coeff_adjoint = True
+        self.W_eta = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
+        self.W_be  = cp.zeros((grid.ny,grid.nx),dtype=cp.float32)
 
         # The adjoint solve is LINEAR: it does not need the heavy damping
         # that protects the forward patch Newton iteration from divergence,
@@ -513,6 +624,7 @@ class AdjointOperators:
         """
         kernel = self.kernels.get_function('compute_vjp')
         grid_size, block_size, stride, halo = self._kernel_config
+        self._last_dt = dt
 
         grid = self.grid
         state = grid.state
@@ -556,8 +668,11 @@ class AdjointOperators:
         out_ud.fill(0)
         out_vd.fill(0)
         out_H.fill(0)
-        kernel(grid_size, block_size,
-               (out_u, out_v, out_ud, out_vd, out_H,
+        if grid.diva:
+            grid.forward_operators.compute_diva_coeffs()   # frozen coeffs at the fixed forward state
+            self.W_eta.fill(0.0)
+            self.W_be.fill(0.0)
+        args = (out_u, out_v, out_ud, out_vd, out_H,
                 state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data,
                 self.lam_free_u, self.lam_free_v,
                 self.lam_free_ud, self.lam_free_vd, self.lam_free_H,
@@ -574,7 +689,11 @@ class AdjointOperators:
                 sliding.water_drag.value, sliding.flotation_reg_sliding.value,
                 calving_rate, calving.flotation_reg_calving.value,
                 grid.dx, dt,
-                grid.ny, grid.nx, stride, halo))
+                grid.ny, grid.nx, stride, halo)
+        if grid.diva:
+            args = args + (rheology.eta_bar.data, sliding.beta_eff.data,
+                           self.W_eta, self.W_be, cp.int32(0))   # freeze_coeffs=0: stock exact transpose
+        kernel(grid_size, block_size, args)
 
         # Identity rows: (J^T lambda)_c = lambda_c + interior contributions
         # (the latter already accumulated by the kernel)
@@ -592,6 +711,27 @@ class AdjointOperators:
             out_vd[-1,:] += adjoint.lambda_vd.data[-1,:]
         if use_mask:
             out_H += state.mask.data*adjoint.lambda_H.data
+
+        if grid.diva and self.diva_exact_coeff_adjoint:
+            self._apply_diva_coeff_adjoints(out_u, out_v, out_H)
+
+    def _apply_diva_coeff_adjoints(self, out_u, out_v, out_H):
+        """Second pass of the exact DIVA transpose: push the per-cell coefficient adjoints
+        W_eta/W_be back to the velocity facets and thickness through the closure derivatives
+        (compute_diva_derivs then compute_diva_vjp_coeffs)."""
+        grid = self.grid
+        rheology = grid.rheology
+        grid.forward_operators.compute_diva_derivs()
+        kernel = self.kernels.get_function('compute_diva_vjp_coeffs')
+        grid_size, block_size, stride, halo = self._kernel_config
+        kernel(grid_size, block_size,
+               (out_u, out_v, out_H,
+                grid.state.u.data, grid.state.v.data,
+                self.W_eta, self.W_be,
+                rheology.deta_deps.data, rheology.deta_dU.data,
+                rheology.dbe_deps.data, rheology.dbe_dU.data,
+                rheology.deta_dH.data, rheology.dbe_dH.data,
+                grid.dx, grid.ny, grid.nx, stride, halo))
 
     def compute_residual(self, dt,
             use_mask=True,
@@ -640,8 +780,9 @@ class AdjointOperators:
         self.delta_lambda_ud.fill(0.0)
         self.delta_lambda_vd.fill(0.0)
         self.delta_lambda_H.fill(0.0)
-        kernel(grid_size, block_size,
-               (self.delta_lambda_u, self.delta_lambda_v,
+        # DIVA: eta_bar/beta_eff are the forward-state closure coefficients (already current for a
+        # fixed adjoint state); the smoother reads them as frozen, exactly like the forward.
+        args = (self.delta_lambda_u, self.delta_lambda_v,
                 self.delta_lambda_ud, self.delta_lambda_vd, self.delta_lambda_H,
                 state.u.data, state.v.data, state.ud.data, state.vd.data, state.H.data,
                 state.phi.data, state.xi.data, state.mask.data,
@@ -663,7 +804,9 @@ class AdjointOperators:
                            else self.vanka_config.newton_config.shear_damping),
                 cp.float32(self.vanka_config.newton_config.mc_damping),
                 bool(grid.ssa))
-        )
+        if grid.diva:
+            args = args + (rheology.eta_bar.data, sliding.beta_eff.data)
+        kernel(grid_size, block_size, args)
 
     def vanka_sweep(self, dt, n_iter,
             freeze_calving=False):
@@ -676,6 +819,75 @@ class AdjointOperators:
             self.grid.adjoint.lambda_vd.data[:] -= self.vanka_config.omega * self.delta_lambda_vd
             self.grid.adjoint.lambda_H.data[:] -= self.vanka_config.omega * self.delta_lambda_H
 
+    def _diva_param_gradient(self, out, deta_dp, dbe_dp, reduce=False):
+        """DIVA parameter gradient dJ/dp = sum_cells (W_eta*deta_dp + W_be*dbe_dp), with W_eta/W_be
+        the coefficient adjoints at the converged multiplier lambda.  A VJP pass re-fills them, and
+        compute_diva_derivs supplies the closure's parameter sensitivities deta_dp/dbe_dp."""
+        grid = self.grid
+        self.compute_vjp(self._last_dt)                 # refill W_eta/W_be at the converged lambda
+        grid.forward_operators.compute_diva_derivs()
+        name = 'compute_gradient_param_sum_diva' if reduce else 'compute_gradient_param_diva'
+        kernel = self.kernels.get_function(name)
+        grid_size, block_size, stride, halo = self._kernel_config
+        out.fill(0)
+        kernel(grid_size, block_size,
+               (out, self.W_eta, self.W_be, deta_dp.data, dbe_dp.data,
+                grid.ny, grid.nx, stride, halo))
+
+    def diva_surface_misfit_rhs(self, cot, out_u=None, out_v=None, out_H=None):
+        """Adjoint right-hand side for an objective built on DIVA SURFACE speed.
+
+        Given the per-cell cotangent ``cot = dJ/d(u_s)``, fills ``(f_u, f_v, f_H) = -dJ/d(u,v,H)``:
+        the surface cotangent scattered to the velocity facets -- and to thickness, since u_s depends
+        on H through the shear moments -- via the closure's stored dus_deps/dus_dU/dus_dH.
+
+        Observations are of SURFACE velocity, and under DIVA that differs from the depth average by
+        the vertical shear (the whole point of the scheme), so an inversion against surface data
+        should route the misfit through here rather than through dJdu/dJdv.  Under SSA there is no
+        shear (u_s == |ubar|), so this is a no-op and returns (None, None); build the RHS from the
+        depth-averaged misfit directly.  See notes/diva_numerics.md 6.5, notes/diva_adjoint_map.md."""
+        if not self.grid.diva:
+            return None, None
+        grid = self.grid
+        if out_u is None:
+            out_u, out_v = self.f_u, self.f_v
+            if out_H is None:
+                out_H = self.f_H
+        out_u.fill(0); out_v.fill(0)
+        if out_H is not None:
+            out_H.fill(0)
+        # dus_* must match the current state; they are written by the forward derivative kernel.
+        grid.forward_operators.compute_diva_derivs()
+        kernel = self.kernels.get_function('compute_diva_us_vjp')
+        grid_size, block_size, stride, halo = self._kernel_config
+        kernel(grid_size, block_size,
+               (out_u, out_v, out_H,
+                grid.state.u.data, grid.state.v.data,
+                cot, grid.rheology.dus_deps.data, grid.rheology.dus_dU.data,
+                grid.rheology.dus_dH.data,
+                grid.dx, grid.ny, grid.nx, stride, halo))
+        out_u *= -1.0; out_v *= -1.0            # f = -dJ/dx
+        if out_H is not None:
+            out_H *= -1.0
+        return out_u, out_v
+
+    def diva_surface_param_gradient(self, cot, param):
+        """The EXPLICIT dJ/d(param) term a surface objective adds on top of lambda^T dr/dp.
+
+        u_s depends on beta, u_c and m DIRECTLY through the closure, so the usual adjoint gradient
+        (which assumes the objective sees the parameters only through the state) is incomplete:
+
+            dJ/dp = sum_c cot_c * d(u_s)_c/dp  +  lambda^T dr/dp
+
+        This returns the first, cell-local term.  Field-shaped for beta/u_c, scalar for the global m;
+        None under SSA (u_s == ubar, no explicit dependence)."""
+        if not self.grid.diva:
+            return None
+        rheology = self.grid.rheology
+        field = {'beta': rheology.dus_dbeta, 'u_c': rheology.dus_duc, 'm': rheology.dus_dm}[param]
+        term = cot * field.data
+        return float(cp.sum(term)) if param == 'm' else term
+
     def compute_gradient_beta(self):
         kernel = self.kernels.get_function('compute_gradient_beta')
         grid_size, block_size, stride, halo = self._kernel_config
@@ -683,11 +895,17 @@ class AdjointOperators:
         grid = self.grid
         state = grid.state
         adjoint = grid.adjoint
-        geometry = grid.geometry        
+        geometry = grid.geometry
         rheology = grid.rheology
         sliding = grid.sliding
         calving = grid.calving
         forcing = grid.forcing
+
+        if grid.diva:
+            # DIVA: dR/dbeta flows through the closure (beta -> beta_eff, eta_bar), so the gradient
+            # is the coefficient-adjoint contraction, not the direct SSA sliding-law transpose.
+            self._diva_param_gradient(sliding.beta.grad, rheology.deta_dbeta, rheology.dbe_dbeta)
+            return
 
         if grid.ssa:
             # SSA mode: all ud/vd rows are identity rows with no beta

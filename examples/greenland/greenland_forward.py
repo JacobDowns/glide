@@ -21,9 +21,11 @@ dataset = load_greenland_preprocessed()
 ### Initialize grid
 # ny and nx must both divide by 2^(n_levels - 1) cleanly!
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
+# Stress balance: 'ssa', 'molho' (MOLHO-MI) or 'diva'.
+stress_scheme = 'molho'
 model = IceDynamics(n_levels=6,ny=ny,nx=nx,dx=dx,
         x0=dataset.x[0].item(),y0=dataset.y[0].item(),
-        crs=pyproj.CRS("EPSG:3413"),stress_scheme='molho')
+        crs=pyproj.CRS("EPSG:3413"),stress_scheme=stress_scheme)
 mg = model.mg
 
 ### Initialize state
@@ -46,6 +48,9 @@ mg.rheology.B.set(B)
 mg.rheology.eps_reg.set(1e-6)
 mg.rheology.n.set(3.0)
 mg.rheology.H_reg.set(25.0)
+if stress_scheme == 'diva':
+    mg.rheology.n_sigma.set(6.0)          # vertical quadrature points (velocity converged by ~6)
+    mg.rheology.eps_reg_shear.set(1e-6)
 
 ### Initialize sliding
 BETA_PATH = None
@@ -85,9 +90,11 @@ model.forward_solver.vanka_options.omega.set(cp.float32(0.25))
 model.forward_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
 model.forward_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-6))
 
-# Derived surface velocity fields: with the MOLHO ansatz the surface
-# velocity is u_bar + u_d/(n+1). These are refreshed from the state in the
-# time loop before each write.
+# Derived surface velocity fields.  Under MOLHO the surface velocity is
+# u_bar + u_d/(n+1); under SSA there is no vertical shear (u_d = 0) so it is
+# just u_bar; under DIVA the closure gives the surface SPEED u_s (a cell
+# field), which we map onto the facet velocity vector below.  Refreshed from
+# the state in the time loop before each write.
 n_glen = float(mg[0].rheology.n.value)
 u_s = Field(
         data=cp.zeros((ny,nx+1),dtype=cp.float32),
@@ -118,8 +125,19 @@ srf  = Field(
             
 
 def update_surface_velocity():
-    u_s.data[:,:] = mg[0].state.u.data + mg[0].state.ud.data/(n_glen + 1.0)
-    v_s.data[:,:] = mg[0].state.v.data + mg[0].state.vd.data/(n_glen + 1.0)
+    if stress_scheme == 'diva':
+        # The DIVA closure stores the surface SPEED u_s per cell.  Scale the depth-averaged facet
+        # velocities by the local surface/mean speed ratio to recover the surface velocity vector.
+        u = mg[0].state.u.data; v = mg[0].state.v.data
+        ubar = cp.hypot(0.5*(u[:,1:]+u[:,:-1]), 0.5*(v[1:]+v[:-1]))
+        r = mg[0].state.u_s.data/(ubar + 1e-6)                 # surface/mean ratio (cells)
+        rx = cp.empty_like(u); rx[:,1:-1] = 0.5*(r[:,1:]+r[:,:-1]); rx[:,0] = r[:,0]; rx[:,-1] = r[:,-1]
+        ry = cp.empty_like(v); ry[1:-1] = 0.5*(r[1:]+r[:-1]); ry[0] = r[0]; ry[-1] = r[-1]
+        u_s.data[:,:] = u*rx
+        v_s.data[:,:] = v*ry
+    else:
+        u_s.data[:,:] = mg[0].state.u.data + mg[0].state.ud.data/(n_glen + 1.0)
+        v_s.data[:,:] = mg[0].state.v.data + mg[0].state.vd.data/(n_glen + 1.0)
 
 def update_basal_velocity():
     u_b.data[:,:] = mg[0].state.u.data - mg[0].state.ud.data

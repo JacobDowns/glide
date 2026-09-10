@@ -105,13 +105,21 @@ class Multigrid:
         coarse_grid.rheology.n.set(fine_grid.rheology.n.value)
         coarse_grid.rheology.eps_reg.set(fine_grid.rheology.eps_reg.value)
         coarse_grid.rheology.H_reg.set(fine_grid.rheology.H_reg.value)
-    
+        if fine_grid.diva:
+            # DIVA closure constants must match across levels (eta_bar/beta_eff are recomputed
+            # per level, so the coefficient fields themselves need no restriction).
+            coarse_grid.rheology.eps_reg_shear.set(fine_grid.rheology.eps_reg_shear.value)
+            coarse_grid.rheology.n_sigma.set(fine_grid.rheology.n_sigma.value)
+
     def restrict_sliding(self,fine_grid,coarse_grid):
         self.restrict_cell(fine_grid.sliding.beta.data,coarse_grid.sliding.beta.data)
         coarse_grid.sliding.m.set(fine_grid.sliding.m.value)
         coarse_grid.sliding.u_reg.set(fine_grid.sliding.u_reg.value)
         coarse_grid.sliding.water_drag.set(fine_grid.sliding.water_drag.value)
         coarse_grid.sliding.flotation_reg_sliding.set(fine_grid.sliding.flotation_reg_sliding.value)
+        if fine_grid.diva:
+            coarse_grid.sliding.sliding_law.set(fine_grid.sliding.sliding_law.value)
+            self.restrict_cell(fine_grid.sliding.u_c.data,coarse_grid.sliding.u_c.data)
 
     def restrict_calving(self,fine_grid,coarse_grid):
         coarse_grid.calving.calving_rate.set(fine_grid.calving.calving_rate.value)
@@ -474,6 +482,21 @@ class MGRheologyManager:
             restrict=lambda f,c: c.set(f.value),
             name="H_reg",
         )
+
+        # DIVA closure constants (broadcast to every level); harmless for SSA/MOLHO,
+        # where these are unused defaults.
+        self.eps_reg_shear = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.eps_reg_shear,
+            restrict=lambda f,c: c.set(f.value),
+            name="eps_reg_shear",
+        )
+        self.n_sigma = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.rheology.n_sigma,
+            restrict=lambda f,c: c.set(f.value),
+            name="n_sigma",
+        )
     def __repr__(self):
         return f'Top-level ({self.mg.n_levels} levels): \n'+self.mg.levels[0].rheology.__repr__()
 
@@ -513,6 +536,21 @@ class MGSlidingManager:
             getter=lambda g: g.sliding.flotation_reg_sliding,
             restrict=lambda f,c: c.set(f.value),
             name="flotation_reg_sliding",
+        )
+
+        # DIVA sliding-law selector + regularized-Coulomb transition speed (u_c is a cell
+        # field like beta; only present on DIVA grids).
+        self.sliding_law = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.sliding_law,
+            restrict=lambda f,c: c.set(f.value),
+            name="sliding_law",
+        )
+        self.u_c = HierarchyFieldManager(
+            mg.levels,
+            getter=lambda g: g.sliding.u_c,
+            restrict=lambda f,c: mg.restrict_cell(f.data,c.data,method='avg'),
+            name="u_c",
         )
 
     def __repr__(self):

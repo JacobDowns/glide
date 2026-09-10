@@ -16,6 +16,8 @@ class State:
     phi: Field | None = None
     xi: Field | None = None
     mask: Field | None = None
+    u_b: Field | None = None          # DIVA basal sliding speed |u_b| (None/zero under SSA & MOLHO)
+    u_s: Field | None = None          # DIVA surface speed |u_s| = u_b + tau_b*F1
 
     def __repr__(self):
         return f'{self.u.compact_string}\n{self.v.compact_string}\n{self.H.compact_string}\n{self.H_prev.compact_string}\n{self.phi.compact_string}\n{self.mask.compact_string}'
@@ -105,12 +107,62 @@ class Rheology:
                                  unregularized model.")})
         )
 
+    # --- DIVA closure (all None / zero under SSA & MOLHO) ---------------------------
+    eta_bar: Field | None = None      # depth-averaged effective viscosity (diagnostic)
+    F1: Field | None = None           # first shear moment H*int(zeta/eta)dzeta -> surface speed
+    F2: Field | None = None           # second shear moment H*int(zeta^2/eta)dzeta -> beta_eff
+    # closure sensitivities carried for the exact 2-pass adjoint (velocity + H) and param gradients:
+    deta_deps: Field | None = None    # d(eta_bar)/d(eps_mem^2)
+    deta_dU: Field | None = None      # d(eta_bar)/d(Ubar)
+    dbe_deps: Field | None = None     # d(beta_eff)/d(eps_mem^2)
+    dbe_dU: Field | None = None       # d(beta_eff)/d(Ubar)
+    deta_dH: Field | None = None      # d(eta_bar)/d(H)  -- the closure's own thickness dependence
+    dbe_dH: Field | None = None       # d(beta_eff)/d(H)
+    deta_dbeta: Field | None = None   # d(eta_bar)/d(beta)  -- parameter gradients
+    dbe_dbeta: Field | None = None    # d(beta_eff)/d(beta)
+    deta_duc: Field | None = None     # d(eta_bar)/d(u_c)   -- zero under Weertman
+    dbe_duc: Field | None = None      # d(beta_eff)/d(u_c)
+    deta_dm: Field | None = None      # d(eta_bar)/d(m)     -- zero under Coulomb
+    dbe_dm: Field | None = None       # d(beta_eff)/d(m)
+    dus_deps: Field | None = None     # d(u_s)/d(...)  -- surface-velocity objectives
+    dus_dU: Field | None = None
+    dus_dbeta: Field | None = None
+    dus_duc: Field | None = None
+    dus_dm: Field | None = None
+    dus_dH: Field | None = None
+    eps_reg_shear: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(1e-12),
+            name='eps_reg_shear',
+            units='s^{-2}',
+            attrs={'long_name':'''DIVA-only strain-invariant regularizer for the SHEAR MOMENTS
+                         F1 and F2.  Much smaller than eps_reg because those integrals converge
+                         as it goes to zero, while eta_bar (which keeps eps_reg, applied as a
+                         cap) does not.  See notes/diva_numerics.md 3.2.'''})
+        )
+    n_sigma: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(8.0),
+            name='n_sigma',
+            units='',
+            attrs={'long_name':'DIVA number of vertical sigma levels (Gauss-Legendre quadrature)'})
+        )
+
     def __repr__(self):
         return f'{self.B.compact_string}\n{self.n}\n{self.eps_reg}\n{self.H_reg}'
     
 @dataclass
 class Sliding:
     beta: Field | None = None
+    u_c: Field | None = None          # DIVA regularized-Coulomb rate-transition speed (unused by Weertman)
+    beta_eff: Field | None = None     # DIVA secant drag c/(1 + c*F2); grounding already folded in
+    sliding_law: Constant = field(
+        default_factory = lambda: Constant(
+            value=cp.float32(0.0),
+            name='sliding_law',
+            units='',
+            attrs={'long_name':'0 = Weertman power law, 1 = regularized Coulomb (DIVA only)'})
+        )
     m: Constant = field(
         default_factory = lambda: Constant(
             value=cp.float32(1.0),
@@ -224,10 +276,18 @@ class Grid:
         # rows, which reduces the momentum balance exactly to the SSA. The
         # state always carries ud/vd (identically zero under SSA) so all
         # downstream code is scheme-agnostic.
-        if stress_scheme not in ('molho', 'ssa'):
-            raise ValueError("stress_scheme must be 'molho' or 'ssa'")
+        #
+        # 'diva' (depth-integrated viscosity approximation) shares the SSA
+        # 2-field (u,v,H) momentum system and 5-DOF Vanka patch -- so it sets
+        # ssa=True to select the SSA-shaped build -- but swaps in two cell-local
+        # closure coefficients: the depth-averaged viscosity eta_bar and the
+        # effective basal drag beta_eff (see cuda/diva.cu). The GLIDE_DIVA
+        # compile flag, distinct from ssa, selects those coefficient reads.
+        if stress_scheme not in ('molho', 'ssa', 'diva'):
+            raise ValueError("stress_scheme must be 'molho', 'ssa', or 'diva'")
         self.stress_scheme = stress_scheme
-        self.ssa = stress_scheme == 'ssa'
+        self.ssa = stress_scheme in ('ssa', 'diva')
+        self.diva = stress_scheme == 'diva'
         
         self.ny = ny
         self.nx = nx
@@ -367,7 +427,17 @@ class Grid:
             attrs={'long_name':'''Active set mask - if unity, thickness is 
                          set to thklim in Dirichlet BC fashion'''})
 
-        return State(u=u,v=v,ud=ud,vd=vd,H=H,H_prev=H_prev,phi=phi,xi=xi,mask=mask)
+        if not self.diva:
+            return State(u=u,v=v,ud=ud,vd=vd,H=H,H_prev=H_prev,phi=phi,xi=xi,mask=mask)
+
+        # DIVA carries the per-cell basal and surface speeds diagnosed by the closure.
+        def _cell(name, long_name):
+            return Field(data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+                         grid_entity=GridEntity.CELL, dx=self.dx, grid=self,
+                         name=name, units='m a^{-1}', attrs={'long_name':long_name})
+        u_b = _cell('u_b','DIVA basal sliding speed |u_b|')
+        u_s = _cell('u_s','DIVA surface speed |u_s| = u_b + tau_b*F1')
+        return State(u=u,v=v,ud=ud,vd=vd,H=H,H_prev=H_prev,phi=phi,xi=xi,mask=mask,u_b=u_b,u_s=u_s)
 
     def _allocate_adjoint_state(self):
         lambda_u = Field(
@@ -448,7 +518,37 @@ class Grid:
             units='m',
             attrs={'long_name':'Rheologic prefactor.  B=A^{-1/n}'})
 
-        return Rheology(B=B)
+        if not self.diva:
+            return Rheology(B=B)
+
+        # DIVA closure diagnostics + adjoint sensitivities, all cell-centred.
+        def _cell(name, units, long_name):
+            return Field(data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+                         grid_entity=GridEntity.CELL, dx=self.dx, grid=self,
+                         name=name, units=units, attrs={'long_name':long_name})
+
+        return Rheology(B=B,
+            eta_bar=_cell('eta_bar','Pa a','DIVA depth-averaged effective viscosity'),
+            F1=_cell('F1','a','DIVA first shear moment H*int(zeta/eta)dzeta'),
+            F2=_cell('F2','a Pa^{-1}','DIVA second shear moment H*int(zeta^2/eta)dzeta'),
+            deta_deps=_cell('deta_deps','Pa a^3','DIVA d(eta_bar)/d(eps_mem^2)'),
+            deta_dU=_cell('deta_dU','Pa a^2 m^{-1}','DIVA d(eta_bar)/d(Ubar)'),
+            dbe_deps=_cell('dbe_deps','?','DIVA d(beta_eff)/d(eps_mem^2)'),
+            dbe_dU=_cell('dbe_dU','?','DIVA d(beta_eff)/d(Ubar)'),
+            deta_dH=_cell('deta_dH','Pa a m^{-1}','DIVA d(eta_bar)/d(H)'),
+            dbe_dH=_cell('dbe_dH','?','DIVA d(beta_eff)/d(H)'),
+            deta_dbeta=_cell('deta_dbeta','?','DIVA d(eta_bar)/d(beta)'),
+            dbe_dbeta=_cell('dbe_dbeta','?','DIVA d(beta_eff)/d(beta)'),
+            deta_duc=_cell('deta_duc','?','DIVA d(eta_bar)/d(u_c)'),
+            dbe_duc=_cell('dbe_duc','?','DIVA d(beta_eff)/d(u_c)'),
+            deta_dm=_cell('deta_dm','?','DIVA d(eta_bar)/d(m)'),
+            dbe_dm=_cell('dbe_dm','?','DIVA d(beta_eff)/d(m)'),
+            dus_deps=_cell('dus_deps','?','DIVA d(u_s)/d(eps_mem^2)'),
+            dus_dU=_cell('dus_dU','?','DIVA d(u_s)/d(Ubar)'),
+            dus_dbeta=_cell('dus_dbeta','?','DIVA d(u_s)/d(beta)'),
+            dus_duc=_cell('dus_duc','?','DIVA d(u_s)/d(u_c)'),
+            dus_dm=_cell('dus_dm','?','DIVA d(u_s)/d(m)'),
+            dus_dH=_cell('dus_dH','a^{-1}','DIVA d(u_s)/d(H)'))
 
     def _allocate_sliding(self):
         beta = Field(
@@ -460,7 +560,17 @@ class Grid:
             units='?',
             attrs={'long_name':'Basal sliding coefficient'})
 
-        return Sliding(beta=beta)
+        if not self.diva:
+            return Sliding(beta=beta)
+
+        def _cell(name, units, long_name):
+            return Field(data=cp.zeros((self.ny,self.nx),dtype=cp.float32),
+                         grid_entity=GridEntity.CELL, dx=self.dx, grid=self,
+                         name=name, units=units, attrs={'long_name':long_name})
+
+        return Sliding(beta=beta,
+            u_c=_cell('u_c','m a^{-1}','DIVA regularized-Coulomb rate-transition speed'),
+            beta_eff=_cell('beta_eff','?','DIVA effective secant drag c/(1+c*F2), grounding folded in'))
 
     def _allocate_calving(self):
         return Calving()

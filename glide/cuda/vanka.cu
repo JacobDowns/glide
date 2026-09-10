@@ -131,7 +131,11 @@ __device__ void build_9x9_vanka(
     float dx, float dt,
     int ny, int nx,
     int i, int j,
-    int bi, int bj)
+    int bi, int bj
+#if GLIDE_DIVA
+    , const float* __restrict__ beta_eff   // DIVA frozen effective drag
+#endif
+    )
 {
     float dx_inv = 1.0f/dx;
 
@@ -623,6 +627,11 @@ __device__ void build_9x9_vanka(
     float xi_l = get_cell(xi,i,j-1,ny,nx);
     float xi_c = get_cell(xi,i,j,ny,nx);
 
+#if GLIDE_DIVA
+    TauBxDivaJacobian tau_bx_l = get_tau_bx_diva_jac(u_l, get_cell(beta_eff,i,j-1,ny,nx), get_cell(beta_eff,i,j,ny,nx));
+    r[4] += tau_bx_l.res;
+    J[40] += tau_bx_l.d_u;
+#else
     TauBxJacobian tau_bx_l = get_tau_bx_jac({ub_l,ub_ll,ub_r,vb_tl,vb_t,vb_bl,vb_b,H_l,H_c,xi_l,xi_c,beta_l,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
 
     // Residual for averaged component
@@ -643,6 +652,7 @@ __device__ void build_9x9_vanka(
     // thickness dependence (currently ignored)
     J[44] += tau_bx_l.d_H_r;
 
+#endif
 #if GLIDE_MOLHO
     // Residual for deformational component
     r[0]  -= tau_bx_l.res;
@@ -693,6 +703,11 @@ __device__ void build_9x9_vanka(
     float xi_c = get_cell(xi,i,j,ny,nx);
     float xi_r = get_cell(xi,i,j+1,ny,nx);
 
+#if GLIDE_DIVA
+    TauBxDivaJacobian tau_bx_r = get_tau_bx_diva_jac(u_r, get_cell(beta_eff,i,j,ny,nx), get_cell(beta_eff,i,j+1,ny,nx));
+    r[5] += tau_bx_r.res;
+    J[50] += tau_bx_r.d_u;
+#else
     TauBxJacobian tau_bx_r = get_tau_bx_jac({ub_r,ub_l,ub_rr,vb_t,vb_tr,vb_b,vb_br,H_c,H_r,xi_c,xi_r,beta_c,beta_r,m,u_reg,water_drag,flotation_reg_sliding});
     r[5] += tau_bx_r.res;
     
@@ -707,6 +722,7 @@ __device__ void build_9x9_vanka(
     J[52] += tau_bx_r.d_v_bl;
     J[53] += tau_bx_r.d_H_l;
     
+#endif
 #if GLIDE_MOLHO
     r[1]  -= tau_bx_r.res;
     J[9]  += tau_bx_r.d_u_l;
@@ -752,6 +768,11 @@ __device__ void build_9x9_vanka(
     float xi_t = get_cell(xi,i-1,j,ny,nx);
     float xi_c = get_cell(xi,i,j,ny,nx);
 
+#if GLIDE_DIVA
+    TauByDivaJacobian tau_by_t = get_tau_by_diva_jac(v_t, get_cell(beta_eff,i-1,j,ny,nx), get_cell(beta_eff,i,j,ny,nx));
+    r[6] += tau_by_t.res;
+    J[60] += tau_by_t.d_v;
+#else
     TauByJacobian tau_by_t = get_tau_by_jac({vb_t,vb_tt,vb_b,ub_tl,ub_tr,ub_l,ub_r,H_t,H_c,xi_t,xi_c,beta_t,beta_c,m,u_reg,water_drag,flotation_reg_sliding});
     r[6]  += tau_by_t.res;
     
@@ -767,6 +788,7 @@ __device__ void build_9x9_vanka(
     
     J[62] += tau_by_t.d_H_b;
     
+#endif
 #if GLIDE_MOLHO
     r[2]  -= tau_by_t.res;
 
@@ -813,6 +835,11 @@ __device__ void build_9x9_vanka(
     float xi_c = get_cell(xi,i,j,ny,nx);
     float xi_b = get_cell(xi,i+1,j,ny,nx);
 
+#if GLIDE_DIVA
+    TauByDivaJacobian tau_by_b = get_tau_by_diva_jac(v_b, get_cell(beta_eff,i,j,ny,nx), get_cell(beta_eff,i+1,j,ny,nx));
+    r[7] += tau_by_b.res;
+    J[70] += tau_by_b.d_v;
+#else
     TauByJacobian tau_by_b = get_tau_by_jac({vb_b,vb_t,vb_bb,ub_l,ub_r,ub_bl,ub_br,H_c,H_b,xi_c,xi_b,beta_c,beta_b,m,u_reg,water_drag,flotation_reg_sliding});
     r[7]  += tau_by_b.res;
 
@@ -827,6 +854,7 @@ __device__ void build_9x9_vanka(
     J[70] += tau_by_b.d_v_c;
     J[71] += tau_by_b.d_H_t;
     
+#endif
 #if GLIDE_MOLHO
     r[3]  -= tau_by_b.res;
 
@@ -916,6 +944,10 @@ void vanka_smooth(
     int ny, int nx, int stride, int halo,
     int newton_steps, float relaxation, float step_tolerance,
     float momentum_damping, float mc_damping, bool ssa
+#if GLIDE_DIVA
+    , const float* __restrict__ eta_bar
+    , const float* __restrict__ beta_eff
+#endif
     )
 {
     const int bny = 16;
@@ -929,7 +961,11 @@ void vanka_smooth(
 
     __shared__ float eta_local[bny][bnx];
 
+#if GLIDE_DIVA
+    eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);   // DIVA frozen depth-averaged viscosity
+#else
     populate_viscosity(eta_local, bi, bj, i, j, u, v, ud, vd, H, B, n, eps_reg, H_reg, dx, ny, nx);
+#endif
     __syncthreads();
 
     if (i < 0 || i >= ny || j<0 || j >= nx) return;
@@ -992,7 +1028,11 @@ void vanka_smooth(
 		    n, eps_reg, H_reg, flotation_reg_driving,
                     m, u_reg, water_drag, flotation_reg_sliding,
 		    calving_rate, flotation_reg_calving,
-                    dx, dt, ny, nx, i, j, bi, bj);
+                    dx, dt, ny, nx, i, j, bi, bj
+#if GLIDE_DIVA
+		    , beta_eff
+#endif
+		    );
             
 
 #if GLIDE_MOLHO
@@ -1259,6 +1299,10 @@ void vanka_smooth_adjoint(
     float dx, float dt,
     int ny, int nx, int stride, int halo,
     float momentum_damping, float shear_damping, float mc_damping, bool ssa
+#if GLIDE_DIVA
+    , const float* __restrict__ eta_bar
+    , const float* __restrict__ beta_eff
+#endif
     )
 {
     const int bny = 16;
@@ -1272,7 +1316,11 @@ void vanka_smooth_adjoint(
 
     __shared__ float eta_local[bny][bnx];
 
+#if GLIDE_DIVA
+    eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);   // DIVA frozen depth-averaged viscosity
+#else
     populate_viscosity(eta_local, bi, bj, i, j, u, v, ud, vd, H, B, n, eps_reg, H_reg, dx, ny, nx);
+#endif
 
     __syncthreads();
 
@@ -1308,7 +1356,11 @@ void vanka_smooth_adjoint(
 		n, eps_reg, H_reg, flotation_reg_driving,
 		m, u_reg, water_drag, flotation_reg_sliding,
 		calving_rate, flotation_reg_calving,
-		dx, dt, ny, nx, i, j, bi, bj);
+		dx, dt, ny, nx, i, j, bi, bj
+#if GLIDE_DIVA
+		    , beta_eff
+#endif
+		    );
 
 	// Additive diagonal shifts (pseudo-transient continuation), split by
 	// velocity mode: shear_damping on the deformational (ud/vd) rows,
@@ -1486,7 +1538,12 @@ void vanka_dump(
     float m, float u_reg, float water_drag, float flotation_reg_sliding,
     float calving_rate, float flotation_reg_calving,
     float dx, float dt,
-    int ny, int nx, int stride, int halo, bool ssa)
+    int ny, int nx, int stride, int halo, bool ssa
+#if GLIDE_DIVA
+    , const float* __restrict__ eta_bar
+    , const float* __restrict__ beta_eff
+#endif
+    )
 {
     const int bny = 16;
     const int bnx = 16;
@@ -1499,7 +1556,11 @@ void vanka_dump(
 
     __shared__ float eta_local[bny][bnx];
 
+#if GLIDE_DIVA
+    eta_local[bi][bj] = get_cell(eta_bar, i, j, ny, nx);   // DIVA frozen depth-averaged viscosity
+#else
     populate_viscosity(eta_local, bi, bj, i, j, u, v, ud, vd, H, B, n, eps_reg, H_reg, dx, ny, nx);
+#endif
     __syncthreads();
 
     if (i < 0 || i >= ny || j<0 || j >= nx) return;
@@ -1533,7 +1594,11 @@ void vanka_dump(
 	    n, eps_reg, H_reg, flotation_reg_driving,
 	    m, u_reg, water_drag, flotation_reg_sliding,
 	    calving_rate, flotation_reg_calving,
-	    dx, dt, ny, nx, i, j, bi, bj);
+	    dx, dt, ny, nx, i, j, bi, bj
+#if GLIDE_DIVA
+		    , beta_eff
+#endif
+		    );
 	
 	r[0] -= get_vfacet(f_ud,i,j,ny,nx);
 	r[1] -= get_vfacet(f_ud,i,j+1,ny,nx);

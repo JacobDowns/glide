@@ -628,7 +628,7 @@ void compute_jvp(
     // DIVA: run the cell closure in dual arithmetic, carrying the FULL d(eta_bar)/du and
     // d(beta_eff)/du -- the exact tangent, no frozen coefficients.
     populate_diva_coeffs_dual(eta_local, beta_eff_local, bi, bj, i, j,
-        u, v, d_u, d_v, H, d_H, phi, B, beta, u_c, u_b,
+        u, v, d_u, d_v, H, d_H, xi, B, beta, u_c, u_b,
         m, u_reg, water_drag, sliding_law, n, eps_reg, eps_reg_shear, dx,
         n_sigma, zeta_q, w_q, ny, nx);
 #else

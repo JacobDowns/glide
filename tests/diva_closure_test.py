@@ -54,6 +54,7 @@ def build(glen_n=GLEN_N):
     mg.state.v.set(cp.zeros((ny + 1, nx), dtype=cp.float32))
     mg.state.H.set(cp.full((ny, nx), H0, dtype=cp.float32))
     mg.state.phi.set(cp.ones((ny, nx), dtype=cp.float32))        # fully grounded
+    mg.state.xi.set(cp.ones((ny, nx), dtype=cp.float32))         # xi=1: DIVA drag grounding factor
     mg.rheology.B.set(cp.full((ny, nx), B0, dtype=cp.float32))
     mg.rheology.n.set(glen_n)
     mg.rheology.eps_reg.set(EPS_REG)

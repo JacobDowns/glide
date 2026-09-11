@@ -354,7 +354,7 @@ __device__ void populate_diva_coeffs_dual(
     const float* __restrict__ dv,
     const float* __restrict__ thk,
     const float* __restrict__ d_thk,
-    const float* __restrict__ phi,
+    const float* __restrict__ xi,
     const float* __restrict__ B,
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
@@ -386,7 +386,7 @@ __device__ void populate_diva_coeffs_dual(
     // response to thickness -- not only the residual's explicit H terms.
     DualFloat H_c = get_cell(thk, d_thk, i, j, ny, nx);
     float B_c = get_cell(B, i, j, ny, nx);
-    float grounded = get_cell(phi, i, j, ny, nx);
+    float grounded = get_cell(xi, i, j, ny, nx);
     float beta_grounded = get_cell(beta, i, j, ny, nx) * grounded;
     float u_c_c = get_cell(u_c, i, j, ny, nx);
     float U_b_warm = fminf(fmaxf(get_cell(u_b, i, j, ny, nx), 0.0f), U_bar.v);
@@ -418,7 +418,7 @@ void compute_diva_coeffs(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
-    const float* __restrict__ phi,
+    const float* __restrict__ xi,
     const float* __restrict__ B,
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
@@ -457,9 +457,10 @@ void compute_diva_coeffs(
 
     float H_c = get_cell(H, i, j, ny, nx);
     float B_c = get_cell(B, i, j, ny, nx);
-    float grounded = get_cell(phi, i, j, ny, nx);
-    // Grounding is folded in here, so beta_eff already carries it and the momentum
-    // kernels must not apply the grounded factor a second time.
+    // Grounding factor is xi (the height-above-flotation fraction), matching SSA/MOLHO's beta*xi
+    // basal drag -- NOT the grounded sigmoid phi, which is ~1 for near-flotation marine ice and
+    // would over-drag it.  Folded into beta_eff here, so the momentum kernels must not reapply it.
+    float grounded = get_cell(xi, i, j, ny, nx);
     float beta_grounded = get_cell(beta, i, j, ny, nx) * grounded;
     float u_c_c = get_cell(u_c, i, j, ny, nx);
 
@@ -514,7 +515,7 @@ void compute_diva_closure_residual(
     float* __restrict__ U_bar_out,
     const float* __restrict__ u,
     const float* __restrict__ v,
-    const float* __restrict__ phi,
+    const float* __restrict__ xi,
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
     const float* __restrict__ u_b,
@@ -542,7 +543,7 @@ void compute_diva_closure_residual(
     float U_bar = sqrtf(0.5f*(u_l*u_l + u_r*u_r) + 0.5f*(v_t*v_t + v_b*v_b));
 
     int idx = i * nx + j;
-    float grounded = get_cell(phi, i, j, ny, nx);
+    float grounded = get_cell(xi, i, j, ny, nx);
     float beta_g = get_cell(beta, i, j, ny, nx) * grounded;
     float u_c_c = get_cell(u_c, i, j, ny, nx);
     float U_b = u_b[idx];
@@ -579,7 +580,7 @@ void compute_diva_derivs(
     const float* __restrict__ u,
     const float* __restrict__ v,
     const float* __restrict__ H,
-    const float* __restrict__ phi,
+    const float* __restrict__ xi,
     const float* __restrict__ B,
     const float* __restrict__ beta,
     const float* __restrict__ u_c,
@@ -625,7 +626,7 @@ void compute_diva_derivs(
 
     float H_c = get_cell(H, i, j, ny, nx);
     float B_c = get_cell(B, i, j, ny, nx);
-    float grounded = get_cell(phi, i, j, ny, nx);
+    float grounded = get_cell(xi, i, j, ny, nx);
     float beta_grounded = get_cell(beta, i, j, ny, nx) * grounded;
     float u_c_c = get_cell(u_c, i, j, ny, nx);
     int idx = i * nx + j;

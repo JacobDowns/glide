@@ -28,14 +28,17 @@ n_levels = 6
 ### Stress balance: 'ssa', 'molho' (MOLHO-MI) or 'diva'.
 stress_scheme = 'diva'
 
-# Sensible per-scheme inversion configuration (tuned on Greenland; see the stress_balance_comparison
-# harness).  SSA follows the historical settings; MOLHO's 4-field solve is fragile at fine levels, so it
-# needs a beta floor, off-ice masking and a tighter forward; DIVA converges best at lr=0.02 and matches
-# the observed SURFACE speed through its closure (n_sigma vertical quadrature points).
+# Per-scheme inversion configuration.  All three schemes regularize beta the SAME way -- Tikhonov
+# smoothness only, no lower floor and no off-ice mask -- exactly as the upstream SSA/MOLHO examples: the
+# smoothness term keeps data-void cells near their observed neighbours, so beta never collapses.  SSA and
+# MOLHO invert the finest level directly (the upstream default); DIVA converges best coarse-to-fine with
+# a fine-heavy epoch schedule (the finest levels carry the small-scale outlets), lr=0.02 and a tighter
+# forward, and it matches the observed SURFACE speed through its closure (u_s, n_sigma quadrature points).
 INV = {
-    'ssa':   dict(lr=1e-2, beta_floor=0.1,  mask_office=False, fwd_rtol=1e-2),
-    'molho': dict(lr=1e-2, beta_floor=0.1,  mask_office=True,  fwd_rtol=1e-3),
-    'diva':  dict(lr=2e-2, beta_floor=1e-2, mask_office=True,  fwd_rtol=1e-2),
+    'ssa':   dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
+    'molho': dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
+    'diva':  dict(lr=2e-2, fwd_rtol=1e-3, coarsest_level=5,
+                  epochs={5: 20, 4: 25, 3: 30, 2: 40, 1: 50, 0: 60}),
 }[stress_scheme]
 
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
@@ -120,10 +123,9 @@ model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(cp.float3
 model.adjoint_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-6))
 
 t = cp.float32(0.0) # Dummy time, which we don't use here
-n_level_epochs = 50
 
-# Index of coarsest grid to start solving inverse problem at
-coarsest_level = 0
+# Index of the coarsest grid to start on (per-level epoch counts come from INV['epochs'])
+coarsest_level = INV['coarsest_level']
 log_beta = torch.log(torch.tensor(mg[coarsest_level].sliding.beta.data,device='cuda'))
 
 # Solve the inverse problem at progressively coarser levels
@@ -146,8 +148,7 @@ for level in range(coarsest_level,-1,-1):
     # Standard torch optimization loop (RMSprop works very well here).  lr above ~0.02 overshoots the
     # low-signal interior and imprints a grid-scale checkerboard on beta.
     optimizer = torch.optim.RMSprop([log_beta],lr=INV['lr'])
-    # Off-ice mask: hold beta at the floor where there is no ice (MOLHO/DIVA need this for stability).
-    ice = H_prev > 10.0
+    n_level_epochs = INV['epochs'][level]
 
     # Derived surface velocity fields for output monitoring: with the MOLHO
     # ansatz the surface velocity is u_bar + u_d/(n+1)
@@ -183,9 +184,15 @@ for level in range(coarsest_level,-1,-1):
         # u_s (magnitude) in the depth-averaged flow direction; under SSA it is just u_bar (u_d = 0).
         if stress_scheme == 'diva':
             u,v,ud,vd,H,mask,u_s = glide_step(t,dt,model,level,H_prev,bed,beta,smb,return_u_s=True)
+            # Build the DIVA surface-velocity VECTOR the same way as SSA/MOLHO (a facet field interpolated
+            # to cells) so speed AND direction are fit identically across schemes: scale the depth-averaged
+            # facet velocity by the surface/depth-averaged speed ratio (u_s is the closure surface SPEED).
             uc = 0.5*(u[:,1:]+u[:,:-1]); vc = 0.5*(v[1:]+v[:-1])
-            spd = torch.sqrt(uc**2 + vc**2 + 1e-6)
-            u_cell = u_s*uc/spd; v_cell = u_s*vc/spd
+            ratio = u_s / torch.sqrt(uc**2 + vc**2 + 1e-6)
+            rx = torch.ones_like(u); rx[:,1:-1] = 0.5*(ratio[:,1:]+ratio[:,:-1]); rx[:,0] = ratio[:,0]; rx[:,-1] = ratio[:,-1]
+            ry = torch.ones_like(v); ry[1:-1] = 0.5*(ratio[1:]+ratio[:-1]); ry[0] = ratio[0]; ry[-1] = ratio[-1]
+            u_s_f = u*rx; v_s_f = v*ry
+            u_cell = 0.5*(u_s_f[:,1:] + u_s_f[:,:-1]); v_cell = 0.5*(v_s_f[1:] + v_s_f[:-1])
         else:
             u,v,ud,vd,H,mask = glide_step(t,dt,model,level,H_prev,bed,beta,smb)
             u_s = u + ud/(n_glen + 1.0)
@@ -216,15 +223,12 @@ for level in range(coarsest_level,-1,-1):
         # Backpropagate
         J.backward()
 
-        # Update parameter.  Freeze off-ice cells at the floor (MOLHO/DIVA), then clamp beta to
-        # [floor, 33.1]: the floor keeps MOLHO's 4-field solve stable, the cap prevents runaway drag.
-        if INV['mask_office'] and log_beta.grad is not None:
-            log_beta.grad[~ice] = 0.0
+        # Update parameter, then clamp log(beta) at 3.5 (beta <= 33.1) to prevent runaway drag.  No lower
+        # floor and no off-ice mask: the Tikhonov smoothness term alone keeps data-void cells sensible,
+        # matching upstream SSA/MOLHO (the old floor+mask collapsed thin margins and made DIVA run away).
         optimizer.step()
         with torch.no_grad():
-            log_beta.clamp_(min=float(np.log(INV['beta_floor'])), max=3.5)
-            if INV['mask_office']:
-                log_beta[~ice] = float(np.log(INV['beta_floor']))
+            log_beta.clamp_(max=3.5)
         
         print(f"Level {level}, Iter. {j}/{n_level_epochs} | J: {J.item():.2f}, J_data: {J_data.item():.2f}, J_L1: {J_L1.item():.2f}, J_L2: {J_L2.item():.2f}")
         su = mg[level].state.u.data; sv = mg[level].state.v.data

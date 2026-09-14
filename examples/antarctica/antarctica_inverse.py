@@ -15,7 +15,7 @@ from scipy.ndimage import gaussian_filter
 from glide.model import IceDynamics
 from glide.data import load_antarctica_preprocessed
 from glide.field import Field, GridEntity
-from glide.torch import GlideStep
+from glide.torch import glide_step
 from glide.io import VTIWriter
 
 ### Load a dataset (here a preprocessed greenland dataset)
@@ -24,10 +24,25 @@ dataset = load_antarctica_preprocessed()
 ### Initialize grid
 # ny and nx must both divide by 2^(n_levels - 1) cleanly!
 n_levels = 6
+
+### Stress balance: 'ssa', 'molho' (MOLHO-MI) or 'diva'.
+stress_scheme = 'diva'
+
+# Per-scheme inversion configuration (Antarctica).  All schemes regularize beta with Tikhonov smoothness
+# ONLY -- no lower floor, no off-ice mask -- so beta never collapses.  SSA/MOLHO invert coarse-to-fine
+# from level 2 (the upstream default); DIVA uses a fine-heavy schedule from level 5, lr=0.02 and a tighter
+# forward, and matches the observed SURFACE speed through its closure u_s (n_sigma quadrature points).
+INV = {
+    'ssa':   dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=2, epochs={2: 50, 1: 50, 0: 50}),
+    'molho': dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=2, epochs={2: 50, 1: 50, 0: 50}),
+    'diva':  dict(lr=2e-2, fwd_rtol=1e-3, coarsest_level=5,
+                  epochs={5: 20, 4: 25, 3: 30, 2: 40, 1: 50, 0: 60}),
+}[stress_scheme]
+
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx
 model = IceDynamics(n_levels=n_levels,ny=ny,nx=nx,dx=dx,
         x0=dataset.x[0].item(),y0=dataset.y[0].item(),
-        crs=pyproj.CRS("EPSG:3031"))
+        crs=pyproj.CRS("EPSG:3031"),stress_scheme=stress_scheme)
 mg = model.mg
 
 grid = mg.levels[0]
@@ -52,6 +67,9 @@ mg.rheology.B.set(B)
 mg.rheology.eps_reg.set(1e-6)
 mg.rheology.n.set(3.0)
 mg.rheology.H_reg.set(25.0)
+if stress_scheme == 'diva':
+    mg.rheology.n_sigma.set(6.0)          # vertical quadrature points (velocity converged by ~6)
+    mg.rheology.eps_reg_shear.set(1e-6)
 
 n_glen = 3.0
 
@@ -89,7 +107,7 @@ for j in range(1,n_levels):
 model.forward_solver.fas_options.set(
         coarsest_steps=200, pre_steps=10, 
         post_steps=150, finest_steps=0,
-        relative_tolerance=1e-2, absolute_tolerance=10.0,
+        relative_tolerance=INV['fwd_rtol'], absolute_tolerance=10.0,
         report_norms=True)
 
 model.forward_solver.vanka_options.omega.set(cp.float32(0.25))
@@ -106,14 +124,10 @@ model.adjoint_solver.vanka_options.omega.set(cp.float32(0.25))
 model.adjoint_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
 model.adjoint_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-6))
 
-# Thin Pytorch wrapper of a single glide time step
-glide_step = GlideStep.apply
-
 t = cp.float32(0.0) # Dummy time, which we don't use here
-n_level_epochs = 50
 
-# Index of coarsest grid to start solving inverse problem at
-coarsest_level = 2
+# Index of the coarsest grid to start on (per-level epoch counts come from INV['epochs'])
+coarsest_level = INV['coarsest_level']
 log_beta = torch.log(torch.tensor(mg[coarsest_level].sliding.beta.data,device='cuda'))
 
 # Solve the inverse problem at progressively coarser levels
@@ -134,7 +148,8 @@ for level in range(coarsest_level,-1,-1):
     v_mask = abs(v_obs) > 0.01
 
     # Standard torch optimization loop (RMSprop works very well here)
-    optimizer = torch.optim.RMSprop([log_beta],lr=1e-2)
+    optimizer = torch.optim.RMSprop([log_beta],lr=INV['lr'])
+    n_level_epochs = INV['epochs'][level]
 
     # Derived surface velocity fields for output monitoring: with the MOLHO
     # ansatz the surface velocity is u_bar + u_d/(n+1)
@@ -166,19 +181,23 @@ for level in range(coarsest_level,-1,-1):
         # Convert log(beta) to beta
         beta = torch.exp(log_beta)
 
-        # Predict the velocity and thickness at t + dt
+        # Predict the velocity (and thickness) at t + dt, matching the observed SURFACE velocity.
+        # SSA/MOLHO: u_s = u_bar + u_d/(n+1).  DIVA: the closure surface speed u_s, built into a facet
+        # vector (scale the depth-averaged facet velocity by the surface/depth-avg ratio) exactly like
+        # SSA/MOLHO so speed AND direction are fit the same way across schemes.
         mg.sliding.water_drag.set(1e-5)
-        u,v,ud,vd,H,mask = glide_step(t,dt,model,level,H_prev,bed,beta,smb)
-
-        # The observations are surface velocities: with the MOLHO ansatz
-        # u_s = u_bar + u_d/(n+1)
-        u_s = u + ud/(n_glen + 1.0)
-        v_s = v + vd/(n_glen + 1.0)
-
-        # Interpolation from facets (where the model predicts)
-        # to cells (where the observations are)
-        u_cell = 0.5*(u_s[:,1:] + u_s[:,:-1])
-        v_cell = 0.5*(v_s[1:] + v_s[:-1])
+        if stress_scheme == 'diva':
+            u,v,ud,vd,H,mask,u_s = glide_step(t,dt,model,level,H_prev,bed,beta,smb,return_u_s=True)
+            uc = 0.5*(u[:,1:]+u[:,:-1]); vc = 0.5*(v[1:]+v[:-1])
+            ratio = u_s / torch.sqrt(uc**2 + vc**2 + 1e-6)
+            rx = torch.ones_like(u); rx[:,1:-1] = 0.5*(ratio[:,1:]+ratio[:,:-1]); rx[:,0] = ratio[:,0]; rx[:,-1] = ratio[:,-1]
+            ry = torch.ones_like(v); ry[1:-1] = 0.5*(ratio[1:]+ratio[:-1]); ry[0] = ratio[0]; ry[-1] = ratio[-1]
+            u_s_f = u*rx; v_s_f = v*ry
+            u_cell = 0.5*(u_s_f[:,1:] + u_s_f[:,:-1]); v_cell = 0.5*(v_s_f[1:] + v_s_f[:-1])
+        else:
+            u,v,ud,vd,H,mask = glide_step(t,dt,model,level,H_prev,bed,beta,smb)
+            u_s = u + ud/(n_glen + 1.0); v_s = v + vd/(n_glen + 1.0)
+            u_cell = 0.5*(u_s[:,1:] + u_s[:,:-1]); v_cell = 0.5*(v_s[1:] + v_s[:-1])
 
         # L1 Objective function, masked by valid data
         J_data = (abs(u_cell - u_obs)*u_mask).mean() + (abs(v_cell - v_obs)*v_mask).mean()
@@ -209,8 +228,16 @@ for level in range(coarsest_level,-1,-1):
         log_beta.data[log_beta.data > 3.5] = 3.5
         
         print(f"Level {level}, Iter. {j}/{n_level_epochs} | J: {J.item():.2f}, J_data: {J_data.item():.2f}, J_L1: {J_L1.item():.2f}, J_L2: {J_L2.item():.2f}")
-        u_s_field.data[:,:] = mg[level].state.u.data + mg[level].state.ud.data/(n_glen + 1.0)
-        v_s_field.data[:,:] = mg[level].state.v.data + mg[level].state.vd.data/(n_glen + 1.0)
+        su = mg[level].state.u.data; sv = mg[level].state.v.data
+        if stress_scheme == 'diva':
+            ubar = cp.hypot(0.5*(su[:,1:]+su[:,:-1]), 0.5*(sv[1:]+sv[:-1]))
+            r = mg[level].state.u_s.data/(ubar + 1e-6)         # DIVA surface/mean speed ratio (cells)
+            rx = cp.empty_like(su); rx[:,1:-1] = 0.5*(r[:,1:]+r[:,:-1]); rx[:,0] = r[:,0]; rx[:,-1] = r[:,-1]
+            ry = cp.empty_like(sv); ry[1:-1] = 0.5*(r[1:]+r[:-1]); ry[0] = r[0]; ry[-1] = r[-1]
+            u_s_field.data[:,:] = su*rx; v_s_field.data[:,:] = sv*ry
+        else:
+            u_s_field.data[:,:] = su + mg[level].state.ud.data/(n_glen + 1.0)
+            v_s_field.data[:,:] = sv + mg[level].state.vd.data/(n_glen + 1.0)
         vti_writer.append(mg[level],time=j)
         vti_writer.write_pvd()
 

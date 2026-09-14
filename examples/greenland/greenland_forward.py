@@ -87,7 +87,8 @@ model.forward_solver.fas_options.set(
         report_norms=True)
 
 model.forward_solver.vanka_options.omega.set(cp.float32(0.25))
-model.forward_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.01))
+# DIVA's 5-DOF solve wants more momentum damping than the SSA/MOLHO default.
+model.forward_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.1 if stress_scheme == 'diva' else 0.01))
 model.forward_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-6))
 
 # Derived surface velocity fields.  Under MOLHO the surface velocity is

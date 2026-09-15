@@ -47,7 +47,7 @@ B.fill(1e-17 ** (-1.0 / 3.0) / (917 * 9.81))
 mg.rheology.B.set(B)
 mg.rheology.eps_reg.set(1e-6)
 mg.rheology.n.set(3.0)
-mg.rheology.H_reg.set(25.0)
+mg.rheology.H_reg.set(10.0)
 if stress_scheme == 'diva':
     mg.rheology.n_sigma.set(6.0)          # vertical quadrature points (velocity converged by ~6)
     mg.rheology.eps_reg_shear.set(1e-6)
@@ -66,7 +66,7 @@ beta[beta>50] = 50
 
 mg.sliding.beta.set(beta)
 mg.sliding.m.set(1./3)
-mg.sliding.water_drag.set(1.0e-4)
+mg.sliding.water_drag.set(1.0e-3)
 
 ### Initialize calving
 # Specifies calving velocity for a non-conservative
@@ -81,14 +81,14 @@ mg.forcing.smb.set(smb)
 
 ### Set multigrid solver parameters ###
 model.forward_solver.fas_options.set(
-        coarsest_steps=200, pre_steps=10, 
+        coarsest_steps=200, pre_steps=10,
         post_steps=150, finest_steps=0,
-        relative_tolerance=1e-2, absolute_tolerance=10.0,
+        relative_tolerance=1e-3, absolute_tolerance=10.0,
         report_norms=True)
 
 model.forward_solver.vanka_options.omega.set(cp.float32(0.25))
-# DIVA's 5-DOF solve wants more momentum damping than the SSA/MOLHO default.
-model.forward_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.1 if stress_scheme == 'diva' else 0.01))
+# MOLHO's two-field solve and DIVA's closure both want more momentum damping than SSA's plug solve.
+model.forward_solver.vanka_options.newton_options.momentum_damping.set(cp.float32(0.1 if stress_scheme in ('diva', 'molho') else 0.01))
 model.forward_solver.vanka_options.newton_options.step_tolerance.set(cp.float32(1e-6))
 
 # Derived surface velocity fields.  Under MOLHO the surface velocity is

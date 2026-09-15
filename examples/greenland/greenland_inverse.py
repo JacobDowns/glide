@@ -28,17 +28,16 @@ n_levels = 6
 ### Stress balance: 'ssa', 'molho' (MOLHO-MI) or 'diva'.
 stress_scheme = 'diva'
 
-# Per-scheme inversion configuration.  All three schemes regularize beta the SAME way -- Tikhonov
-# smoothness only, no lower floor and no off-ice mask -- exactly as the upstream SSA/MOLHO examples: the
-# smoothness term keeps data-void cells near their observed neighbours, so beta never collapses.  SSA and
-# MOLHO invert the finest level directly (the upstream default); DIVA converges best coarse-to-fine with
-# a fine-heavy epoch schedule (the finest levels carry the small-scale outlets), lr=0.02 and a tighter
-# forward, and it matches the observed SURFACE speed through its closure (u_s, n_sigma quadrature points).
+# Per-scheme inversion configuration.  All three schemes use the SAME setup: single-level inversion at the
+# finest grid (the upstream Greenland default), lr=0.01, and Tikhonov smoothness regularization ONLY -- no
+# lower floor, no off-ice mask -- so beta never collapses (the smoothness term keeps data-void cells near
+# their observed neighbours).  The ONLY per-scheme difference is the forward tolerance: DIVA's closure
+# benefits from a tighter solve (1e-3 vs 1e-2); it is otherwise identical.  DIVA matches the observed
+# SURFACE speed through its closure (u_s, n_sigma quadrature points); SSA/MOLHO match u_bar + u_d/(n+1).
 INV = {
     'ssa':   dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
     'molho': dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
-    'diva':  dict(lr=2e-2, fwd_rtol=1e-3, coarsest_level=5,
-                  epochs={5: 20, 4: 25, 3: 30, 2: 40, 1: 50, 0: 60}),
+    'diva':  dict(lr=1e-2, fwd_rtol=1e-3, coarsest_level=0, epochs={0: 50}),
 }[stress_scheme]
 
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx

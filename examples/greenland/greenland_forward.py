@@ -80,9 +80,12 @@ smb -= 1.0
 mg.forcing.smb.set(smb)
 
 ### Set multigrid solver parameters ###
+# Vanka post-smoothing sweeps.  The floor scales with per-step change (dt x grounding-line migration):
+# SSA/MOLHO want ~150, but DIVA needs far fewer on land-terminating Greenland (~30 here).  For actively-
+# migrating marine grounding lines DIVA needs more smoothing (~100) and a smaller dt -- see antarctica_forward.
 model.forward_solver.fas_options.set(
         coarsest_steps=200, pre_steps=10,
-        post_steps=150, finest_steps=0,
+        post_steps=(30 if stress_scheme == 'diva' else 150), finest_steps=0,
         relative_tolerance=1e-3, absolute_tolerance=10.0,
         report_norms=True)
 
@@ -178,7 +181,7 @@ zarr_writer.initialize(mg[0],overwrite=True)
 # Run simulation
 t = cp.float32(0.0)
 t_end = cp.float32(1000.0)
-dt = cp.float32(20.0)
+dt = cp.float32(10.0)   # 1000-yr transient step (all schemes stable here on land-terminating Greenland)
 
 while t < t_end:
     print(f"Solving forward problem at t={t} with dt={dt:.2f}")

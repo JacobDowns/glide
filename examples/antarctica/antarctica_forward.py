@@ -93,9 +93,13 @@ smb[mg[0].state.phi.data.get()<0.5] -= 0.5
 mg.forcing.smb.set(smb)
 
 ### Set multigrid solver parameters ###
+# Vanka post-smoothing sweeps.  The floor scales with per-step change (dt x grounding-line migration):
+# SSA/MOLHO want ~150; DIVA needs ~100 under active marine grounding-line migration (and only ~30 in
+# quiescent runs).  NB DIVA's coupled flotation-drag closure has a LOWER dt ceiling than SSA/MOLHO under
+# fast grounding-line retreat (reliable to ~dt=10 vs ~25) -- use a smaller/adaptive dt for rapid marine change.
 model.forward_solver.fas_options.set(
-        coarsest_steps=200, pre_steps=10, 
-        post_steps=150, finest_steps=0,
+        coarsest_steps=200, pre_steps=10,
+        post_steps=(100 if stress_scheme == 'diva' else 150), finest_steps=0,
         relative_tolerance=1e-3, absolute_tolerance=10.0,
         report_norms=True)
 
@@ -160,7 +164,7 @@ zarr_writer.initialize(mg[0],overwrite=True)
 # Run simulation
 t = cp.float32(0.0)
 t_end = cp.float32(1000.0)
-dt = cp.float32(20.0)
+dt = cp.float32(10.0)   # DIVA's marine grounding-line solve is reliable to ~dt=10; SSA/MOLHO tolerate larger
 while t < t_end:
     print(f"Solving forward problem at t={t} with dt={dt:.2f}")
     model.forward(t,dt)

@@ -18,11 +18,12 @@ Prerequisites (run once each):
 Then:
     python greenland_thermal_compare.py
 
-NOTE: the enthalpy advection currently uses the DEPTH-AVERAGED velocity for every
-scheme (broadcast_velocity copies u_bar to all layers), so the differences below
-reflect u_bar + beta (through frictional heating), NOT resolved vertical shear.
-This is a solver verification / calibrated-beta comparison; wiring the full 3D
-velocity + strain heating is the physically-complete next step.
+The thermal model resolves the full vertical velocity profile: u_bar for SSA
+(plug), and u(sigma) = u_b + (u_s-u_b)*(1-(1-sigma)^(n+1)) for MOLHO/DIVA, plus
+strain (deformational) heating from that shear.  So SSA carries no shear or strain
+heating while MOLHO/DIVA do -- the temperate-bed differences below (SSA ~39% vs
+MOLHO/DIVA ~51-55% at equilibrium) are that near-basal deformational warming,
+which the plug-flow SSA cannot represent.
 """
 import os
 import cupy as cp
@@ -149,7 +150,7 @@ def main():
     im2 = axd.imshow(dd, origin="upper", cmap="PuOr_r", norm=TwoSlopeNorm(0, -6, 6))
     axd.set_title("DIVA − SSA basal T (K)"); axd.set_xticks([]); axd.set_yticks([])
     fig.colorbar(im2, ax=axd, fraction=0.046)
-    fig.suptitle("Greenland thermal EQUILIBRIUM — SSA / MOLHO / DIVA (uncoupled, real forcing)",
+    fig.suptitle("Greenland thermal EQUILIBRIUM — SSA / MOLHO / DIVA (real 3D velocity + strain heating)",
                  fontweight="bold", fontsize=14)
     fig.savefig(f"{OUT}/compare_equilibrium.png", dpi=130, bbox_inches="tight")
 
@@ -165,7 +166,7 @@ def main():
     ax2[1].set_title("Temperate-bed fraction"); ax2[1].set_ylabel("% of ice area")
     for a in ax2:
         a.set_xlabel("year"); a.legend(); a.grid(alpha=.3)
-    fig2.suptitle("Greenland coupled TRANSIENT — SSA / MOLHO / DIVA (real forcing)",
+    fig2.suptitle("Greenland coupled TRANSIENT — SSA / MOLHO / DIVA (real 3D velocity + strain heating)",
                   fontweight="bold", fontsize=13.5)
     fig2.tight_layout(); fig2.savefig(f"{OUT}/compare_transient.png", dpi=130, bbox_inches="tight")
     print(f"saved {OUT}/compare_equilibrium.png, {OUT}/compare_transient.png")

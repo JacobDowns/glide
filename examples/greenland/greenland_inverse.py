@@ -36,7 +36,12 @@ stress_scheme = 'diva'
 # SURFACE speed through its closure (u_s, n_sigma quadrature points); SSA/MOLHO match u_bar + u_d/(n+1).
 INV = {
     'ssa':   dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
-    'molho': dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
+    # MOLHO's finest-level Greenland forward solve is unstable: single-level
+    # optimisation from a uniform beta blows up (NaN) after ~10-15 iterations
+    # before converging.  Use coarse-to-fine (converge at coarser levels, then
+    # prolongate) instead; the NaN guard in the optimisation loop keeps the last
+    # finite beta as a backstop regardless.
+    'molho': dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=2, epochs={2: 40, 1: 20, 0: 12}),
     'diva':  dict(lr=1e-2, fwd_rtol=1e-3, coarsest_level=0, epochs={0: 50}),
 }[stress_scheme]
 
@@ -172,6 +177,7 @@ for level in range(coarsest_level,-1,-1):
         )
 
     vti_writer.initialize(mg[level])
+    last_good_log_beta = log_beta.detach().clone()
     for j in range(n_level_epochs):
         optimizer.zero_grad()
 
@@ -218,6 +224,17 @@ for level in range(coarsest_level,-1,-1):
         
         # Combined objective - elastic net regularization
         J = J_data + J_L1 + J_L2
+
+        # NaN guard: a forward solve can blow up on a bad beta update (notably
+        # MOLHO at the finest Greenland level).  Keep the last finite beta and
+        # stop this level rather than propagating NaNs into the saved field.
+        if not torch.isfinite(J):
+            with torch.no_grad():
+                log_beta.copy_(last_good_log_beta)
+                mg[level].sliding.beta.set(cp.asarray(torch.exp(log_beta).detach()))
+            print(f"Level {level}, Iter. {j}: non-finite J -- reverted to last finite beta, stopping level.")
+            break
+        last_good_log_beta = log_beta.detach().clone()
 
         # Backpropagate
         J.backward()

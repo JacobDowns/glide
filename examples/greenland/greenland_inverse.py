@@ -34,15 +34,18 @@ stress_scheme = 'diva'
 # their observed neighbours).  The ONLY per-scheme difference is the forward tolerance: DIVA's closure
 # benefits from a tighter solve (1e-3 vs 1e-2); it is otherwise identical.  DIVA matches the observed
 # SURFACE speed through its closure (u_s, n_sigma quadrature points); SSA/MOLHO match u_bar + u_d/(n+1).
+# All three schemes use the SAME coarse-to-fine schedule (converge at coarser levels,
+# prolongate to the finest) so the inverted betas are directly comparable -- an
+# apples-to-apples setup for the SSA/MOLHO/DIVA thermal comparison.  SSA and DIVA also
+# converge single-level (coarsest_level=0, epochs={0:50}), but MOLHO's single-level
+# finest-grid inversion is unstable (blows up to NaN after ~10-15 iterations before
+# converging), so coarse-to-fine is the consistent choice that works for all three; the
+# coarse warm-start also stabilises MOLHO's finest level.  The NaN guard in the loop
+# keeps the last finite beta as a backstop.  All three reach J_data ~6.2 here.
 INV = {
-    'ssa':   dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=0, epochs={0: 50}),
-    # MOLHO's finest-level Greenland forward solve is unstable: single-level
-    # optimisation from a uniform beta blows up (NaN) after ~10-15 iterations
-    # before converging.  Use coarse-to-fine (converge at coarser levels, then
-    # prolongate) instead; the NaN guard in the optimisation loop keeps the last
-    # finite beta as a backstop regardless.
+    'ssa':   dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=2, epochs={2: 40, 1: 20, 0: 12}),
     'molho': dict(lr=1e-2, fwd_rtol=1e-2, coarsest_level=2, epochs={2: 40, 1: 20, 0: 12}),
-    'diva':  dict(lr=1e-2, fwd_rtol=1e-3, coarsest_level=0, epochs={0: 50}),
+    'diva':  dict(lr=1e-2, fwd_rtol=1e-3, coarsest_level=2, epochs={2: 40, 1: 20, 0: 12}),
 }[stress_scheme]
 
 ny,nx,dx = dataset.ny,dataset.nx,dataset.dx

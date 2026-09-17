@@ -627,14 +627,18 @@ class EnthalpyOperators:
         T_safe = cp.maximum(T_pa, 1.0)  # avoid division by zero
         A = A_factor * cp.exp(-Q_factor / (R_gas * T_safe))
 
-        # Water content enhancement
+        # Water content enhancement (Lliboutry-Duval: A_eff = A * (1 + 181.25 * omega)).
+        # Cap omega at 1%: the relation is only calibrated to ~1% (Aschwanden et al.
+        # 2012), and UNCAPPED it collapses B at temperate fast outlets (where basal
+        # frictional heating drives the water content well past 1%), which ill-conditions
+        # the momentum solve and produces spurious velocity spikes.
         E = self.enthalpy_state.E
         H = self.grid.state.H.data
         for k in range(self.nz):
             sigma_k = float(self.sigma[k])
             depth = (1.0 - sigma_k) * H
             omega = water_content_from_enthalpy(E[:, :, k] * E_SCALE, depth)
-            A[:, :, k] *= (1.0 + 181.25 * omega)
+            A[:, :, k] *= (1.0 + 181.25 * cp.minimum(omega, 0.01))
 
         # Depth average and convert to B
         A_avg = cp.mean(A, axis=2)

@@ -39,6 +39,20 @@
 // Drainage smoothing sharpness (same as K(E) sigmoid)
 #define DRAIN_SHARPNESS 0.01f
 
+// Nonlinear drainage "valve": basal frictional heating at fast temperate outlets
+// can inject enthalpy faster than a constant-rate drainage can remove it, letting
+// the water content run away (>>100%).  Above DRAIN_OMEGA_CAP the effective drainage
+// rate ramps up by DRAIN_HIGH_FACTOR (a smooth softplus hinge of sharpness
+// DRAIN_HINGE_SHARP), pinning omega near the cap -- the standard Aschwanden/Greve
+// nonlinear drainage.  Below the cap it reduces to the usual linear drain_rate*omega.
+#define DRAIN_OMEGA_CAP   0.01f    // basal water-content ceiling (~1%, Aschwanden 2012)
+#define DRAIN_HIGH_FACTOR 2000.0f  // effective-rate multiplier above the cap
+// Softplus sharpness (1/omega) of the cap transition.  Must be sharp enough that the
+// hinge is negligible for omega << cap even after the DRAIN_HIGH_FACTOR amplification
+// (otherwise cold ice, omega~0, gets a spurious sink): the sub-cap leak is
+// HIGH_FACTOR*softplus(-SHARP*cap)/SHARP ~ 4e-7 here, vs the 0.01 cap.
+#define DRAIN_HINGE_SHARP 1500.0f
+
 // Term toggle bitmask flags
 #define TERM_HORIZ_ADV    (1 << 0)
 #define TERM_SIGMA_DOT    (1 << 1)
@@ -91,10 +105,23 @@ float get_domega_dE(float E, float E_pmp) {
 }
 
 // ---- Helper: drainage function Dw(omega) ----
+// Linear drain_rate*omega below DRAIN_OMEGA_CAP, plus a steep softplus valve above
+// it so the water content cannot run away when frictional heating is large.
 __device__ __forceinline__
 float get_drainage(float omega, float drain_rate) {
-    // Simple linear drainage: Dw = drain_rate * omega
-    return drain_rate * omega;
+    float x = DRAIN_HINGE_SHARP * (omega - DRAIN_OMEGA_CAP);
+    float hinge = (x > 10.0f) ? (omega - DRAIN_OMEGA_CAP)
+                              : __logf(1.0f + __expf(x)) / DRAIN_HINGE_SHARP;
+    return drain_rate * (omega + DRAIN_HIGH_FACTOR * hinge);
+}
+
+// ---- Helper: d(Dw)/d(omega) for the drainage Jacobian ----
+__device__ __forceinline__
+float get_ddrainage_domega(float omega, float drain_rate) {
+    float z = DRAIN_HINGE_SHARP * (omega - DRAIN_OMEGA_CAP);
+    z = fminf(fmaxf(z, -20.0f), 20.0f);
+    float s = 1.0f / (1.0f + __expf(-z));               // sigmoid = d(hinge)/d(omega)
+    return drain_rate * (1.0f + DRAIN_HIGH_FACTOR * s);
 }
 
 // ---- Helper: 3D cell-centered access for E (ny, nx, nz layout) ----
@@ -647,9 +674,12 @@ DrainageJacobian get_drainage_jac(DrainageStencil s) {
     // Drainage is nonlinear in E and produces a physical-scale residual.
     // Divide by E_SCALE to match the other (E-linear) residual terms.
     // The Jacobian d(R_scaled)/d(E_scaled) = d(R_phys)/d(E_phys)
-    // because the E_SCALE factors cancel in the chain rule.
+    // because the E_SCALE factors cancel in the chain rule.  The chain rule now
+    // carries the nonlinear valve: d(Dw)/d(E) = d(Dw)/d(omega) * d(omega)/d(E).
     jac.res = s.H * RHO_W * L_HEAT * get_drainage(omega, s.drain_rate) / E_SCALE;
-    jac.d_E_k = s.H * RHO_W * L_HEAT * s.drain_rate * get_domega_dE(s.E_k, s.E_pmp_k);
+    jac.d_E_k = s.H * RHO_W * L_HEAT
+              * get_ddrainage_domega(omega, s.drain_rate)
+              * get_domega_dE(s.E_k, s.E_pmp_k);
 
     return jac;
 }

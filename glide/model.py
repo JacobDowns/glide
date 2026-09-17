@@ -256,6 +256,13 @@ class ThermalModel:
             bed -- a spurious heat source hundreds of times the geothermal flux).
           - the head->Pa factor rho*g (matching the momentum nondimensionalization,
             same rho*g used in B_scale).
+
+        The effective basal drag the momentum solver uses is beta_eff = beta*xi,
+        where xi is the grounding factor (~1 grounded, ~0 floating; stress.cu).
+        We gate the heating by the SAME xi so floating/near-floating margins (which
+        have no bed contact) get no spurious basal friction -- without it, thin fast
+        marine cells at the calving front receive ~200 W/m^2 and their enthalpy runs
+        away.
         """
         grid = self.ops.grid
         sliding = grid.sliding
@@ -270,8 +277,9 @@ class ThermalModel:
 
         m = sliding.m.value
         scale = cp.float32(self.rho_i * self.g / self.SEC_PER_YR)  # head->Pa, /yr->/s
+        beta_eff = sliding.beta.data * grid.state.xi.data          # grounding-gated drag
         self.ops.enthalpy_forcing.Q_fh[:] = (
-            scale * sliding.beta.data * speed_yr ** (m + 1.0))
+            scale * beta_eff * speed_yr ** (m + 1.0))
 
     def _compute_omega(self, dt):
         """Compute omega from the actual thickness change.

@@ -333,6 +333,12 @@ where $\beta$ is the smoothing sharpness. The Jacobian is the corresponding sigm
 
 $$\frac{\partial R^{\text{drain}}_k}{\partial E_k} = H \rho_w \, r_d \cdot \frac{1}{1 + \exp(-\beta(E_k - E_{\text{pmp},k}))}.$$
 
+**Nonlinear drainage valve.** A constant rate $r_d$ cannot bound the water content when the heat input is large: at fast temperate outlets, basal frictional heating injects enthalpy faster than a constant-rate drainage removes it, and $\varpi$ runs away to unphysical values (well over 100%). Following the standard Aschwanden/Greve treatment, the drainage *rate* ramps up above a cap $\varpi_{\text{cap}}$ so that $\varpi$ is pinned near the cap regardless of the source strength. The implementation replaces $D_w(\varpi) = r_d\,\varpi$ with
+
+$$D_w(\varpi) = r_d\left[\varpi + F_{\text{high}}\,\text{softplus}_{s}(\varpi - \varpi_{\text{cap}})\right],$$
+
+where $\text{softplus}_s(x) = s^{-1}\ln(1+e^{sx})$ adds a steep but differentiable "valve" above $\varpi_{\text{cap}}$ ($\varpi_{\text{cap}} = 0.01$, $F_{\text{high}} = 2000$, $s = 1500$). Below the cap the valve is negligible and drainage reduces to the linear form; above it the effective rate rises by up to $F_{\text{high}}\,r_d$, capping $\varpi$ at a few percent. The Jacobian carries the extra chain-rule factor $dD_w/d\varpi = r_d\,[1 + F_{\text{high}}\,\text{sigmoid}(s(\varpi-\varpi_{\text{cap}}))]$, which only strengthens the (stabilizing) diagonal. The same $\varpi_{\text{cap}}$ caps the water-content softening of the rate factor $A(T,\varpi)$ fed back to the momentum solver (uncapped, that softening collapses $B$ at temperate outlets and destabilizes the velocity solve).
+
 ## 8. Boundary Conditions
 
 ### Surface ($k = N_z - 1$): Dirichlet

@@ -48,6 +48,10 @@ T_SEA_LEVEL = 278.15      # K
 LAPSE_RATE  = -6.5e-3     # K/m (atmospheric lapse rate)
 Q_GEO       = 0.05         # W/m^2 (uniform geothermal flux; ~Greenland mean ~50 mW/m^2)
 
+# Stress balance: 'ssa', 'molho' (MOLHO-MI) or 'diva'.  DIVA resolves the vertical
+# shear the thermal model wants (deformational velocities, and eventually strain heating).
+STRESS_SCHEME = 'diva'
+
 # Enthalpy solver
 NZ          = 9          # sigma levels
 N_SMOOTH    = 30          # max column-sweep iterations per step
@@ -72,7 +76,7 @@ ny, nx, dx = dataset.ny, dataset.nx, dataset.dx
 # ny and nx must both divide by 2^(n_levels - 1) cleanly!
 model = IceDynamics(n_levels=6, ny=ny, nx=nx, dx=dx,
         x0=dataset.x[0].item(), y0=dataset.y[0].item(),
-        crs=CRS)
+        crs=CRS, stress_scheme=STRESS_SCHEME)
 mg = model.mg
 
 # ========================================================
@@ -84,7 +88,9 @@ mg.state.H_prev.set(thk)
 
 bed = gaussian_filter(dataset.bed.values, 1)
 mg.geometry.bed.set(bed)
-mg.geometry.flotation_reg_driving.set(0.1)
+mg.geometry.depth.set(np.maximum(-bed, 0.0))
+mg.geometry.sigmoid_c.set(0.1)          # grounding-line flotation smoothing (as greenland_forward)
+mg.geometry.sigmoid_k.set(3.0)
 
 # Rheology: start with the same uniform B as greenland_forward.py.
 # The thermal model overrides this once update_rheology is enabled.
@@ -93,6 +99,9 @@ B.fill(1e-17 ** (-1.0 / 3.0) / (917 * 9.81))
 mg.rheology.B.set(B)
 mg.rheology.eps_reg.set(1e-6)
 mg.rheology.n.set(3.0)
+if STRESS_SCHEME == 'diva':
+    mg.rheology.n_sigma.set(6.0)        # vertical quadrature points (velocity converged by ~6)
+    mg.rheology.eps_reg_shear.set(1e-6)
 
 # Sliding
 if BETA_PATH:
@@ -115,11 +124,17 @@ mg.forcing.smb.set(smb)
 # ========================================================
 # Multigrid solver options (same as greenland_forward.py)
 # ========================================================
+# Scheme-aware post-smoothing: DIVA's land-terminating Greenland solve is happy with ~30
+# (see greenland_forward), SSA/MOLHO want ~150.
 model.forward_solver.fas_options.set(
         coarsest_steps=200, pre_steps=10,
-        post_steps=150, finest_steps=0,
+        post_steps=(30 if STRESS_SCHEME == 'diva' else 150), finest_steps=0,
         relative_tolerance=1e-2, absolute_tolerance=10.0,
-        report_norms=True)
+        report_norms=False)
+model.forward_solver.vanka_options.omega.set(cp.float32(0.25))
+# MOLHO's two-field solve and DIVA's closure both want more momentum damping than SSA.
+model.forward_solver.vanka_options.newton_options.momentum_damping.set(
+        cp.float32(0.1 if STRESS_SCHEME in ('diva', 'molho') else 0.01))
 
 # ========================================================
 # Thermal model

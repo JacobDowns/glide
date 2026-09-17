@@ -2,13 +2,14 @@
 Coupled Greenland forward simulation with enthalpy.
 
 Mirrors greenland_forward.py for the momentum / mass-balance setup but
-adds a coupled enthalpy solver via ThermalModel. The thermal forcing is
-intentionally simple:
+adds a coupled enthalpy solver via ThermalModel. Thermal forcing:
 
-  - Surface temperature: elevation-dependent lapse rate, capped at T_melt.
-    T_surf(s) = T_SEA_LEVEL + LAPSE_RATE * s.
-  - Geothermal heat flux: uniform (no spatial map).
-  - Frictional heating: enabled (computed from beta and basal speed).
+  - Surface temperature: SeaRISE annual-mean surface-temperature map if
+    data/greenland_tsurf.nc is present (run greenland_thermal_forcing.py),
+    else an elevation lapse rate T_surf(s) = T_SEA_LEVEL + LAPSE_RATE * s.
+  - Geothermal heat flux: Martos et al. 2018 map (data/greenland_q_geo.nc)
+    if present, else a uniform Q_GEO.
+  - Frictional heating: enabled (beta*xi gated by grounding, basal speed).
 
 The script follows the coupled_dome.py pattern:
   1. Momentum-only spin-up for a few steps so the initial geometry relaxes
@@ -66,6 +67,20 @@ SEC_PER_YR  = 365.25 * 86400.0
 
 # Path to optimized beta (set to None to use a uniform value)
 BETA_PATH   = "./inverse/level_0/beta_opt.nc"
+
+# Real thermal forcing (produced by greenland_thermal_forcing.py).  When present,
+# these replace the uniform Q_GEO and the lapse-rate surface BC below:
+#   greenland_q_geo.nc  -- Martos et al. 2018 geothermal flux [W/m^2]
+#   greenland_tsurf.nc  -- SeaRISE annual-mean surface temperature [K]
+import os
+import xarray as xr
+Q_GEO_MAP  = (cp.array(xr.load_dataarray("./data/greenland_q_geo.nc"))
+              if os.path.exists("./data/greenland_q_geo.nc") else None)
+T_SURF_MAP = (cp.array(xr.load_dataarray("./data/greenland_tsurf.nc"))
+              if os.path.exists("./data/greenland_tsurf.nc") else None)
+Q_GEO_FORCING = Q_GEO_MAP if Q_GEO_MAP is not None else Q_GEO
+print("Q_geo:", "Martos 2018 map" if Q_GEO_MAP is not None else f"uniform {Q_GEO}",
+      "| surface T:", "SeaRISE map" if T_SURF_MAP is not None else "lapse-rate BC")
 
 # ========================================================
 # Load dataset and build the multigrid model
@@ -155,19 +170,21 @@ thermal.ops.enthalpy_forcing.h_thin.set(H_THIN)
 
 
 def surface_temperature(H, bed):
-    """Elevation-dependent surface temperature, capped at T_melt.
+    """Surface-temperature BC (capped at T_melt downstream).
 
-    T_surf(s) = T_SEA_LEVEL + LAPSE_RATE * s, where s = bed + H.
-    Capping at T_melt is done implicitly by set_surface_enthalpy_from_temperature.
+    Uses the SeaRISE annual-mean surface-temperature map when available
+    (fixed climatology), otherwise the elevation lapse rate
+    T_surf(s) = T_SEA_LEVEL + LAPSE_RATE * (bed + H).
     """
-    surface_elev = bed + H
-    return cp.float32(T_SEA_LEVEL) + cp.float32(LAPSE_RATE) * surface_elev
+    if T_SURF_MAP is not None:
+        return T_SURF_MAP
+    return cp.float32(T_SEA_LEVEL) + cp.float32(LAPSE_RATE) * (bed + H)
 
 
 # Seed thermal state from the *initial* geometry. The column is initialized
 # at surface T (cold throughout) — Q_geo will warm the base during the run.
 T_surf_init = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
-thermal.initialize(T_surface=T_surf_init, T_field=T_surf_init, Q_geo=Q_GEO)
+thermal.initialize(T_surface=T_surf_init, T_field=T_surf_init, Q_geo=Q_GEO_FORCING)
 
 # All enthalpy physics on by default; make it explicit for clarity.
 thermal.ops.term_flags.horizontal_advection = True
@@ -227,7 +244,7 @@ for k in range(N_SPINUP):
 T_surf_relaxed = surface_temperature(grid.state.H.data, grid.geometry.bed.data)
 thermal.initialize(T_surface=T_surf_relaxed,
                    T_field=T_surf_relaxed,
-                   Q_geo=Q_GEO)
+                   Q_geo=Q_GEO_FORCING)
 thermal.update_rheology = True
 
 # Seed B from the (still cold) thermal state so the first coupled step

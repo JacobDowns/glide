@@ -149,11 +149,15 @@ class ThermalModel:
 
     def __init__(self, grid, nz=21, n_smooth=10,
                  update_rheology=True, frictional_heating=True,
-                 rho_i=917.0):
+                 strain_heating=True, rho_i=917.0):
         self.ops = EnthalpyOperators(grid, nz=nz)
         self.n_smooth = n_smooth
         self.update_rheology = update_rheology
         self.frictional_heating = frictional_heating
+        # Deformational (strain) heating from the resolved vertical shear.  Zero
+        # under SSA (no shear); the source of the near-basal warming that plug flow
+        # cannot represent.
+        self.strain_heating = strain_heating
         self.rho_i = rho_i
         self.g = 9.81
 
@@ -221,6 +225,8 @@ class ThermalModel:
 
         if self.frictional_heating:
             self._compute_frictional_heating()
+        if self.strain_heating:
+            self._compute_strain_heating()
 
         # Precompute forcing array (E_prev and H_prev set by pre_momentum)
         ops.set_rhs(snapshot=False)
@@ -280,6 +286,47 @@ class ThermalModel:
         beta_eff = sliding.beta.data * grid.state.xi.data          # grounding-gated drag
         self.ops.enthalpy_forcing.Q_fh[:] = (
             scale * beta_eff * speed_yr ** (m + 1.0))
+
+    def _compute_strain_heating(self):
+        """Fill phi_strain [W/m^3] with the deformational (shear) heating.
+
+        With the reconstructed profile u(sigma) = u_b + (u_s - u_b)*psi(sigma),
+        psi = 1 - (1 - sigma)^(n+1), the shear strain rate is
+        du/dz = (u_s - u_b)/H * (n+1)(1 - sigma)^n, and the DIVA/SIA shear stress
+        is tau_xz = tau_b * (1 - sigma) (basal drag distributed linearly).  So
+
+            phi_shear(sigma) = tau_xz * du/dz
+                             = tau_b * (u_s - u_b) * (n+1)/H * (1 - sigma)^(n+1),
+
+        peaked at the bed.  tau_b is the physical basal drag rho*g*beta*xi*|u_b|^m
+        [Pa]; u_s, u_b are cell speeds [m/yr].  Zero under SSA (u_s = u_b): plug
+        flow cannot represent this near-basal warming -- the point of DIVA/MOLHO.
+        (Membrane/longitudinal dissipation is neglected; it is small in grounded ice.)
+        """
+        grid = self.ops.grid
+        ph = self.ops.enthalpy_forcing.phi_strain
+        scheme = getattr(grid, 'stress_scheme', 'ssa')
+        if scheme == 'ssa':
+            ph.fill(0.0)
+            return
+        sliding = grid.sliding
+        n = float(grid.rheology.n.value); m = sliding.m.value
+        if scheme == 'diva':
+            ub = grid.state.u_b.data; us = grid.state.u_s.data          # cell speeds m/yr
+        else:  # molho: cell speeds from u_bar +/- deformational amplitude
+            u = grid.state.u.data; v = grid.state.v.data
+            ud = grid.state.ud.data; vd = grid.state.vd.data
+            ubx = u - ud; uby = v - vd; usx = u + ud / (n + 1.0); usy = v + vd / (n + 1.0)
+            ub = cp.hypot(0.5 * (ubx[:, 1:] + ubx[:, :-1]), 0.5 * (uby[1:] + uby[:-1]))
+            us = cp.hypot(0.5 * (usx[:, 1:] + usx[:, :-1]), 0.5 * (usy[1:] + usy[:-1]))
+        H = cp.maximum(grid.state.H.data, 1.0)
+        tau_b = (cp.float32(self.rho_i * self.g) * sliding.beta.data
+                 * grid.state.xi.data * cp.maximum(ub, 0.0) ** m)      # Pa
+        dU = cp.maximum(us - ub, 0.0) / cp.float32(self.SEC_PER_YR)     # m/s
+        pref = tau_b * dU * (n + 1.0) / H                              # W/m^3 at the bed
+        for k in range(self.ops.nz):
+            s = float(self.ops.sigma[k])
+            ph[:, :, k] = pref * (1.0 - s) ** (n + 1.0)
 
     def _compute_omega(self, dt):
         """Compute omega from the actual thickness change.

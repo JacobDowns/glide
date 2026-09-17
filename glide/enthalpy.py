@@ -288,17 +288,59 @@ class EnthalpyOperators:
 
     def broadcast_velocity(self):
         """
-        Broadcast 2D SSA velocities to all sigma layers.
+        Fill the 3D advective velocity from the momentum solution, resolving the
+        vertical shear where the stress balance provides it.
 
-        Copies the depth-averaged u, v from the grid state
-        into the 3D velocity arrays for enthalpy advection.
+        The horizontal velocity profile is  u(zeta) = u_b + (u_s - u_b) * psi(zeta),
+        with zeta = (z - b)/H (0 at the bed, 1 at the surface) and the Glen shape
+        psi(zeta) = 1 - (1 - zeta)^(n+1)  (shear concentrated near the bed).
+
+          - SSA   : no shear (u_d = 0), so every layer gets the depth-averaged u.
+          - MOLHO : facet form  u(zeta) = u_bar + u_d * phi(zeta), with
+                    phi(zeta) = -1 + (n+2)/(n+1) * (1 - (1-zeta)^(n+1)); this is
+                    exactly u_b + (u_s-u_b)*psi since u_s = u_bar + u_d/(n+1),
+                    u_b = u_bar - u_d.
+          - DIVA  : u_b and u_s are cell SPEEDS from the closure, so scale the
+                    depth-averaged facet velocity by the per-cell speed ratio
+                    rho(zeta) = [u_b + (u_s-u_b)*psi(zeta)] / |u_bar|.
+
+        Resolving the profile feeds the sheared field to horizontal advection, to
+        the vertical velocity (compute_omega now sees a depth-varying div(Hu)), and
+        to frictional heating (u3d[0] is the true basal velocity, not u_bar).
         """
-        u2d = self.grid.state.u.data  # (ny, nx+1)
-        v2d = self.grid.state.v.data  # (ny+1, nx)
+        grid = self.grid
+        u2d = grid.state.u.data  # (ny, nx+1)  depth-averaged facet velocity
+        v2d = grid.state.v.data  # (ny+1, nx)
+        scheme = getattr(grid, 'stress_scheme', 'ssa')
+        n = float(grid.rheology.n.value)
+        u3d = self.enthalpy_velocity.u3d
+        v3d = self.enthalpy_velocity.v3d
 
-        for k in range(self.nz):
-            self.enthalpy_velocity.u3d[k, :, :] = u2d
-            self.enthalpy_velocity.v3d[k, :, :] = v2d
+        if scheme == 'molho' and grid.state.ud is not None:
+            ud = grid.state.ud.data; vd = grid.state.vd.data
+            for k in range(self.nz):
+                z = float(self.sigma[k])
+                phi = -1.0 + (n + 2.0) / (n + 1.0) * (1.0 - (1.0 - z) ** (n + 1.0))
+                u3d[k, :, :] = u2d + ud * phi
+                v3d[k, :, :] = v2d + vd * phi
+        elif scheme == 'diva' and grid.state.u_s is not None:
+            ub = grid.state.u_b.data; us = grid.state.u_s.data       # cell speeds
+            ubar = cp.hypot(0.5 * (u2d[:, 1:] + u2d[:, :-1]),
+                            0.5 * (v2d[1:] + v2d[:-1])) + 1e-6        # cell |u_bar|
+            for k in range(self.nz):
+                z = float(self.sigma[k])
+                psi = 1.0 - (1.0 - z) ** (n + 1.0)
+                r = (ub + (us - ub) * psi) / ubar                    # cell speed ratio
+                rx = cp.empty_like(u2d)
+                rx[:, 1:-1] = 0.5 * (r[:, 1:] + r[:, :-1]); rx[:, 0] = r[:, 0]; rx[:, -1] = r[:, -1]
+                ry = cp.empty_like(v2d)
+                ry[1:-1] = 0.5 * (r[1:] + r[:-1]); ry[0] = r[0]; ry[-1] = r[-1]
+                u3d[k, :, :] = u2d * rx
+                v3d[k, :, :] = v2d * ry
+        else:  # SSA (or any scheme without a shear profile): plug flow
+            for k in range(self.nz):
+                u3d[k, :, :] = u2d
+                v3d[k, :, :] = v2d
 
     def compute_omega(self, dh_dt, bmb=None):
         """
